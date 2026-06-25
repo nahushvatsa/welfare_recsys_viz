@@ -1,0 +1,5 @@
+# Backend (FastAPI service). Install the engine separately: `pip install -e .`
+# (from the repo root), or `pip install -e .[server]` to get both at once.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6

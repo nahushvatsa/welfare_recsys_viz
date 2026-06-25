@@ -7,7 +7,7 @@ import random
 
 import numpy as np
 
-import params
+from . import params
 
 
 class City:

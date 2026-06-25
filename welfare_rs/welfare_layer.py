@@ -14,8 +14,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import params
-from recommender_systems import (
+from . import params
+from .recommender_systems import (
     LeisureRSOrchestrator,
     Place,
     Recommendation,

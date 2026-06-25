@@ -1,5 +1,7 @@
-numpy
-pandas
-matplotlib
-scipy
-jupyter
+# Dev convenience: engine (editable) + FastAPI backend + paper-notebook deps.
+#
+#   Engine only ........... pip install -e .
+#   Engine + backend ...... pip install -e .[server]
+#   Everything (dev) ...... pip install -r requirements.txt
+#
+-e .[server,notebook]

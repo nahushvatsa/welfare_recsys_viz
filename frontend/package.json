@@ -1,0 +1,30 @@
+{
+  "name": "welfare-rs-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.0.27",
+    "@deck.gl/geo-layers": "^9.0.27",
+    "@deck.gl/layers": "^9.0.27",
+    "@deck.gl/mapbox": "^9.0.27",
+    "maplibre-gl": "^4.5.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.5.4",
+    "vite": "^7.3.5"
+  },
+  "overrides": {
+    "esbuild": "0.28.1"
+  }
+}

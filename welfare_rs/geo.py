@@ -409,7 +409,7 @@ def build_road_network(
     Shared by the frontend, the persona generator, and any script so they all
     agree on the same area and cache. See ``params.GEO_PARAMS``.
     """
-    import params
+    from . import params
 
     gp = params.GEO_PARAMS
     city = city or gp["default_city"]

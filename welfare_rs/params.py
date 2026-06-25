@@ -5,15 +5,19 @@ modified at runtime, or swept without touching model logic.
 
 Usage
 -----
-    import params
+    from welfare_rs import params, Simulation
     params.MODE_PARAMS["car"]["speed_kmh"] = 25   # patch at runtime
-    from simulation import Simulation
     sim = Simulation(...)                           # picks up the new value
 """
 
 from __future__ import annotations
 
 import os
+
+# Repo root = parent of the welfare_rs package dir. Data files (persona CSVs)
+# and the default network/POI cache live there, so paths stay stable now that
+# this module lives inside the package. Override the cache with $WELFARE_RS_CACHE.
+_REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ── Simplification toggles ──────────────────────────────────────────────────
 #
@@ -68,13 +72,13 @@ SIMPLIFIED_ETA_PARAMS: dict = {
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-DEFAULT_PERSONA_CSV_PATH: str = (
-    "data/synthetic_personas_realism_first_dopt_with_start_locs_Seattle.csv"
+DEFAULT_PERSONA_CSV_PATH: str = os.path.join(
+    _REPO_ROOT, "data", "synthetic_personas_realism_first_dopt_with_start_locs_Seattle.csv"
 )
 
 # Persona file for the OSM / New York frontend (homes sampled on the network).
-NYC_PERSONA_CSV_PATH: str = (
-    "data/synthetic_personas_realism_first_dopt_with_start_locs_NewYork.csv"
+NYC_PERSONA_CSV_PATH: str = os.path.join(
+    _REPO_ROOT, "data", "synthetic_personas_realism_first_dopt_with_start_locs_NewYork.csv"
 )
 
 # ── OSM road-network geography (geo.py) ──────────────────────────────────────
@@ -86,7 +90,7 @@ NYC_PERSONA_CSV_PATH: str = (
 GEO_PARAMS: dict = {
     "cache_dir": os.environ.get(
         "WELFARE_RS_CACHE",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache"),
+        os.path.join(_REPO_ROOT, ".cache"),
     ),
     "default_city": "nyc_manhattan",
     "default_network_type": "drive",

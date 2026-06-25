@@ -24,8 +24,8 @@ import sys
 # Allow running from the data/ directory by putting the repo root on the path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import params  # noqa: E402
-from geo import build_road_network  # noqa: E402
+from welfare_rs import params  # noqa: E402
+from welfare_rs.geo import build_road_network  # noqa: E402
 
 
 def main() -> None:

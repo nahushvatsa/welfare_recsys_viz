@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
-from recommender_systems import (
+from .recommender_systems import (
     LEISURE_SUBTYPE_TO_CATEGORIES,
     Place,
     Recommendation,
@@ -194,7 +194,7 @@ class OracleOrchestrator:
 
 def register_agent_from_abm(oracle: OracleRecommender, agent) -> None:
     """Convenience: extract true preferences from an ABM Agent object."""
-    import params
+    from . import params
 
     subtype_bonuses = {}
     for subtype, seg_cfg in params.LEISURE_SEGMENTS.items():

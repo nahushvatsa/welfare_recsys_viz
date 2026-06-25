@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "welfare-rs"
+version = "0.1.0"
+description = "Welfare-oriented activity-travel agent-based model on a real OpenStreetMap street network."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Nahush Vatsa" }]
+keywords = ["agent-based-model", "recommender-systems", "travel-behaviour", "welfare", "osmnx"]
+
+# Core engine dependencies only — no web framework, no visualization stack.
+dependencies = [
+    "numpy",
+    "networkx",
+    "osmnx>=1.9",
+    "shapely>=2.0",
+    "scikit-learn",  # osmnx.nearest_nodes (snapping personas/POIs to the graph)
+]
+
+[project.optional-dependencies]
+# FastAPI backend (the client-server app).
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+]
+# Paper notebook + data-prep scripts.
+notebook = [
+    "jupyter",
+    "matplotlib",
+    "pandas",
+    "scipy",
+]
+
+[tool.setuptools]
+# Ship only the importable engine. The backend/ and frontend/ are the app, not
+# the library. (Persona CSVs in data/ are repo files; packaging them as
+# importable package-data is a follow-up for standalone distribution.)
+packages = ["welfare_rs"]

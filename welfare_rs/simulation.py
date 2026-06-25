@@ -11,12 +11,12 @@ from pathlib import Path
 
 import numpy as np
 
-import params
-from agent import Agent
-from city import City
-from datastructures import Activity, Trip
-from utils import clamp, softmax
-from recommender_systems import (
+from . import params
+from .agent import Agent
+from .city import City
+from .datastructures import Activity, Trip
+from .utils import clamp, softmax
+from .recommender_systems import (
     Place,
     build_recommender_stack,
 )
@@ -623,7 +623,7 @@ class Simulation:
             # straight-line (haversine) distance — the paper's "as the crow flies"
             # signal, deliberately cruder than the network cost of the realised
             # trip — so coord_scale is 1.0 (haversine already returns km).
-            from geo import haversine_km
+            from .geo import haversine_km
 
             gm_cfg = {**gm_cfg, "coord_scale_km": 1.0, "coord_distance_km": haversine_km}
         elif "coord_scale_km" not in gm_cfg:
@@ -1033,7 +1033,7 @@ class Simulation:
             feedback_strength=feedback_strength,
         )
         if hasattr(self.recommender_stack, "record_continuous_feedback"):
-            from welfare_layer import compute_continuous_feedback
+            from .welfare_layer import compute_continuous_feedback
 
             continuous_feedback = compute_continuous_feedback(
                 feedback_trip,

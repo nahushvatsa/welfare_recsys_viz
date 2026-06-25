@@ -8,10 +8,10 @@ from collections.abc import Mapping
 
 import numpy as np
 
-import params
-from datastructures import Activity
-from utils import clamp, sigmoid, softmax
-from recommender_systems import LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS, UserContext
+from . import params
+from .datastructures import Activity
+from .utils import clamp, sigmoid, softmax
+from .recommender_systems import LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS, UserContext
 
 
 class Agent:
