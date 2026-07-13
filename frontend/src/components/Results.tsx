@@ -1,65 +1,114 @@
 import type { RunMeta } from "../types";
-import { BarChart, LineChart } from "./Charts";
 
-function pct(v: number | undefined): string {
-  return v == null ? "—" : `${Math.round(v * 100)}%`;
+function pct(v: number | null | undefined): string {
+  return v == null ? "—" : `${(v * 100).toFixed(1)}%`;
 }
-function num(v: number | undefined, digits = 0): string {
+function num(v: number | null | undefined, digits = 3): string {
   return v == null ? "—" : v.toFixed(digits);
 }
 
-const TREND_SERIES = [
-  { key: "avg_trip_utility", label: "avg trip utility", color: "#3b82f6" },
-  { key: "recommendation_acceptance_rate", label: "rec. acceptance", color: "#10b981" },
-  { key: "feedback_like_rate", label: "feedback like rate", color: "#a855f7" },
-  { key: "avg_travel_time_min", label: "avg travel time (min)", color: "#f59e0b" },
-];
-
 export default function Results({ run }: { run: RunMeta }) {
-  const s = run.summary;
-  const modeShare = (s.mode_share ?? {}) as Record<string, number>;
-  const leisureMix = (s.leisure_subtype_counts ?? {}) as Record<string, number>;
-  const leisureTrips = Object.values(leisureMix).reduce((a, b) => a + b, 0);
+  const h = run.headline;
+  const t2 = run.table2;
+  const nSeeds = run.seeds.length;
 
   return (
     <div className="results">
       <h3>
-        Results (final day) · {run.area_label} · {run.config.treatment}
+        Welfare metrics (final day, paper-aligned) · {run.area_label} · {run.config.treatment}
+        <span className="muted">
+          {" "}
+          · {nSeeds} seed{nSeeds > 1 ? "s" : ""}
+        </span>
       </h3>
 
       <div className="metric-grid">
-        <Metric label="Trips" value={num(s.trips)} />
-        <Metric label="Leisure trips" value={String(leisureTrips)} />
-        <Metric label="Rec. acceptance" value={pct(s.recommendation_acceptance_rate)} />
         <Metric
-          label="Leisure net utility"
-          value={num(s.mean_leisure_net_utility, 3)}
-          help="Mean net utility of leisure trips (activity benefit − travel cost). The welfare-relevant signal: Standard RS often pushes this below No RS."
+          label="Mean net utility (Ū)"
+          value={`${num(h.mean_utility)} ± ${num(h.sigma_u)}`}
+          help="Mean net trip utility over the eval-day leisure trips (activity benefit V − travel cost C), averaged across seeds; ± is the between-seed std σ_U. Paper Table 1."
         />
-        <Metric label="Avg travel time" value={`${num(s.avg_travel_time_min, 1)} min`} />
+        <Metric
+          label="Negative rate"
+          value={pct(h.neg_rate)}
+          help="Fraction of leisure trips whose realized net utility U < 0 — the trip left the agent worse off than not going. Paper Table 1. (Distinct from rejection rate.)"
+        />
+        <Metric
+          label="Harmed %"
+          value={pct(h.harmed_pct)}
+          help="Fraction of agents whose eval-day leisure trip yielded lower utility than their matched No-RS (organic) trip. Paper Table 2."
+        />
+        <Metric
+          label="Improved %"
+          value={pct(h.improved_pct)}
+          help="Fraction whose utility increased vs the matched No-RS trip. Paper Table 2."
+        />
+        <Metric
+          label="Mean ORC"
+          value={num(h.mean_orc)}
+          help="Over-recommendation cost: mean utility loss (U_organic − U_rec) over harmed agents only (Eq. 14)."
+        />
       </div>
 
-      <div className="chart-grid">
-        <div className="card">
-          <h4>Mode share</h4>
-          <BarChart data={modeShare} color="#3b82f6" format={(v) => `${Math.round(v * 100)}%`} />
-        </div>
-        <div className="card">
-          <h4>Leisure activity mix</h4>
-          <BarChart data={leisureMix} color="#a855f7" />
-        </div>
+      <div className="card">
+        <h4>Table 1 · Aggregate welfare by condition</h4>
+        <table className="metrics-table">
+          <thead>
+            <tr>
+              <th>Condition</th>
+              <th>Ū</th>
+              <th>σ_U</th>
+              <th>Neg. rate</th>
+              <th>Abst.</th>
+              <th>Gini</th>
+            </tr>
+          </thead>
+          <tbody>
+            {run.table1.map((r) => (
+              <tr key={r.condition} className={r.condition === run.config.treatment ? "row-hi" : ""}>
+                <td>{r.condition}</td>
+                <td>{num(r.mean_utility)}</td>
+                <td>{num(r.sigma_u)}</td>
+                <td>{pct(r.neg_rate)}</td>
+                <td>{pct(r.abstention_rate)}</td>
+                <td>{num(r.gini)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
 
-      {run.day_summaries.length > 1 && (
+      {t2 && (
         <div className="card">
-          <h4>Daily trends</h4>
-          <LineChart
-            rows={run.day_summaries as Array<Record<string, number>>}
-            xKey="day"
-            series={TREND_SERIES.filter((s2) => run.day_summaries.some((d) => d[s2.key] != null))}
-          />
+          <h4>Table 2 · Over-recommendation cost (vs matched No RS)</h4>
+          <table className="metrics-table">
+            <thead>
+              <tr>
+                <th>Condition</th>
+                <th>Harmed %</th>
+                <th>Improved %</th>
+                <th>Mean ORC</th>
+                <th>Matched agents</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr className="row-hi">
+                <td>{t2.condition}</td>
+                <td>{pct(t2.harmed_pct)}</td>
+                <td>{pct(t2.improved_pct)}</td>
+                <td>{num(t2.mean_orc)}</td>
+                <td>{t2.n_matched}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       )}
+
+      <p className="muted small">
+        Across {nSeeds} seed{nSeeds > 1 ? "s" : ""}: rec. acceptance {pct(run.aggregate.acceptance_rate)} ·
+        avg travel time {num(run.aggregate.avg_travel_time_min, 1)} min ·{" "}
+        {run.table1[0]?.n_leisure_trips ?? 0} leisure trips (No RS).
+      </p>
     </div>
   );
 }

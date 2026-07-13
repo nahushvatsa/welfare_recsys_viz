@@ -13,6 +13,7 @@ const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json
 
 interface MapViewProps {
   run: RunMeta;
+  seed: number;
 }
 
 interface Marker {
@@ -29,8 +30,8 @@ interface Want {
   key: string;
 }
 
-function keyOf(day: number, bbox: BBox | undefined): string {
-  return `${day}|${bbox ? bbox.map((n) => n.toFixed(3)).join(",") : ""}`;
+function keyOf(day: number, bbox: BBox | undefined, seed: number): string {
+  return `${seed}|${day}|${bbox ? bbox.map((n) => n.toFixed(3)).join(",") : ""}`;
 }
 
 // Piecewise-linear position along a downsampled trip at minute t -> [lon, lat].
@@ -56,7 +57,7 @@ function fmtClock(t: number): string {
   return `Day ${day} · ${hh}:${mm}`;
 }
 
-export default function MapView({ run }: MapViewProps) {
+export default function MapView({ run, seed }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlayRef = useRef<MapboxOverlay | null>(null);
@@ -79,6 +80,14 @@ export default function MapView({ run }: MapViewProps) {
   const wantRef = useRef<Want>({ day: 0, bbox: undefined, key: "" });
   const loadedKeyRef = useRef<string>("");
 
+  // Which seed's trips are being shown, and that seed's time span. Held in refs so
+  // the rAF loop and pump (defined once per map init) always read the live value,
+  // and a separate [seed] effect can swap data without re-creating the map.
+  const seedRef = useRef(seed);
+  const shownSeedRef = useRef(seed); // last seed the [seed] effect acted on
+  const timeSpanRef = useRef(run.time_spans?.[String(seed)] ?? run.num_days * DAY);
+  const pumpRef = useRef<(() => void) | null>(null);
+
   const clockRef = useRef<HTMLSpanElement | null>(null);
   const scrubRef = useRef<HTMLInputElement | null>(null);
 
@@ -88,7 +97,7 @@ export default function MapView({ run }: MapViewProps) {
   const [inspected, setInspected] = useState<string | null>(null);
 
   const runId = run.run_id;
-  const timeSpan = run.time_span || run.num_days * DAY;
+  const timeSpan = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
 
   function currentBBox(): BBox | undefined {
     const map = mapRef.current;
@@ -198,6 +207,9 @@ export default function MapView({ run }: MapViewProps) {
     loadingRef.current = false;
     loadedKeyRef.current = "";
     wantRef.current = { day: 0, bbox: undefined, key: "" };
+    seedRef.current = seed;
+    shownSeedRef.current = seed;
+    timeSpanRef.current = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
 
     const map = new maplibregl.Map({
       container: containerRef.current,
@@ -236,12 +248,13 @@ export default function MapView({ run }: MapViewProps) {
       if (want.key === loadedKeyRef.current) return;
       loadingRef.current = true;
       setLoading(true);
+      const sd = seedRef.current;
       const t0 = want.day * DAY;
-      const t1 = Math.min(timeSpan, t0 + DAY);
+      const t1 = Math.min(timeSpanRef.current, t0 + DAY);
       try {
         const [timeline, pois] = await Promise.all([
-          getTimeline(runId, t0, t1, want.bbox),
-          getPois(runId, want.bbox),
+          getTimeline(runId, t0, t1, want.bbox, sd),
+          getPois(runId, want.bbox, sd),
         ]);
         const tba = new Map<number, Trip[]>();
         for (const tr of timeline.trips) {
@@ -268,6 +281,7 @@ export default function MapView({ run }: MapViewProps) {
       // Desired window moved while we were loading → reconcile once more.
       if (wantRef.current.key !== loadedKeyRef.current) void pump();
     }
+    pumpRef.current = pump;
 
     let frame = 0;
     let lastClock = 0;
@@ -276,13 +290,13 @@ export default function MapView({ run }: MapViewProps) {
       lastRef.current = now;
       if (playingRef.current) {
         timeRef.current += speedRef.current * dt;
-        if (timeRef.current > timeSpan) timeRef.current = 0;
+        if (timeRef.current > timeSpanRef.current) timeRef.current = 0;
       }
       const t = timeRef.current;
       // Want the day-window for the current clock position; pump reconciles.
       const dayIndex = Math.floor(t / DAY);
       if (dayIndex !== wantRef.current.day) {
-        wantRef.current = { ...wantRef.current, day: dayIndex, key: keyOf(dayIndex, wantRef.current.bbox) };
+        wantRef.current = { ...wantRef.current, day: dayIndex, key: keyOf(dayIndex, wantRef.current.bbox, seedRef.current) };
       }
       void pump();
       overlay.setProps({ layers: buildLayers(t) });
@@ -301,7 +315,7 @@ export default function MapView({ run }: MapViewProps) {
     const onLoad = () => {
       map.addControl(overlay as unknown as maplibregl.IControl);
       const bbox = currentBBox();
-      wantRef.current = { day: 0, bbox, key: keyOf(0, bbox) };
+      wantRef.current = { day: 0, bbox, key: keyOf(0, bbox, seedRef.current) };
       void pump();
       frame = requestAnimationFrame(loop);
     };
@@ -313,7 +327,7 @@ export default function MapView({ run }: MapViewProps) {
       window.clearTimeout(moveTimer);
       moveTimer = window.setTimeout(() => {
         const bbox = currentBBox();
-        wantRef.current = { ...wantRef.current, bbox, key: keyOf(wantRef.current.day, bbox) };
+        wantRef.current = { ...wantRef.current, bbox, key: keyOf(wantRef.current.day, bbox, seedRef.current) };
         void pump();
       }, 250);
     };
@@ -323,7 +337,7 @@ export default function MapView({ run }: MapViewProps) {
     overlay.setProps({
       onClick: ({ object }: any) => {
         if (object && object.tripId) {
-          void getTripGeometry(runId, object.tripId).then((g) => {
+          void getTripGeometry(runId, object.tripId, seedRef.current).then((g) => {
             selectedTripRef.current = g;
             setInspected(object.tripId);
           });
@@ -343,6 +357,28 @@ export default function MapView({ run }: MapViewProps) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+
+  // ── Seed switch (swap data only; the map itself stays put) ───────────────────
+  useEffect(() => {
+    if (shownSeedRef.current === seed) return; // initial render handled by map init
+    shownSeedRef.current = seed;
+    seedRef.current = seed;
+    timeSpanRef.current = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
+    // Drop the old seed's geometry so its dots/paths clear immediately, then force
+    // the single-flight pump to refetch this seed's window.
+    tripsByAgent.current = new Map();
+    staysByAgent.current = new Map();
+    selectedTripRef.current = null;
+    setInspected(null);
+    if (timeRef.current > timeSpanRef.current) timeRef.current = 0;
+    loadedKeyRef.current = "";
+    wantRef.current = {
+      ...wantRef.current,
+      key: keyOf(wantRef.current.day, wantRef.current.bbox, seed),
+    };
+    pumpRef.current?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed]);
 
   // ── Controls ───────────────────────────────────────────────────────────────
   function togglePlay() {

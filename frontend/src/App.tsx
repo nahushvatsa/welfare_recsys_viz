@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Controls, { type RunStatus } from "./components/Controls";
 import MapView from "./components/MapView";
 import Results from "./components/Results";
-import { createRun, getCities, getRun, subscribeProgress } from "./api";
+import { cancelRun, createRun, getCities, getRun, subscribeProgress } from "./api";
 import type { CitiesResponse, RunConfig, RunMeta } from "./types";
 
 export default function App() {
@@ -13,6 +13,13 @@ export default function App() {
   const [runMeta, setRunMeta] = useState<RunMeta | null>(null);
   const [committed, setCommitted] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [selectedSeed, setSelectedSeed] = useState<number | null>(null);
+  const runningIdRef = useRef<string | null>(null);  // the in-flight study, for Stop
+
+  // When a study finishes, point the map at its first seed.
+  useEffect(() => {
+    if (runMeta) setSelectedSeed(runMeta.default_seed);
+  }, [runMeta]);
 
   useEffect(() => {
     getCities()
@@ -35,7 +42,7 @@ export default function App() {
     if (!config) return;
     setError(null);
     setStatus("running");
-    setProgress({ current: 0, total: config.num_days });
+    setProgress({ current: 0, total: config.num_seeds });
     try {
       const resp = await createRun(config);
       const finalize = async (runId: string) => {
@@ -56,12 +63,21 @@ export default function App() {
         }
         return;
       }
+      runningIdRef.current = resp.run_id;
       subscribeProgress(resp.run_id, (e) => {
         if (e.type === "progress") {
           setProgress({ current: e.current, total: e.total });
         } else if (e.type === "done") {
+          runningIdRef.current = null;
           void finalize(e.run_id);
+        } else if (e.type === "cancelled") {
+          // Clean stop: reset to a fresh, empty state (no partial viz shown).
+          runningIdRef.current = null;
+          setStatus("idle");
+          setProgress(null);
+          setRunMeta(null);
         } else if (e.type === "error") {
+          runningIdRef.current = null;
           setError(e.message);
           setStatus("error");
           setProgress(null);
@@ -72,6 +88,11 @@ export default function App() {
       setStatus("error");
       setProgress(null);
     }
+  }
+
+  function onStop() {
+    const id = runningIdRef.current;
+    if (id) void cancelRun(id);  // SSE 'cancelled' will reset the UI to idle
   }
 
   if (!cities || !config) {
@@ -89,6 +110,7 @@ export default function App() {
         config={config}
         setConfig={setConfig}
         onRun={onRun}
+        onStop={onStop}
         status={status}
         progress={progress}
         runMeta={runMeta}
@@ -104,10 +126,28 @@ export default function App() {
         {runMeta && (
           <>
             <section>
-              <h3>
-                Activity-travel over the day · {runMeta.area_label} · {runMeta.config.treatment}
-              </h3>
-              <MapView run={runMeta} />
+              <div className="section-head">
+                <h3>
+                  Activity-travel over the day · {runMeta.area_label} · {runMeta.config.treatment}
+                </h3>
+                {runMeta.seeds.length > 1 && (
+                  <label className="seed-picker">
+                    Seed
+                    <select
+                      value={selectedSeed ?? runMeta.default_seed}
+                      onChange={(e) => setSelectedSeed(parseInt(e.target.value, 10))}
+                    >
+                      {runMeta.seeds.map((s, i) => (
+                        <option key={s} value={s}>
+                          {s}
+                          {i === 0 ? " (base)" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+              </div>
+              <MapView run={runMeta} seed={selectedSeed ?? runMeta.default_seed} />
               <p className="legend">
                 <b>Dots = agents:</b> <Dot c="#e65038" /> in transit · <Dot c="#50aa5a" /> home ·{" "}
                 <Dot c="#f0961e" /> work · <Dot c="#a05ad2" /> leisure · <Dot c="#6e6e78" /> POIs ·{" "}

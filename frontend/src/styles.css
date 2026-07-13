@@ -38,6 +38,8 @@ body { background: var(--bg); color: var(--ink); }
 .muted { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
 .hint { color: #b45309; font-size: 12px; }
 .error { color: #dc2626; font-size: 13px; }
+.field-error { display: block; color: #dc2626; font-size: 11px; margin-top: 3px; }
+.sidebar input[aria-invalid="true"] { border-color: #dc2626; outline-color: #dc2626; }
 
 .area-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .area-btn {
@@ -51,6 +53,12 @@ body { background: var(--bg); color: var(--ink); }
   background: var(--accent); color: #fff; border: 0; border-radius: 8px; cursor: pointer;
 }
 .run-btn:disabled { opacity: .6; cursor: default; }
+
+.stop-btn {
+  width: 100%; margin-top: 18px; padding: 10px; font-size: 15px; font-weight: 600;
+  background: #dc2626; color: #fff; border: 0; border-radius: 8px; cursor: pointer;
+}
+.stop-btn:hover { background: #b91c1c; }
 
 .progress { margin-top: 12px; position: relative; background: #eef0f3; border-radius: 6px; height: 22px; overflow: hidden; }
 .progress-bar { height: 100%; background: var(--accent); transition: width .2s; }
@@ -96,6 +104,19 @@ body { background: var(--bg); color: var(--ink); }
 .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-top: 14px; }
 .card h4 { margin: 0 0 10px; font-size: 13px; }
+
+/* Section header with the per-seed map picker */
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.seed-picker { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.seed-picker select { padding: 3px 6px; font-size: 12px; }
+
+/* Paper Table 1 / Table 2 */
+.metrics-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.metrics-table th, .metrics-table td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+.metrics-table th:first-child, .metrics-table td:first-child { text-align: left; }
+.metrics-table thead th { color: var(--muted); font-weight: 600; }
+.metrics-table .row-hi { background: rgba(80, 140, 255, 0.10); font-weight: 600; }
+.small { font-size: 11px; }
 
 .barchart { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
 .bar-row { display: grid; grid-template-columns: 110px 1fr 48px; align-items: center; gap: 8px; font-size: 12px; }

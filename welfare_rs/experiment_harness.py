@@ -116,6 +116,96 @@ def welfare_gain(
     }
 
 
+# ── Paper-exact Table 1 / Table 2 metrics ────────────────────────────────────
+#
+# These reproduce the metrics in the paper's Table 1 (aggregate welfare) and
+# Table 2 (over-recommendation cost) *exactly*, over the leisure trips on the
+# evaluation day. They are deliberately distinct from over_recommendation_cost()
+# / welfare_gain() above, which average a clipped loss over *all* agents on total
+# (all-trip) utility — a different quantity from the paper's per-harmed-agent ORC.
+
+def leisure_net_utility(trip) -> float:
+    """Paper-aligned realised net trip utility ``U = V - C`` for a leisure trip.
+
+    ``V`` is the activity benefit (``trip.activity_utility``) and ``C`` is the
+    generalized travel cost (``trip.gen_cost``) converted to utility units by the
+    same ``gen_cost_denominator`` the simulation uses when travel cost enters mode
+    utility — so V and C live on one scale, matching the paper's Eq. 1 minus the
+    idiosyncratic term.
+    """
+    from . import params
+
+    denom = params.UTILITY_WEIGHTS.get("gen_cost_denominator", 8.0) or 1.0
+    return float(trip.activity_utility - trip.gen_cost / denom)
+
+
+def eval_day_leisure_utilities(agents) -> Dict[int, float]:
+    """Map ``agent_id -> mean leisure net utility`` over the trips currently held
+    on each agent. After ``Simulation.run_days``, these are the last (evaluation)
+    day's trips, since day planning clears ``agent.trips``."""
+    out: Dict[int, float] = {}
+    for a in agents:
+        us = [leisure_net_utility(t) for t in a.trips if t.purpose == "leisure"]
+        if us:
+            out[a.id] = float(np.mean(us))
+    return out
+
+
+def table1_metrics(sim) -> Dict[str, float]:
+    """Paper Table 1 metrics for a single run, over the eval-day leisure trips.
+
+    Returns ``mean_utility`` (Ū), ``neg_rate`` (fraction of trips with U<0),
+    ``gini`` of the trip-utility distribution, ``abstention_rate`` (fraction of
+    leisure recommendation opportunities the RS withheld), and counts. ``sigma_u``
+    (σ_U) is a *cross-seed* quantity and is computed when aggregating seeds, not
+    here.
+    """
+    utils: List[float] = []
+    for a in sim.agents:
+        utils.extend(leisure_net_utility(t) for t in a.trips if t.purpose == "leisure")
+    n = len(utils)
+    opp = sum(1 for a in sim.agents if getattr(a, "had_leisure_opportunity", False))
+    abst = sum(
+        1 for a in sim.agents
+        if getattr(a, "had_leisure_opportunity", False) and getattr(a, "rs_abstained", False)
+    )
+    return {
+        "mean_utility": float(np.mean(utils)) if utils else 0.0,
+        "neg_rate": float(np.mean([u < 0 for u in utils])) if utils else 0.0,
+        "gini": gini_coefficient(utils) if n >= 2 else 0.0,
+        "abstention_rate": (abst / opp) if opp else 0.0,
+        "n_leisure_trips": n,
+        "n_opportunities": opp,
+    }
+
+
+def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
+    """Paper Table 2 (over-recommendation cost) for a treatment vs its matched
+    No-RS counterfactual, on the eval day.
+
+    Agents are matched by id over those who took a leisure trip in *both* runs.
+    Harmed % / Improved %: fraction whose eval-day leisure net utility is lower /
+    higher under the treatment than under No RS. Mean ORC: mean of
+    ``U_organic - U_rec`` over harmed agents only (Eq. 14).
+    """
+    u_rec = eval_day_leisure_utilities(rec_sim.agents)
+    u_org = eval_day_leisure_utilities(organic_sim.agents)
+    common = sorted(set(u_rec) & set(u_org))
+    n = len(common)
+    if n == 0:
+        return {"harmed_pct": 0.0, "improved_pct": 0.0, "mean_orc": 0.0, "n_matched": 0}
+    diffs = [u_rec[i] - u_org[i] for i in common]  # rec - organic
+    harmed = [d for d in diffs if d < 0]
+    improved = [d for d in diffs if d > 0]
+    return {
+        "harmed_pct": len(harmed) / n,
+        "improved_pct": len(improved) / n,
+        # U_organic - U_rec over harmed agents = -(rec - organic).
+        "mean_orc": float(np.mean([-d for d in harmed])) if harmed else 0.0,
+        "n_matched": n,
+    }
+
+
 # ── RM epsilon calibration ───────────────────────────────────────────────────
 
 def calibrate_rm_epsilon(

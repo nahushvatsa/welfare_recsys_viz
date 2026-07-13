@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from service import TREATMENTS, RunConfig
+from service import MAX_SEEDS, TREATMENTS, RunConfig
 
 
 class RunRequest(BaseModel):
-    """Simulation config posted by the frontend (mirrors the old sidebar)."""
+    """Study config posted by the frontend.
+
+    ``seed`` is the base seed; the study sweeps ``seed .. seed + num_seeds - 1``.
+    """
 
     city: str = "nyc_manhattan"
     num_agents: int = Field(80, ge=1, le=5000)
     num_days: int = Field(3, ge=1, le=60)
     seed: int = 42
+    num_seeds: int = Field(3, ge=1, le=MAX_SEEDS)
     treatment: str = "Standard RS"
     multimodal: bool = False
     use_real_pois: bool = True
@@ -27,6 +31,7 @@ class RunRequest(BaseModel):
             num_agents=self.num_agents,
             num_days=self.num_days,
             seed=self.seed,
+            num_seeds=self.num_seeds,
             treatment=treatment,
             multimodal=self.multimodal,
             use_real_pois=self.use_real_pois,

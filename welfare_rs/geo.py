@@ -31,6 +31,7 @@ import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import networkx as nx
+import numpy as np
 import osmnx as ox
 from shapely import STRtree
 from shapely.geometry import LineString, Point
@@ -122,12 +123,33 @@ class RoadNetwork:
         self._ss_cache: Dict[int, Dict[int, float]] = {}
         self._geom_cache: Dict[Tuple[int, int], List[LatLon]] = {}
 
+        # Lazily-built acceleration structures (invalidated by _refresh_nodes):
+        #   _kdtree: haversine BallTree over node coords — O(log n) snapping,
+        #            built once instead of osmnx rebuilding its index per call.
+        #   _csr:    CSR adjacency (min length per directed edge) — lets scipy
+        #            run Dijkstra in C. Both yield identical results to before.
+        self._kdtree = None
+        self._kdtree_nodes = None  # np.ndarray: tree row -> node id
+        self._csr = None
+        self._csr_row: Optional[Dict[int, int]] = None   # node id -> CSR row
+        self._csr_nodes = None     # np.ndarray: CSR row -> node id
+
         # Original road (intersection) nodes — homes/work/organic locations sample
         # only these. POIs may be inserted as extra mid-block nodes (see
         # add_pois_as_nodes) without polluting that pool.
         self._base_nodes: List[int] = list(self.nodes)
         self._poi_nodes: Dict[str, int] = {}
         self._next_poi_node_id = 10_000_000_000_000
+
+    def __getstate__(self) -> dict:
+        """Exclude the lazily-rebuilt acceleration structures from pickling (so
+        the disk cache stays small and isn't coupled to sklearn/scipy pickle
+        versions); they rebuild on first use after a load. The graph + routing
+        caches (the expensive, reusable parts) are persisted."""
+        state = self.__dict__.copy()
+        for k in ("_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes"):
+            state[k] = None
+        return state
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -158,13 +180,35 @@ class RoadNetwork:
     # ── snapping ───────────────────────────────────────────────────────────--
 
     def nearest_node(self, lat: float, lon: float) -> int:
-        """Snap a raw (lat, lon) to the id of the nearest network node (cached)."""
+        """Snap a raw (lat, lon) to the id of the nearest network node (cached).
+
+        Queries a prebuilt haversine ``BallTree`` (built once and reused) rather
+        than ``osmnx.nearest_nodes``, which rebuilds its spatial index on every
+        call. Returns the identical node id (same BallTree-haversine method osmnx
+        uses for unprojected graphs); ~3 orders of magnitude faster on cache miss.
+        """
         key = (round(lat, 6), round(lon, 6))
         node = self._snap_cache.get(key)
         if node is None:
-            node = int(ox.nearest_nodes(self.G, X=lon, Y=lat))
+            self._ensure_kdtree()
+            idx = int(self._kdtree.query(np.radians([[lat, lon]]), k=1,
+                                         return_distance=False)[0][0])
+            node = int(self._kdtree_nodes[idx])
             self._snap_cache[key] = node
         return node
+
+    def _ensure_kdtree(self) -> None:
+        """Build (once) the haversine BallTree over current node coordinates."""
+        if self._kdtree is not None:
+            return
+        from sklearn.neighbors import BallTree  # same backend osmnx uses
+
+        node_ids = list(self.G.nodes)
+        coords = np.radians(
+            np.array([[self._lat[n], self._lon[n]] for n in node_ids], dtype=np.float64)
+        )
+        self._kdtree = BallTree(coords, metric="haversine")
+        self._kdtree_nodes = np.array(node_ids)
 
     def node_latlon(self, node: int) -> LatLon:
         return (self._lat[node], self._lon[node])
@@ -181,26 +225,70 @@ class RoadNetwork:
     # ── routing ──────────────────────────────────────────────────────────────
 
     def route_length_km(self, orig: int, dest: int) -> float:
-        """Network shortest-path length in km between two node ids (cached)."""
+        """Network shortest-path length in km between two node ids (cached).
+
+        Served from the (cached) single-source tree out of ``orig`` rather than a
+        fresh per-pair search: the planner scores many destinations from the same
+        origin, so one Dijkstra amortises across all of them. Identical values.
+        """
         if orig == dest:
             return 0.0
         key = (orig, dest)
         dist = self._dist_cache.get(key)
         if dist is None:
-            try:
-                dist = float(nx.shortest_path_length(self.G, orig, dest, weight="length")) / 1000.0
-            except nx.NetworkXNoPath:
+            meters = self._single_source(orig).get(dest)
+            if meters is None:  # unreachable (shouldn't happen on the routable core)
                 dist = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
+            else:
+                dist = meters / 1000.0
             self._dist_cache[key] = dist
         return dist
 
     def route_length_km_latlon(self, a: LatLon, b: LatLon) -> float:
         return self.route_length_km(self.nearest_node(*a), self.nearest_node(*b))
 
+    def _ensure_csr(self) -> None:
+        """Build (once) a CSR adjacency: the minimum ``length`` among parallel
+        directed edges for each (u, v). networkx Dijkstra also uses the min
+        parallel edge, so distances are identical — but scipy runs in C."""
+        if self._csr is not None:
+            return
+        import scipy.sparse as sp
+
+        node_ids = list(self.G.nodes)
+        row_of = {n: i for i, n in enumerate(node_ids)}
+        best: Dict[Tuple[int, int], float] = {}
+        for u, v, d in self.G.edges(data=True):
+            w = float(d.get("length", 1.0))
+            key = (row_of[u], row_of[v])
+            if key not in best or w < best[key]:
+                best[key] = w
+        n = len(node_ids)
+        if best:
+            keys = list(best.keys())
+            rows = np.fromiter((k[0] for k in keys), dtype=np.int32, count=len(keys))
+            cols = np.fromiter((k[1] for k in keys), dtype=np.int32, count=len(keys))
+            data = np.fromiter((best[k] for k in keys), dtype=np.float64, count=len(keys))
+        else:
+            rows = cols = np.empty(0, dtype=np.int32)
+            data = np.empty(0, dtype=np.float64)
+        self._csr = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+        self._csr_row = row_of
+        self._csr_nodes = np.array(node_ids)
+
     def _single_source(self, src: int) -> Dict[int, float]:
+        """Shortest-path lengths (metres) from ``src`` to every reachable node,
+        cached per source. Computed with scipy csgraph Dijkstra (C-level) instead
+        of networkx — identical distances, ~10-20x faster."""
         lengths = self._ss_cache.get(src)
         if lengths is None:
-            lengths = nx.single_source_dijkstra_path_length(self.G, src, weight="length")
+            from scipy.sparse.csgraph import dijkstra
+
+            self._ensure_csr()
+            dist = dijkstra(self._csr, directed=True, indices=self._csr_row[src])
+            nodes = self._csr_nodes
+            finite = np.nonzero(np.isfinite(dist))[0]
+            lengths = {int(nodes[i]): float(dist[i]) for i in finite}
             self._ss_cache[src] = lengths
         return lengths
 
@@ -278,6 +366,12 @@ class RoadNetwork:
         self._dist_cache.clear()
         self._ss_cache.clear()
         self._geom_cache.clear()
+        # Acceleration structures must be rebuilt against the new node set.
+        self._kdtree = None
+        self._kdtree_nodes = None
+        self._csr = None
+        self._csr_row = None
+        self._csr_nodes = None
 
     def _split_edge_through(self, a: int, b: int, k, poi_node_ids: List[int]) -> None:
         """Replace directed edge (a,b,k) with a chain a → … → b through the given

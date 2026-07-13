@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { CitiesResponse, RunConfig, RunMeta } from "../types";
 
 export type RunStatus = "idle" | "running" | "ready" | "error";
@@ -7,6 +8,7 @@ interface ControlsProps {
   config: RunConfig;
   setConfig: (patch: Partial<RunConfig>) => void;
   onRun: () => void;
+  onStop: () => void;
   status: RunStatus;
   progress: { current: number; total: number } | null;
   runMeta: RunMeta | null;
@@ -19,6 +21,7 @@ export default function Controls({
   config,
   setConfig,
   onRun,
+  onStop,
   status,
   progress,
   runMeta,
@@ -28,6 +31,18 @@ export default function Controls({
   const showPup = config.treatment === "PUP" || config.treatment === "PUP+RM";
   const showRm = config.treatment === "RM" || config.treatment === "PUP+RM";
   const running = status === "running";
+
+  // Numeric fields are edited as raw text so they can be fully erased/retyped
+  // (a controlled number coerced empty -> 1, causing "type 5, get 15"). The
+  // config's number is only updated when the text is valid; while it's
+  // empty/invalid we surface an error and block Run.
+  const [agentsText, setAgentsText] = useState(String(config.num_agents));
+  const [daysText, setDaysText] = useState(String(config.num_days));
+  const [seedsText, setSeedsText] = useState(String(config.num_seeds));
+  const agents = validateInt(agentsText, 1, 5000);
+  const days = validateInt(daysText, 1, 60);
+  const seeds = validateInt(seedsText, 1, 12);
+  const inputError = agents.error ?? days.error ?? seeds.error;
 
   return (
     <aside className="sidebar">
@@ -54,9 +69,15 @@ export default function Controls({
           type="number"
           min={1}
           max={5000}
-          value={config.num_agents}
-          onChange={(e) => setConfig({ num_agents: clampInt(e.target.value, 1, 5000) })}
+          value={agentsText}
+          aria-invalid={agents.error ? true : undefined}
+          onChange={(e) => {
+            setAgentsText(e.target.value);
+            const v = validateInt(e.target.value, 1, 5000).value;
+            if (v !== null) setConfig({ num_agents: v });
+          }}
         />
+        {agents.error && <span className="field-error">{agents.error}</span>}
       </label>
       <label>
         Days
@@ -64,17 +85,39 @@ export default function Controls({
           type="number"
           min={1}
           max={60}
-          value={config.num_days}
-          onChange={(e) => setConfig({ num_days: clampInt(e.target.value, 1, 60) })}
+          value={daysText}
+          aria-invalid={days.error ? true : undefined}
+          onChange={(e) => {
+            setDaysText(e.target.value);
+            const v = validateInt(e.target.value, 1, 60).value;
+            if (v !== null) setConfig({ num_days: v });
+          }}
         />
+        {days.error && <span className="field-error">{days.error}</span>}
       </label>
       <label>
-        Random seed
+        Base random seed
         <input
           type="number"
           value={config.seed}
           onChange={(e) => setConfig({ seed: parseInt(e.target.value || "0", 10) })}
         />
+      </label>
+      <label title="Number of random seeds to sweep. The study runs all of them (in parallel), reports Table 1 with σ_U = std across seeds, and lets you switch which seed the map shows. Seeds are base .. base+N−1.">
+        Seeds (run in parallel)
+        <input
+          type="number"
+          min={1}
+          max={12}
+          value={seedsText}
+          aria-invalid={seeds.error ? true : undefined}
+          onChange={(e) => {
+            setSeedsText(e.target.value);
+            const v = validateInt(e.target.value, 1, 12).value;
+            if (v !== null) setConfig({ num_seeds: v });
+          }}
+        />
+        {seeds.error && <span className="field-error">{seeds.error}</span>}
       </label>
       <label>
         Recommender
@@ -107,7 +150,6 @@ export default function Controls({
         />
         Real NYC POIs {cities.pois_available ? "" : "(dataset not found)"}
       </label>
-
       {showPup && (
         <label>
           PUP α (min P[U≥0]): {config.pup_alpha.toFixed(2)}
@@ -135,9 +177,20 @@ export default function Controls({
         </label>
       )}
 
-      <button className="run-btn" onClick={onRun} disabled={running}>
-        {running ? "Running…" : "▶ Run simulation"}
-      </button>
+      {running ? (
+        <button className="stop-btn" onClick={onStop}>■ Stop simulation</button>
+      ) : (
+        <button
+          className="run-btn"
+          onClick={() => { if (!inputError) onRun(); }}
+          disabled={!!inputError}
+        >
+          ▶ Run simulation
+        </button>
+      )}
+      {!running && inputError && (
+        <p className="error">Fix the highlighted settings above to run.</p>
+      )}
 
       {running && progress && (
         <div className="progress">
@@ -147,8 +200,8 @@ export default function Controls({
           />
           <span className="progress-text">
             {progress.current === 0
-              ? "Preparing simulation…"
-              : `Running day ${progress.current} of ${progress.total}…`}
+              ? "Preparing study (building network)…"
+              : `Completed ${progress.current} of ${progress.total} seed${progress.total > 1 ? "s" : ""}…`}
           </span>
         </div>
       )}
@@ -170,8 +223,15 @@ export default function Controls({
   );
 }
 
-function clampInt(v: string, lo: number, hi: number): number {
-  const n = parseInt(v || "0", 10);
-  if (Number.isNaN(n)) return lo;
-  return Math.max(lo, Math.min(hi, n));
+function validateInt(
+  text: string,
+  lo: number,
+  hi: number
+): { value: number | null; error: string | null } {
+  const t = text.trim();
+  if (t === "") return { value: null, error: "Required" };
+  if (!/^\d+$/.test(t)) return { value: null, error: "Whole number only" };
+  const n = parseInt(t, 10);
+  if (n < lo || n > hi) return { value: null, error: `Must be ${lo}–${hi}` };
+  return { value: n, error: null };
 }

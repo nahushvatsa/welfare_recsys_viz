@@ -55,7 +55,13 @@ class Trip:
         emissions_g: CO2e grams.
         utility: Total utility (travel utility + activity utility).
         travel_utility: Utility component of travel itself.
-        activity_utility: Utility component of destination activity.
+        activity_utility: Utility component of destination activity (the paper's
+            activity benefit V_ik for leisure trips).
+        gen_cost: Generalized travel cost (the paper's C_ik), in dollar-equivalent
+            units: (travel_time_hr * VOT * beta_time) + (monetary_cost * beta_cost).
+            The paper-aligned net trip utility in *utility* units is
+            ``activity_utility - gen_cost / UTILITY_WEIGHTS['gen_cost_denominator']``
+            (see welfare_rs.experiment_harness.leisure_net_utility).
         arrival_time: Arrival time in minutes.
     """
 
@@ -79,3 +85,4 @@ class Trip:
     travel_utility: float
     activity_utility: float
     arrival_time: int
+    gen_cost: float = 0.0

@@ -4,12 +4,42 @@ export interface RunConfig {
   city: string;
   num_agents: number;
   num_days: number;
-  seed: number;
+  seed: number; // base seed; the study sweeps seed .. seed + num_seeds - 1
+  num_seeds: number;
   treatment: string;
   multimodal: boolean;
   use_real_pois: boolean;
   pup_alpha: number;
   rm_epsilon: number;
+}
+
+// Paper Table 1 (aggregate welfare) — one row per condition, averaged over seeds.
+export interface Table1Row {
+  condition: string;
+  mean_utility: number; // Ū
+  sigma_u: number; // std of per-seed Ū
+  neg_rate: number; // fraction of leisure trips with U < 0
+  abstention_rate: number; // fraction of opportunities the RS withheld
+  gini: number;
+  n_leisure_trips: number;
+}
+
+// Paper Table 2 (over-recommendation cost), treatment vs matched No-RS.
+export interface Table2Row {
+  condition: string;
+  harmed_pct: number;
+  improved_pct: number;
+  mean_orc: number;
+  n_matched: number;
+}
+
+export interface Headline {
+  mean_utility: number;
+  sigma_u: number;
+  neg_rate: number;
+  harmed_pct: number | null;
+  improved_pct: number | null;
+  mean_orc: number | null;
 }
 
 export interface Area {
@@ -27,15 +57,19 @@ export interface CitiesResponse {
 export interface RunMeta {
   run_id: string;
   config: RunConfig;
-  summary: Record<string, any>;
-  day_summaries: Array<Record<string, any>>;
+  seeds: number[];
+  default_seed: number;
+  time_spans: Record<string, number>; // per-seed time span (keyed by seed string)
+  table1: Table1Row[];
+  table2: Table2Row | null;
+  headline: Headline;
+  aggregate: Record<string, number>;
   view: { latitude: number; longitude: number };
   bounds: { south: number; west: number; north: number; east: number };
   num_days: number;
   num_intersections: number;
   poi_count: number;
   poi_source: string;
-  time_span: number;
   area_label: string;
 }
 
@@ -95,4 +129,5 @@ export type BBox = [number, number, number, number]; // south, west, north, east
 export type ProgressEvent =
   | { type: "progress"; current: number; total: number }
   | { type: "done"; run_id: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "cancelled"; run_id: string };

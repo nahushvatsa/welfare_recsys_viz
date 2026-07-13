@@ -14,10 +14,11 @@ keywords = ["agent-based-model", "recommender-systems", "travel-behaviour", "wel
 # Core engine dependencies only — no web framework, no visualization stack.
 dependencies = [
     "numpy",
+    "scipy",         # csgraph Dijkstra for fast network routing (geo.py)
     "networkx",
     "osmnx>=1.9",
     "shapely>=2.0",
-    "scikit-learn",  # osmnx.nearest_nodes (snapping personas/POIs to the graph)
+    "scikit-learn",  # BallTree snapping of personas/POIs to the graph (geo.py)
 ]
 
 [project.optional-dependencies]

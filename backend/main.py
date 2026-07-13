@@ -6,10 +6,13 @@ Endpoints (all under ``/api``) let the browser stream only what it needs:
 * ``POST /api/runs``                           — start (or hit cached) run
 * ``GET  /api/runs/{id}``                      — run summary + view/bounds
 * ``GET  /api/runs/{id}/events``               — SSE per-day progress
-* ``GET  /api/runs/{id}/timeline?t0&t1&bbox``  — windowed trip/stay keyframes
-* ``GET  /api/runs/{id}/positions?t&bbox``     — exact-instant positions
-* ``GET  /api/runs/{id}/trips/{trip_id}/geometry`` — full route (on demand)
-* ``GET  /api/runs/{id}/pois?bbox``            — viewport POIs
+* ``GET  /api/runs/{id}/timeline?seed&t0&t1&bbox``  — windowed trip/stay keyframes
+* ``GET  /api/runs/{id}/positions?seed&t&bbox``     — exact-instant positions
+* ``GET  /api/runs/{id}/trips/{trip_id}/geometry?seed`` — full route (on demand)
+* ``GET  /api/runs/{id}/pois?seed&bbox``            — viewport POIs
+
+A "run" is a multi-seed *study*; the geometry endpoints take an optional ``seed``
+to pick which seed's trips the map shows (defaults to the study's first seed).
 
 The built React frontend (``frontend/dist``) is mounted at ``/`` when present.
 
@@ -109,6 +112,12 @@ def get_run(run_id: str) -> dict:
     return _require_run(run_id).meta()
 
 
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_run(run_id: str) -> dict:
+    """Cleanly stop a running study; it aborts (no result) within ~one day."""
+    return {"run_id": run_id, "cancelled": manager.cancel(run_id)}
+
+
 @app.get("/api/runs/{run_id}/events")
 def run_events(run_id: str) -> StreamingResponse:
     """Server-sent events: per-day progress, then a terminal done/error event."""
@@ -130,7 +139,7 @@ def run_events(run_id: str) -> StreamingResponse:
                 yield ": keep-alive\n\n"
                 continue
             yield f"data: {json.dumps(event)}\n\n"
-            if event.get("type") in ("done", "error"):
+            if event.get("type") in ("done", "error", "cancelled"):
                 break
 
     return StreamingResponse(
@@ -142,47 +151,63 @@ def run_events(run_id: str) -> StreamingResponse:
 
 # ── Geometry / positions (the streamed, viewport-culled payloads) ─────────────
 
+def _require_seed_viz(run_id: str, seed: Optional[int]):
+    run = _require_run(run_id)
+    sv = run.viz(seed)
+    if sv is None:
+        raise HTTPException(status_code=404, detail="no geometry for this study")
+    return sv
+
+
 @app.get("/api/runs/{run_id}/timeline")
 def timeline(
     run_id: str,
+    seed: Optional[int] = Query(None),
     t0: float = Query(0.0),
     t1: Optional[float] = Query(None),
     bbox: Optional[str] = Query(None),
 ) -> dict:
-    run = _require_run(run_id)
-    hi = run.time_span if t1 is None else t1
+    sv = _require_seed_viz(run_id, seed)
+    hi = sv.time_span if t1 is None else t1
     box = _parse_bbox(bbox)
     return {
+        "seed": sv.seed,
         "t0": t0,
         "t1": hi,
-        "trips": viz.window_trips(run.merged, t0, hi, box),
-        "stays": viz.window_stays(run.merged, t0, hi, box),
+        "trips": viz.window_trips(sv.merged, t0, hi, box),
+        "stays": viz.window_stays(sv.merged, t0, hi, box),
     }
 
 
 @app.get("/api/runs/{run_id}/positions")
 def positions(
     run_id: str,
+    seed: Optional[int] = Query(None),
     t: float = Query(0.0),
     bbox: Optional[str] = Query(None),
 ) -> dict:
-    run = _require_run(run_id)
-    return {"t": t, "positions": viz.positions_at(run.merged, t, _parse_bbox(bbox))}
+    sv = _require_seed_viz(run_id, seed)
+    return {"seed": sv.seed, "t": t, "positions": viz.positions_at(sv.merged, t, _parse_bbox(bbox))}
 
 
 @app.get("/api/runs/{run_id}/trips/{trip_id}/geometry")
-def trip_geometry(run_id: str, trip_id: str) -> dict:
-    run = _require_run(run_id)
-    mv = run.trip_index.get(trip_id)
+def trip_geometry(run_id: str, trip_id: str, seed: Optional[int] = Query(None)) -> dict:
+    sv = _require_seed_viz(run_id, seed)
+    mv = sv.trip_index.get(trip_id)
     if mv is None:
         raise HTTPException(status_code=404, detail="unknown trip id")
     return viz.trip_geometry(mv)
 
 
 @app.get("/api/runs/{run_id}/pois")
-def pois(run_id: str, bbox: Optional[str] = Query(None), limit: int = Query(4000)) -> dict:
-    run = _require_run(run_id)
-    return {"pois": viz.pois_in_bbox(run.pois, _parse_bbox(bbox), limit=limit)}
+def pois(
+    run_id: str,
+    seed: Optional[int] = Query(None),
+    bbox: Optional[str] = Query(None),
+    limit: int = Query(4000),
+) -> dict:
+    sv = _require_seed_viz(run_id, seed)
+    return {"pois": viz.pois_in_bbox(sv.pois, _parse_bbox(bbox), limit=limit)}
 
 
 # ── Static frontend (built React app), mounted last so /api wins ──────────────

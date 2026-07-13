@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import random
 
 import numpy as np
@@ -31,6 +32,10 @@ class City:
         # mutate the template in params.py.
         self.context = copy.deepcopy(cp["default_context"])
         self.context["community_mode_bias"] = dict(cp["community_mode_bias"])
+
+        # Leisure POI catalog indexed by subtype (set by Simulation via set_pois).
+        # Lets organic leisure choices target real places — see sample_poi.
+        self._pois_by_subtype = None
 
         if road_network is None:
             self._build_zones()
@@ -88,6 +93,44 @@ class City:
         if not pool:
             return (self.rng.randrange(self.size_x), self.rng.randrange(self.size_y))
         return self.rng.choice(pool)
+
+    def set_pois(self, pois_by_subtype):
+        """Register the leisure POI catalog indexed by subtype.
+
+        ``pois_by_subtype`` maps a leisure subtype (e.g. ``"museum"``) to a list
+        of Place objects of that subtype. Enables :meth:`sample_poi` to resolve
+        organic leisure destinations to real places instead of random nodes.
+        """
+        self._pois_by_subtype = pois_by_subtype
+
+    def sample_poi(self, subtype, origin, rng, fallback_zone_weights=None):
+        """Sample a destination POI for a leisure subtype, favouring nearer places.
+
+        This is the organic (non-recommended) choice: among the real POIs of the
+        chosen subtype, a place is drawn with probability ``∝ exp(-dist/scale)`` so
+        closer options dominate — the proximity-driven "self-selected alternative"
+        from the paper. Distances use straight-line (haversine) proximity in OSM
+        mode, mirroring the recommenders' proximity heuristic; realized travel cost
+        is still measured on the network downstream.
+
+        Falls back to :meth:`sample_location_weighted` (a random node) when there
+        is no catalog or no POI matches the subtype, preserving prior behaviour.
+        """
+        places = self._pois_by_subtype.get(subtype) if self._pois_by_subtype else None
+        if not places:
+            return self.sample_location_weighted(fallback_zone_weights or {})
+        if len(places) == 1:
+            return places[0].location
+        scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
+        if self.road_network is not None:
+            from .geo import haversine_km
+            dist = haversine_km
+        else:
+            dist = self.distance_km
+        weights = [math.exp(-dist(origin, p.location) / scale) for p in places]
+        if sum(weights) <= 0:
+            return rng.choice(places).location
+        return rng.choices(places, weights=weights, k=1)[0].location
 
     def sample_location_weighted(self, zone_weights):
         """Sample a location by weighted zone types (random node in OSM mode)."""

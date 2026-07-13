@@ -91,17 +91,27 @@ def _normalize(values: Sequence[float]) -> List[float]:
     return [(v - vmin) / (vmax - vmin) for v in values]
 
 
-def _token_overlap_score(tokens_a: Iterable[str], tokens_b: Iterable[str]) -> float:
-    """Return overlap score in [0, 1] using Jaccard similarity."""
-    set_a = {t.lower().strip() for t in tokens_a if t}
-    set_b = {t.lower().strip() for t in tokens_b if t}
-    if not set_a and not set_b:
-        return 0.0
+def _normalize_tokens(tokens: Iterable[str]) -> frozenset:
+    """Lower/strip tokens into a set (the form Jaccard compares)."""
+    return frozenset(t.lower().strip() for t in tokens if t)
+
+
+def _jaccard(set_a: frozenset, set_b: frozenset) -> float:
+    """Jaccard similarity of two already-normalized token sets, in [0, 1]."""
     if not set_a or not set_b:
         return 0.0
-    inter = len(set_a.intersection(set_b))
-    union = len(set_a.union(set_b))
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
     return inter / max(1, union)
+
+
+def _token_overlap_score(tokens_a: Iterable[str], tokens_b: Iterable[str]) -> float:
+    """Return overlap score in [0, 1] using Jaccard similarity.
+
+    Thin wrapper kept for callers that pass raw token iterables; the hot path
+    (GoogleMapsReplica) precomputes the sets once and calls ``_jaccard`` directly.
+    """
+    return _jaccard(_normalize_tokens(tokens_a), _normalize_tokens(tokens_b))
 
 
 class RecommenderSystem(ABC):
@@ -202,6 +212,11 @@ class GoogleMapsReplica(RecommenderSystem):
         # Distance between two location tuples. Defaults to Euclidean (grid mode);
         # OSM mode injects haversine so (lat, lon) proximity is measured in km.
         self.coord_distance_km = coord_distance_km
+        # Precompute each place's normalized keyword set once (it never changes),
+        # so relevance scoring doesn't rebuild it on every candidate × user × day.
+        self._place_tokens: Dict[str, frozenset] = {
+            p.place_id: _normalize_tokens(p.keywords) for p in self.catalog
+        }
 
     def _prominence_scores(self, places: Sequence[Place]) -> Dict[str, float]:
         if not places:
@@ -215,14 +230,21 @@ class GoogleMapsReplica(RecommenderSystem):
         ]
         return {places[i].place_id: prominence[i] for i in range(len(places))}
 
-    def _relevance_score(self, place: Place, user: UserContext, leisure_subtype: str) -> float:
+    def _query_interest_sets(self, user: UserContext, leisure_subtype: str):
+        """Normalized (query_set, interest_set) for a recommend() call — built
+        once per call, not once per candidate."""
         query_tokens = list(user.query_keywords)
         if not query_tokens:
             query_tokens = list(LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS.get(leisure_subtype, ()))
-        interest_tokens = list(user.interest_keywords)
-        qr_score = _token_overlap_score(place.keywords, query_tokens)
-        qi_score = _token_overlap_score(place.keywords, interest_tokens)
-        return 0.75 * qr_score + 0.25 * qi_score
+        return _normalize_tokens(query_tokens), _normalize_tokens(user.interest_keywords)
+
+    def _relevance_from_sets(self, place: Place, query_set: frozenset, interest_set: frozenset) -> float:
+        pset = self._place_tokens.get(place.place_id) or _normalize_tokens(place.keywords)
+        return 0.75 * _jaccard(pset, query_set) + 0.25 * _jaccard(pset, interest_set)
+
+    def _relevance_score(self, place: Place, user: UserContext, leisure_subtype: str) -> float:
+        query_set, interest_set = self._query_interest_sets(user, leisure_subtype)
+        return self._relevance_from_sets(place, query_set, interest_set)
 
     def _proximity_score(self, place: Place, user: UserContext) -> float:
         dist_km = self.coord_distance_km(user.location, place.location) * self.coord_scale_km
@@ -233,10 +255,13 @@ class GoogleMapsReplica(RecommenderSystem):
         if not candidates:
             return []
         prominence_by_id = self._prominence_scores(candidates)
+        # Query/interest token sets are identical for every candidate in this
+        # call — build them once here instead of per place inside the loop.
+        query_set, interest_set = self._query_interest_sets(user, leisure_subtype)
         scored: List[Recommendation] = []
         for place in candidates:
             prominence = prominence_by_id.get(place.place_id, 0.0)
-            relevance = self._relevance_score(place, user, leisure_subtype)
+            relevance = self._relevance_from_sets(place, query_set, interest_set)
             proximity = self._proximity_score(place, user)
             base_score = (
                 self.prominence_weight * prominence

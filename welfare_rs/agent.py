@@ -85,6 +85,14 @@ class Agent:
         self.daily_recommendations = {}
         self.daily_recommendation_choice = None
         self.daily_recommendation_source = "organic"
+        # Per-day welfare-metric flags (reflect the most recently planned day).
+        # had_leisure_opportunity: agent committed to a leisure outing (a slot
+        # where the RS could have issued a suggestion). rs_abstained: that outing
+        # received no recommendation (RS withheld / no candidate survived filtering,
+        # or there was no RS at all). Together they yield the paper's abstention
+        # rate over recommendation opportunities.
+        self.had_leisure_opportunity = False
+        self.rs_abstained = False
         self.persona_id = ""
         self.car_access_type = "own car" if car_ownership else "no car"
         self.transit_access_level = 0.5
@@ -838,6 +846,8 @@ class Agent:
         self.last_recommendation_accepted = False
         self.daily_recommendation_source = "organic"
         self.daily_recommendation_choice = None
+        self.had_leisure_opportunity = False
+        self.rs_abstained = False
 
         if remote_today:
             schedule.append(Activity("work", "", "organic", False, "", work_start, work_duration, self.home, is_mandatory=True))
@@ -885,7 +895,11 @@ class Agent:
             leisure_delay = rng.randint(*seg_cfg["delay_minmax"])
             leisure_duration = rng.randint(*seg_cfg["duration_minmax"])
             leisure_start = after_work_start + leisure_delay
-            desired_location = city.sample_location_weighted(seg_cfg["zone_weights"])
+            # Organic leisure destination: a real POI of this subtype, chosen by
+            # proximity (falls back to a random node if the catalog has none).
+            desired_location = city.sample_poi(
+                subtype, origin_after_work, rng, fallback_zone_weights=seg_cfg["zone_weights"]
+            )
 
             open_start, open_end = self._authority_window(city, subtype)
             if leisure_start < open_start:
@@ -963,6 +977,12 @@ class Agent:
         if do_leisure and chosen is not None:
             subtype = chosen["subtype"]
             best_rec = self.daily_recommendations.get(subtype, {}).get("best")
+            # Abstention bookkeeping: this leisure outing is a recommendation
+            # opportunity; it counts as withheld when the RS surfaced no candidate
+            # for the chosen subtype (filtered out under PUP/RM, none available, or
+            # no RS at all). Mirrors Table 1's "Abst." column.
+            self.had_leisure_opportunity = True
+            self.rs_abstained = best_rec is None
             eta = 0.0
             accepted = False
             chosen_location = chosen["desired_location"]

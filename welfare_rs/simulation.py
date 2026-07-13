@@ -22,6 +22,12 @@ from .recommender_systems import (
 )
 
 
+class SimulationCancelled(Exception):
+    """Raised by :meth:`Simulation.run_days` when a ``should_stop`` callback
+    signals cancellation between days. Picklable (no args) so it propagates
+    cleanly out of worker processes."""
+
+
 class Simulation:
     """Orchestrates the day, applies mode choice, and aggregates statistics."""
 
@@ -76,6 +82,19 @@ class Simulation:
         # Place catalog and agents must exist before some recommender factories
         # can finish wiring treatment-specific stacks (for example Oracle).
         self.place_catalog = self._build_place_catalog()
+
+        # Index the catalog by leisure subtype so organic leisure choices resolve
+        # to real POIs (City.sample_poi) rather than random intersections — both
+        # organic and recommended visits now land on catalog places, which is what
+        # makes footfall-per-POI meaningful and matches the paper's proximity-based
+        # self-selected alternative.
+        from .recommender_systems import LEISURE_SUBTYPE_TO_CATEGORIES
+
+        pois_by_subtype = {}
+        for _subtype, _cats in LEISURE_SUBTYPE_TO_CATEGORIES.items():
+            _catset = set(_cats)
+            pois_by_subtype[_subtype] = [p for p in self.place_catalog if p.category in _catset]
+        self.city.set_pois(pois_by_subtype)
 
         _num_agents = num_agents if num_agents is not None else sd["num_agents"]
         self.agents = []
@@ -740,9 +759,14 @@ class Simulation:
         for agent in self.agents:
             agent.plan_day(self.city, self.rng, recommender_stack=rs_for_agent, day_index=day_index)
 
-    def run_days(self, num_days=7, progress=None, on_day_complete=None):
+    def run_days(self, num_days=7, progress=None, on_day_complete=None, should_stop=None):
+        """Run ``num_days`` days. If ``should_stop`` is given and returns True at
+        the start of a day, raise :class:`SimulationCancelled` (used for clean
+        mid-run cancellation; has no effect on results when unused)."""
         outputs = []
         for day in range(num_days):
+            if should_stop is not None and should_stop():
+                raise SimulationCancelled()
             if progress is not None:
                 progress(day + 1, num_days)
             if day > 0:
@@ -1168,6 +1192,7 @@ class Simulation:
                         travel_utility=data["travel_utility"],
                         activity_utility=data["activity_utility"],
                         arrival_time=arrival_time,
+                        gen_cost=data["gen_cost"],
                     )
                     agent.trips.append(trip)
 

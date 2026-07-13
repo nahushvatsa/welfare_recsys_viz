@@ -43,24 +43,40 @@ export function getRun(runId: string): Promise<RunMeta> {
   return getJSON<RunMeta>(`${API}/runs/${runId}`);
 }
 
+/** Request a clean stop of a running study (aborts within ~one day). */
+export async function cancelRun(runId: string): Promise<void> {
+  await fetch(`${API}/runs/${runId}/cancel`, { method: "POST" });
+}
+
+function seedParam(seed?: number): string {
+  return seed == null ? "" : `&seed=${seed}`;
+}
+
 export function getTimeline(
   runId: string,
   t0: number,
   t1: number,
-  bbox?: BBox
+  bbox?: BBox,
+  seed?: number
 ): Promise<TimelineResponse> {
   return getJSON<TimelineResponse>(
-    `${API}/runs/${runId}/timeline?t0=${t0}&t1=${t1}${bboxParam(bbox)}`
+    `${API}/runs/${runId}/timeline?t0=${t0}&t1=${t1}${bboxParam(bbox)}${seedParam(seed)}`
   );
 }
 
-export function getTripGeometry(runId: string, tripId: string): Promise<TripGeometry> {
-  return getJSON<TripGeometry>(`${API}/runs/${runId}/trips/${tripId}/geometry`);
+export function getTripGeometry(
+  runId: string,
+  tripId: string,
+  seed?: number
+): Promise<TripGeometry> {
+  return getJSON<TripGeometry>(
+    `${API}/runs/${runId}/trips/${tripId}/geometry?_=1${seedParam(seed)}`
+  );
 }
 
-export async function getPois(runId: string, bbox?: BBox): Promise<Poi[]> {
+export async function getPois(runId: string, bbox?: BBox, seed?: number): Promise<Poi[]> {
   const data = await getJSON<{ pois: Poi[] }>(
-    `${API}/runs/${runId}/pois?limit=4000${bboxParam(bbox)}`
+    `${API}/runs/${runId}/pois?limit=4000${bboxParam(bbox)}${seedParam(seed)}`
   );
   return data.pois;
 }
@@ -77,7 +93,7 @@ export function subscribeProgress(
     try {
       const e = JSON.parse(msg.data) as ProgressEvent;
       onEvent(e);
-      if (e.type === "done" || e.type === "error") src.close();
+      if (e.type === "done" || e.type === "error" || e.type === "cancelled") src.close();
     } catch {
       /* ignore keep-alive comments */
     }

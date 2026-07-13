@@ -165,6 +165,12 @@ CITY_PARAMS: dict = {
     "road_capacity_floor": 60,
     "transit_capacity_multiplier": 2.5,
     "transit_capacity_floor": 120,
+    # Organic (non-recommended) leisure choice: when an agent picks a place for the
+    # chosen subtype itself, nearer real POIs are favoured via exp(-dist/scale_km).
+    # This is the proximity term of the paper's self-selected alternative; the RS,
+    # by contrast, also weighs quality/popularity/personalization and may steer the
+    # agent to a farther place. Smaller = more strongly local.
+    "organic_poi_proximity_scale_km": 3.0,
     "community_mode_bias": {
         "walk": 0.05,
         "bike": 0.10,
