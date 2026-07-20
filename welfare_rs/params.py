@@ -151,16 +151,9 @@ POI_PARAMS: dict = {
     ],
 }
 
-# ── City / spatial environment ───────────────────────────────────────────────
+# ── Spatial environment / shared context ─────────────────────────────────────
 
 CITY_PARAMS: dict = {
-    "block_km": 0.2,
-    "zone_probabilities": {
-        "residential": 0.55,
-        "employment": 0.15,
-        "leisure": 0.15,
-        "mixed": 0.15,
-    },
     "road_capacity_multiplier": 1.8,
     "road_capacity_floor": 60,
     "transit_capacity_multiplier": 2.5,
@@ -206,7 +199,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 1.0,
         "duration_minmax": (25, 75),
         "delay_minmax": (10, 45),
-        "zone_weights": {"mixed": 0.45, "employment": 0.30, "residential": 0.20, "leisure": 0.05},
         "activity_utility": 0.35,
     },
     "food_dine_in": {
@@ -214,7 +206,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 1.0,
         "duration_minmax": (60, 150),
         "delay_minmax": (20, 75),
-        "zone_weights": {"mixed": 0.50, "employment": 0.25, "residential": 0.15, "leisure": 0.10},
         "activity_utility": 0.55,
     },
     "live_music": {
@@ -222,7 +213,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 0.55,
         "duration_minmax": (90, 210),
         "delay_minmax": (45, 150),
-        "zone_weights": {"leisure": 0.60, "mixed": 0.30, "employment": 0.10, "residential": 0.0},
         "activity_utility": 0.70,
     },
     "workout_or_run": {
@@ -230,7 +220,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 0.95,
         "duration_minmax": (40, 110),
         "delay_minmax": (10, 60),
-        "zone_weights": {"leisure": 0.45, "residential": 0.35, "mixed": 0.20, "employment": 0.0},
         "activity_utility": 0.60,
     },
     "cafe_friend": {
@@ -238,7 +227,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 0.9,
         "duration_minmax": (45, 135),
         "delay_minmax": (15, 90),
-        "zone_weights": {"mixed": 0.50, "residential": 0.30, "leisure": 0.20, "employment": 0.0},
         "activity_utility": 0.55,
     },
     "museum": {
@@ -246,7 +234,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 0.45,
         "duration_minmax": (75, 180),
         "delay_minmax": (25, 120),
-        "zone_weights": {"leisure": 0.70, "mixed": 0.25, "employment": 0.05, "residential": 0.0},
         "activity_utility": 0.65,
     },
     "park": {
@@ -254,7 +241,6 @@ LEISURE_SEGMENTS: dict = {
         "base_weight": 0.75,
         "duration_minmax": (40, 140),
         "delay_minmax": (10, 80),
-        "zone_weights": {"leisure": 0.50, "residential": 0.45, "mixed": 0.05, "employment": 0.0},
         "activity_utility": 0.50,
     },
 }
@@ -271,13 +257,6 @@ CATEGORY_KEYWORDS: dict = {
     "running_route": ("run", "outdoor", "fitness"),
     "museum": ("museum", "art", "culture"),
     "park": ("park", "green", "outdoor"),
-}
-
-ZONE_CATEGORY_MIX: dict = {
-    "residential": ("cafe", "food_takeout", "park", "running_route", "gym"),
-    "employment": ("restaurant", "food_takeout", "cafe", "fitness_studio"),
-    "leisure": ("museum", "park", "live_music", "concert_venue", "music_event", "cafe"),
-    "mixed": ("restaurant", "cafe", "food_takeout", "fitness_studio", "museum"),
 }
 
 # ── Transport mode parameters ────────────────────────────────────────────────
@@ -482,19 +461,29 @@ CATALOG_PARAMS: dict = {
     "review_count_range": (20, 5000),
     "popularity_multiplier_range": (1.0, 9.0),
     "popularity_floor": 10.0,
-    # OSM mode has no zones: synthetic POIs are placed on random network nodes,
-    # this many (lo, hi) per category, guaranteeing candidates for every subtype.
+    # Synthetic-catalog fallback: POIs are placed on random network nodes, this
+    # many (lo, hi) per category, guaranteeing candidates for every subtype.
     "osm_places_per_category": (6, 14),
-    "places_per_zone": {
-        "leisure": (1, 3),
-        "mixed": (1, 2),
-        "residential": (0, 2),
-        "employment": (0, 2),
-    },
-    "required_categories": [
-        "food_takeout", "restaurant", "cafe", "live_music",
-        "fitness_studio", "running_route", "museum", "park",
-    ],
+}
+
+# ── Dynamic POI prominence (PlaceDynamics) ───────────────────────────────────
+#
+# Live per-POI state accumulated during a run: every leisure visit (recommended
+# or organic) adds footfall to the place's popularity, and every like/dislike
+# from an accepted recommendation posts a "review" that moves the place's
+# rating via a Bayesian average around the synthetic base rating.
+
+POI_DYNAMICS: dict = {
+    # Pseudo-review weight of the base (prior) rating: higher = new feedback
+    # moves the public rating more slowly.
+    "prior_weight": 20.0,
+    # Star value a like / dislike contributes to the rating average.
+    "like_star": 5.0,
+    "dislike_star": 1.0,
+    "rating_min": 1.0,
+    "rating_max": 5.0,
+    # Popularity points added per recorded visit (footfall signal).
+    "visit_popularity_boost": 25.0,
 }
 
 # ── Agent defaults ───────────────────────────────────────────────────────────
@@ -771,7 +760,6 @@ MODE_AVAILABILITY: dict = {
 
 SIM_DEFAULTS: dict = {
     "num_agents": 200,
-    "city_size": 16,
     "seed": 42,
     "time_step": 5,
     "reference_point_smoothing": 0.2,   # alpha in exponential smoothing

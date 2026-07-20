@@ -13,7 +13,9 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from .utils import haversine_km
 
 
 Coordinate = Tuple[float, float]
@@ -75,9 +77,84 @@ class Recommendation:
     components: Dict[str, float]
 
 
-def euclidean_distance_km(a: Coordinate, b: Coordinate) -> float:
-    """Approximate Euclidean distance in grid units interpreted as km."""
-    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+class PlaceDynamics:
+    """Live rating / review / popularity state for the place catalog.
+
+    Static ``Place`` records hold each POI's *base* prominence (the synthetic
+    prior). This store accumulates what happens during the simulation — visits
+    (footfall) and like/dislike feedback from agents who accepted a
+    recommendation — and exposes the *effective* signals the recommenders score
+    with:
+
+    * ``rating``       — Bayesian average: the base rating acts as a prior with
+      pseudo-weight ``prior_weight``; each like counts as a ``like_star`` review
+      and each dislike as a ``dislike_star`` review.
+    * ``review_count`` — base count plus one review per recorded feedback.
+    * ``popularity``   — base popularity plus ``visit_popularity_boost`` per
+      recorded visit (recommended *and* organic footfall).
+
+    Deterministic (pure counters, no RNG); shared by every recommender in the
+    stack so a like on one platform raises the POI's public prominence on all.
+    """
+
+    def __init__(self, catalog: Sequence[Place], config: Optional[Dict[str, float]] = None):
+        from . import params
+
+        cfg = dict(params.POI_DYNAMICS)
+        if config:
+            cfg.update(config)
+        self.prior_weight = float(cfg["prior_weight"])
+        self.like_star = float(cfg["like_star"])
+        self.dislike_star = float(cfg["dislike_star"])
+        self.rating_min = float(cfg["rating_min"])
+        self.rating_max = float(cfg["rating_max"])
+        self.visit_popularity_boost = float(cfg["visit_popularity_boost"])
+
+        self._base: Dict[str, Tuple[float, int, float]] = {
+            p.place_id: (p.rating, p.review_count, p.popularity) for p in catalog
+        }
+        self.visits: Dict[str, int] = {}
+        self.likes: Dict[str, int] = {}
+        self.dislikes: Dict[str, int] = {}
+
+    def record_visit(self, place_id: str) -> None:
+        if place_id:
+            self.visits[place_id] = self.visits.get(place_id, 0) + 1
+
+    def record_feedback(self, place_id: str, liked: bool) -> None:
+        if not place_id:
+            return
+        if liked:
+            self.likes[place_id] = self.likes.get(place_id, 0) + 1
+        else:
+            self.dislikes[place_id] = self.dislikes.get(place_id, 0) + 1
+
+    def rating(self, place: Place) -> float:
+        base_rating = self._base.get(place.place_id, (place.rating, 0, 0.0))[0]
+        likes = self.likes.get(place.place_id, 0)
+        dislikes = self.dislikes.get(place.place_id, 0)
+        if likes == 0 and dislikes == 0:
+            return base_rating
+        blended = (
+            base_rating * self.prior_weight + self.like_star * likes + self.dislike_star * dislikes
+        ) / (self.prior_weight + likes + dislikes)
+        return max(self.rating_min, min(self.rating_max, blended))
+
+    def review_count(self, place: Place) -> int:
+        base = self._base.get(place.place_id, (0.0, place.review_count, 0.0))[1]
+        return base + self.likes.get(place.place_id, 0) + self.dislikes.get(place.place_id, 0)
+
+    def popularity(self, place: Place) -> float:
+        base = self._base.get(place.place_id, (0.0, 0, place.popularity))[2]
+        return base + self.visit_popularity_boost * self.visits.get(place.place_id, 0)
+
+    def snapshot(self, place_id: str) -> Dict[str, float]:
+        """Current dynamic state for one place (diagnostics)."""
+        return {
+            "visits": self.visits.get(place_id, 0),
+            "likes": self.likes.get(place_id, 0),
+            "dislikes": self.dislikes.get(place_id, 0),
+        }
 
 
 def _normalize(values: Sequence[float]) -> List[float]:
@@ -117,12 +194,26 @@ def _token_overlap_score(tokens_a: Iterable[str], tokens_b: Iterable[str]) -> fl
 class RecommenderSystem(ABC):
     """Base interface for recommenders."""
 
-    def __init__(self, name: str, catalog: Sequence[Place]):
+    def __init__(self, name: str, catalog: Sequence[Place], dynamics: Optional[PlaceDynamics] = None):
         self.name = name
         self.catalog = list(catalog)
         self.place_by_id = {p.place_id: p for p in self.catalog}
+        # Shared live rating/review/popularity state; None falls back to the
+        # static values baked into each Place.
+        self.dynamics = dynamics
         self.user_place_affinity: Dict[int, Dict[str, float]] = {}
         self.user_keyword_affinity: Dict[int, Dict[str, float]] = {}
+
+    # Effective prominence signals (dynamic when a PlaceDynamics is wired).
+
+    def _rating(self, place: Place) -> float:
+        return self.dynamics.rating(place) if self.dynamics is not None else place.rating
+
+    def _review_count(self, place: Place) -> int:
+        return self.dynamics.review_count(place) if self.dynamics is not None else place.review_count
+
+    def _popularity(self, place: Place) -> float:
+        return self.dynamics.popularity(place) if self.dynamics is not None else place.popularity
 
     @abstractmethod
     def recommend(
@@ -199,9 +290,10 @@ class GoogleMapsReplica(RecommenderSystem):
         personalization_weight: float = 0.10,
         distance_scale_km: float = 5.0,
         coord_scale_km: float = 1.0,
-        coord_distance_km=euclidean_distance_km,
+        coord_distance_km=haversine_km,
+        dynamics: Optional[PlaceDynamics] = None,
     ):
-        super().__init__(name="google_maps", catalog=catalog)
+        super().__init__(name="google_maps", catalog=catalog, dynamics=dynamics)
         weight_sum = prominence_weight + relevance_weight + proximity_weight
         self.prominence_weight = prominence_weight / weight_sum
         self.relevance_weight = relevance_weight / weight_sum
@@ -209,8 +301,7 @@ class GoogleMapsReplica(RecommenderSystem):
         self.personalization_weight = max(0.0, min(0.35, personalization_weight))
         self.distance_scale_km = max(0.1, distance_scale_km)
         self.coord_scale_km = max(1e-4, coord_scale_km)
-        # Distance between two location tuples. Defaults to Euclidean (grid mode);
-        # OSM mode injects haversine so (lat, lon) proximity is measured in km.
+        # Straight-line distance between two (lat, lon) tuples, in km.
         self.coord_distance_km = coord_distance_km
         # Precompute each place's normalized keyword set once (it never changes),
         # so relevance scoring doesn't rebuild it on every candidate × user × day.
@@ -221,8 +312,8 @@ class GoogleMapsReplica(RecommenderSystem):
     def _prominence_scores(self, places: Sequence[Place]) -> Dict[str, float]:
         if not places:
             return {}
-        rating_signal = [max(0.0, min(5.0, p.rating)) / 5.0 for p in places]
-        review_signal_raw = [math.log1p(max(0, p.review_count)) for p in places]
+        rating_signal = [max(0.0, min(5.0, self._rating(p))) / 5.0 for p in places]
+        review_signal_raw = [math.log1p(max(0, self._review_count(p))) for p in places]
         review_signal = _normalize(review_signal_raw)
         prominence = [
             0.55 * rating_signal[i] + 0.45 * review_signal[i]
@@ -298,8 +389,9 @@ class PopularityRecommender(RecommenderSystem):
         review_weight: float = 0.35,
         popularity_weight: float = 0.40,
         personalization_weight: float = 0.12,
+        dynamics: Optional[PlaceDynamics] = None,
     ):
-        super().__init__(name=name, catalog=catalog)
+        super().__init__(name=name, catalog=catalog, dynamics=dynamics)
         weight_sum = rating_weight + review_weight + popularity_weight
         self.rating_weight = rating_weight / weight_sum
         self.review_weight = review_weight / weight_sum
@@ -307,9 +399,9 @@ class PopularityRecommender(RecommenderSystem):
         self.personalization_weight = max(0.0, min(0.35, personalization_weight))
 
     def _popularity_score(self, place: Place) -> float:
-        rating_term = max(0.0, min(5.0, place.rating)) / 5.0
-        review_term = math.log1p(max(0, place.review_count))
-        pop_term = math.log1p(max(0.0, place.popularity))
+        rating_term = max(0.0, min(5.0, self._rating(place))) / 5.0
+        review_term = math.log1p(max(0, self._review_count(place)))
+        pop_term = math.log1p(max(0.0, self._popularity(place)))
         # Keep this popularity-focused: no proximity/relevance terms here.
         return (
             self.rating_weight * rating_term
@@ -407,15 +499,24 @@ def build_recommender_stack(
     catalog: Sequence[Place],
     google_maps_config: Dict[str, float] | None = None,
     popularity_config: Dict[str, float] | None = None,
+    dynamics: Optional[PlaceDynamics] = None,
 ) -> LeisureRSOrchestrator:
-    """Convenience builder for the RS stack using a shared place catalog."""
+    """Convenience builder for the RS stack using a shared place catalog.
+
+    ``dynamics`` (one shared :class:`PlaceDynamics`) makes every platform score
+    with the live visit/feedback-driven rating, review count, and popularity.
+    """
     google_maps_config = google_maps_config or {}
     popularity_config = popularity_config or {}
     return LeisureRSOrchestrator(
-        google_maps_rs=GoogleMapsReplica(catalog=catalog, **google_maps_config),
-        opentable_rs=PopularityRecommender(name="opentable", catalog=catalog, **popularity_config),
-        spotify_ticketmaster_rs=PopularityRecommender(
-            name="spotify_ticketmaster", catalog=catalog, **popularity_config
+        google_maps_rs=GoogleMapsReplica(catalog=catalog, dynamics=dynamics, **google_maps_config),
+        opentable_rs=PopularityRecommender(
+            name="opentable", catalog=catalog, dynamics=dynamics, **popularity_config
         ),
-        classpass_rs=PopularityRecommender(name="classpass", catalog=catalog, **popularity_config),
+        spotify_ticketmaster_rs=PopularityRecommender(
+            name="spotify_ticketmaster", catalog=catalog, dynamics=dynamics, **popularity_config
+        ),
+        classpass_rs=PopularityRecommender(
+            name="classpass", catalog=catalog, dynamics=dynamics, **popularity_config
+        ),
     )

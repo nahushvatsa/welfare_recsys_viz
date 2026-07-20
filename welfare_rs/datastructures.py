@@ -17,8 +17,11 @@ class Activity:
         recommended_place_id: Place id used when recommendation was accepted.
         start_time: Scheduled start time in minutes from 0.
         duration: Planned duration in minutes.
-        location: (x, y) grid location.
+        location: (lat, lon) network-node location.
         is_mandatory: Whether the activity is mandatory (e.g., work, home).
+        place_id: Catalog place id of the destination POI for leisure activities
+            (recommended *or* organic); "" for home/work. Drives per-POI
+            footfall in :class:`welfare_rs.recommender_systems.PlaceDynamics`.
     """
 
     type: str
@@ -30,6 +33,7 @@ class Activity:
     duration: int
     location: tuple
     is_mandatory: bool = False
+    place_id: str = ""
 
 
 @dataclass
@@ -38,8 +42,8 @@ class Trip:
 
     Attributes:
         agent_id: Traveler identifier.
-        origin: Origin location (x, y).
-        destination: Destination location (x, y).
+        origin: Origin location (lat, lon).
+        destination: Destination location (lat, lon).
         depart_time: Departure time in minutes.
         mode: Chosen travel mode.
         purpose: Activity type the trip is serving.
@@ -49,7 +53,7 @@ class Trip:
         eta_acceptance: Dynamic willingness-to-accept parameter used for decision.
         recommended_place_id: Place id used by recommender.
         user_feedback_like: User feedback on recommended place (1 like, 0 dislike, -1 not applicable).
-        distance_km: Manhattan distance in kilometers.
+        distance_km: Network route distance in kilometers.
         travel_time_min: Actual travel time in minutes.
         cost: Monetary cost in dollars.
         emissions_g: CO2e grams.
@@ -63,6 +67,8 @@ class Trip:
             ``activity_utility - gen_cost / UTILITY_WEIGHTS['gen_cost_denominator']``
             (see welfare_rs.experiment_harness.leisure_net_utility).
         arrival_time: Arrival time in minutes.
+        place_id: Catalog place id of the destination POI (leisure trips,
+            recommended or organic); "" otherwise.
     """
 
     agent_id: int
@@ -86,3 +92,4 @@ class Trip:
     activity_utility: float
     arrival_time: int
     gen_cost: float = 0.0
+    place_id: str = ""

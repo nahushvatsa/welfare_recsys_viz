@@ -284,13 +284,11 @@ class ExperimentHarness:
         self,
         base_seed: int = 42,
         num_agents: int = 200,
-        city_size: int = 16,
         num_days: int = 5,
         treatments: Optional[List[TreatmentConfig]] = None,
     ):
         self.base_seed = base_seed
         self.num_agents = num_agents
-        self.city_size = city_size
         self.num_days = num_days
         self.treatments = treatments or DEFAULT_TREATMENTS
         self.results: Dict[str, TreatmentResult] = {}

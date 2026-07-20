@@ -16,8 +16,8 @@ from .recommender_systems import (
     Recommendation,
     RecommenderSystem,
     UserContext,
-    euclidean_distance_km,
 )
+from .utils import haversine_km
 
 
 @dataclass
@@ -99,7 +99,7 @@ class OracleRecommender(RecommenderSystem):
         prefs: AgentTruePreferences,
     ) -> float:
         """Compute true C^travel for reaching a place."""
-        dist_km = euclidean_distance_km(user_location, place.location) * self.coord_scale_km
+        dist_km = haversine_km(user_location, place.location) * self.coord_scale_km
         travel_time_hr = dist_km / max(1.0, self.default_speed_kmh)
         monetary_cost = dist_km * self.cost_per_km
 

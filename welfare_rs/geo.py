@@ -1,10 +1,10 @@
 """OSM road-network backend for the travel-behaviour ABM.
 
-This module replaces the synthetic grid in :mod:`city` with a real street
-network downloaded from OpenStreetMap via OSMnx. It is deliberately free of any
-ABM knowledge: it only snaps coordinates to network nodes, measures network
-routes (length + geometry), and answers single-source distance queries used by
-the agent day-planner.
+This module provides the real street network (downloaded from OpenStreetMap via
+OSMnx) that the simulation runs on. It is deliberately free of any ABM
+knowledge: it only snaps coordinates to network nodes, measures network routes
+(length + geometry), and answers single-source distance queries used by the
+agent day-planner.
 
 Design notes
 ------------
@@ -25,7 +25,6 @@ Design notes
 
 from __future__ import annotations
 
-import math
 import os
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -37,6 +36,8 @@ from shapely import STRtree
 from shapely.geometry import LineString, Point
 from shapely.ops import substring
 
+from .utils import haversine_km  # re-exported: geo is the historic import site
+
 LatLon = Tuple[float, float]
 BBox = Tuple[float, float, float, float]  # (west, south, east, north)
 
@@ -44,24 +45,6 @@ DEFAULT_CACHE_DIR = os.environ.get(
     "WELFARE_RS_CACHE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache"),
 )
-
-_EARTH_RADIUS_KM = 6371.0088
-
-
-def haversine_km(a: LatLon, b: LatLon) -> float:
-    """Great-circle ("as the crow flies") distance in km between two points.
-
-    Used by the recommender systems for their proximity heuristic, which the
-    paper models as straight-line distance — deliberately cruder than the
-    network routing used for the realised trip cost.
-    """
-    lat1, lon1 = a
-    lat2, lon2 = b
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    h = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(h))
 
 
 class RoadNetwork:
@@ -388,13 +371,17 @@ class RoadNetwork:
             ) * 1000.0
         attrs = {kk: vv for kk, vv in data.items() if kk not in ("geometry", "length")}
 
-        positions = [(0.0, a), (total, b)]
+        # Rank breaks ties: the origin endpoint must sort first and the far
+        # endpoint last even when a POI projects exactly onto one of them —
+        # otherwise that POI node ends up with no outgoing (or incoming) edge
+        # on a one-way street and becomes unreachable.
+        positions = [(0.0, 0, a), (total, 2, b)]
         for nid in poi_node_ids:
             d = line.project(Point(G.nodes[nid]["x"], G.nodes[nid]["y"]))
-            positions.append((min(max(d, 0.0), total), nid))
-        positions.sort(key=lambda e: e[0])
+            positions.append((min(max(d, 0.0), total), 1, nid))
+        positions.sort(key=lambda e: (e[0], e[1]))
 
-        for (da, an), (db, bn) in zip(positions[:-1], positions[1:]):
+        for (da, _ra, an), (db, _rb, bn) in zip(positions[:-1], positions[1:]):
             if an == bn:
                 continue
             seg = dict(attrs)

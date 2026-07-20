@@ -649,9 +649,9 @@ class Agent:
             weights.append(base_w * personal_w)
         return rng.choices(segments, weights=weights, k=1)[0]
 
-    def _authority_window(self, city, segment):
+    def _authority_window(self, env, segment):
         """Return opening window for a leisure subtype."""
-        authority = city.context.get("authority_constraints", {})
+        authority = env.context.get("authority_constraints", {})
         by_subtype = authority.get("leisure_hours_by_subtype", {})
         return by_subtype.get(segment, authority.get("leisure_open", (9 * 60, 23 * 60)))
 
@@ -678,7 +678,7 @@ class Agent:
 
     # ── Eta (recommendation acceptance) ──────────────────────────────────────
 
-    def _estimate_eta(self, city, leisure_start, recommendation_score, leisure_subtype):
+    def _estimate_eta(self, env, leisure_start, recommendation_score, leisure_subtype):
         """Estimate dynamic willingness to accept recommendation (eta)."""
         # TOGGLE: simplified willingness-to-accept model.
         # When SIMPLIFY_ETA is True we collapse eta to a function of only
@@ -688,7 +688,8 @@ class Agent:
         # to the count of previously accepted recommendations. All persona-
         # column-driven influences (weather, language, group type, risk
         # salience, top-rated preference, mobility needs, time window,
-        # WillingnessAI, EnvConscious) are removed.
+        # WillingnessAI, EnvConscious) are removed. The population-wide
+        # eta_shift knob still applies, as in the full model.
         if params.SIMPLIFICATION_TOGGLES.get("SIMPLIFY_ETA", False):
             sep = params.SIMPLIFIED_ETA_PARAMS
             trust = self.latent_variables.get("trust_platforms", 0.5)
@@ -702,7 +703,7 @@ class Agent:
             memory_effect = sep["memory_weight"] * min(
                 sep["memory_cap"], self.accepted_recommendation_count
             )
-            eta = eta_base + quality_effect + memory_effect
+            eta = eta_base + self.eta_shift + quality_effect + memory_effect
             return clamp(eta, sep["eta_min"], sep["eta_max"])
 
         ep = params.ETA_PARAMS
@@ -735,15 +736,15 @@ class Agent:
         user_effect -= sp["awareness_caution"] * (self.latent_variables["algorithmic_awareness"] - 0.5)
 
         # Context effect.
-        weather = city.context.get("weather", "fair")
+        weather = env.context.get("weather", "fair")
         context_effect = 0.0
         if weather in {"rain", "heat"}:
             context_effect += ep["adverse_weather"]
             if leisure_subtype in {"park", "workout_or_run"}:
                 context_effect += ep["adverse_weather_outdoor_override"]
-        if city.context.get("travel_norm") == "pro_travel":
+        if env.context.get("travel_norm") == "pro_travel":
             context_effect += ep["pro_travel_norm"]
-        elif city.context.get("travel_norm") == "anti_travel":
+        elif env.context.get("travel_norm") == "anti_travel":
             context_effect += ep["anti_travel_norm"]
 
         quality_effect = ep["quality_weight"] * (recommendation_score - 0.5)
@@ -754,7 +755,7 @@ class Agent:
 
     # ── Feedback ─────────────────────────────────────────────────────────────
 
-    def evaluate_recommendation_feedback(self, trip, city, rng):
+    def evaluate_recommendation_feedback(self, trip, env, rng):
         """Generate like/dislike feedback for accepted recommendations."""
         if trip.purpose != "leisure" or not trip.accepted_recommendation:
             return 0, 0.0
@@ -768,10 +769,10 @@ class Agent:
         travel_affinity = self.attitudes["travel_affinity"]
 
         context_term = 0.0
-        weather = city.context.get("weather", "fair")
+        weather = env.context.get("weather", "fair")
         if weather in {"rain", "heat"} and subtype in {"park", "workout_or_run"}:
             context_term += fp["rain_heat_outdoor_penalty"]
-        if city.context.get("social_norms") == "green" and subtype == "park":
+        if env.context.get("social_norms") == "green" and subtype == "park":
             context_term += fp["green_norm_park_bonus"]
 
         experience_term = fp["experience_activity_weight"] * trip.activity_utility + fp["experience_travel_weight"] * trip.travel_utility
@@ -794,7 +795,7 @@ class Agent:
 
     # ── TPB intention ────────────────────────────────────────────────────────
 
-    def _tpb_intention(self, city, purpose):
+    def _tpb_intention(self, env, purpose):
         """Theory of Planned Behavior: intention from attitude, norm, PBC."""
         tp = params.TPB_PARAMS
         attitude = self.attitudes["travel_affinity"]
@@ -802,9 +803,9 @@ class Agent:
             attitude += tp["leisure_attitude_boost"] * self.motivation_weights["intrinsic"]
 
         norm = tp["norm_neutral"]
-        if city.context.get("travel_norm") == "pro_travel":
+        if env.context.get("travel_norm") == "pro_travel":
             norm = tp["norm_pro_travel"]
-        elif city.context.get("travel_norm") == "anti_travel":
+        elif env.context.get("travel_norm") == "anti_travel":
             norm = tp["norm_anti_travel"]
 
         pbc = tp["pbc_base"]
@@ -825,8 +826,13 @@ class Agent:
 
     # ── Day planning ─────────────────────────────────────────────────────────
 
-    def plan_day(self, city, rng, recommender_stack=None, day_index=0):
-        """Generate a daily activity schedule with RS-driven leisure choices."""
+    def plan_day(self, env, rng, recommender_stack=None, day_index=0):
+        """Generate a daily activity schedule with RS-driven leisure choices.
+
+        ``env`` is the owning :class:`welfare_rs.Simulation` — it provides the
+        shared context (weather, norms, authority constraints), network
+        distances, and POI sampling.
+        """
         del day_index
         ad = params.AGENT_DEFAULTS
         pp = params.PARTICIPATION_PARAMS
@@ -881,7 +887,7 @@ class Agent:
             self.daily_recommendations[subtype] = {"by_source": by_source, "best": best}
 
         # (2)-(3) Evaluate leisure participation and subtype choice from net utility.
-        intention = self._tpb_intention(city, "leisure")
+        intention = self._tpb_intention(env, "leisure")
         motivation_boost = (
             pp["motivation_intrinsic_coeff"] * self.motivation_weights["intrinsic"]
             + pp["motivation_escape_coeff"] * self.motivation_weights["escape"]
@@ -897,18 +903,16 @@ class Agent:
             leisure_start = after_work_start + leisure_delay
             # Organic leisure destination: a real POI of this subtype, chosen by
             # proximity (falls back to a random node if the catalog has none).
-            desired_location = city.sample_poi(
-                subtype, origin_after_work, rng, fallback_zone_weights=seg_cfg["zone_weights"]
-            )
+            desired_location, desired_place_id = env.sample_poi(subtype, origin_after_work, rng)
 
-            open_start, open_end = self._authority_window(city, subtype)
+            open_start, open_end = self._authority_window(env, subtype)
             if leisure_start < open_start:
                 leisure_start = open_start
             if leisure_start + leisure_duration > open_end:
                 continue
 
-            d_out = city.distance_km(origin_after_work, desired_location)
-            d_back = city.distance_km(desired_location, self.home)
+            d_out = env.distance_km(origin_after_work, desired_location)
+            d_back = env.distance_km(desired_location, self.home)
             expected_trip_disutility = pp["expected_trip_disutility_per_km"] * (d_out + d_back)
             expected_trip_disutility *= self._trip_disutility_multiplier()
             if subtype in {"park", "workout_or_run"} and self.walk_tolerance_min >= pp["outdoor_walk_tol_threshold"]:
@@ -942,6 +946,7 @@ class Agent:
                     "start": leisure_start,
                     "duration": leisure_duration,
                     "desired_location": desired_location,
+                    "desired_place_id": desired_place_id,
                     "activity_utility": activity_utility,
                     "net_utility": net_utility,
                 }
@@ -986,12 +991,14 @@ class Agent:
             eta = 0.0
             accepted = False
             chosen_location = chosen["desired_location"]
+            chosen_place_id = chosen["desired_place_id"]
             source = "organic"
             if best_rec is not None:
-                eta = self._estimate_eta(city, chosen["start"], best_rec.score, subtype)
+                eta = self._estimate_eta(env, chosen["start"], best_rec.score, subtype)
                 accepted = rng.random() < eta
                 if accepted:
                     chosen_location = best_rec.place.location
+                    chosen_place_id = best_rec.place.place_id
                     source = best_rec.source
 
             self.last_eta = eta
@@ -1004,7 +1011,7 @@ class Agent:
                 "eta": eta,
                 "accepted": accepted,
                 "source": source,
-                "recommended_place_id": best_rec.place.place_id if (best_rec is not None and accepted) else "",
+                "recommended_place_id": chosen_place_id if accepted else "",
             }
 
             schedule.append(
@@ -1013,11 +1020,12 @@ class Agent:
                     subtype,
                     source,
                     accepted,
-                    self.daily_recommendation_choice.get("recommended_place_id", "") if self.daily_recommendation_choice else "",
+                    chosen_place_id if accepted else "",
                     chosen["start"],
                     chosen["duration"],
                     chosen_location,
                     is_mandatory=False,
+                    place_id=chosen_place_id,
                 )
             )
             after_work_start = chosen["start"] + chosen["duration"]

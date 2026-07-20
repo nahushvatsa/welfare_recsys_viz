@@ -17,11 +17,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from . import params
 from .recommender_systems import (
     LeisureRSOrchestrator,
-    Place,
     Recommendation,
     UserContext,
-    euclidean_distance_km,
 )
+from .utils import haversine_km
 
 
 DEFAULT_SCORE_TO_UTILITY_MODE = "subtype_base_plus_score"
@@ -323,7 +322,7 @@ class WelfareAwareOrchestrator:
         pup_alpha: float = 0.6,
         rm_epsilon: float = 0.3,
         coord_scale_km: float = 1.0,
-        coord_distance_km=euclidean_distance_km,
+        coord_distance_km=haversine_km,
         score_to_utility_mode: str = DEFAULT_SCORE_TO_UTILITY_MODE,
         score_utility_scale: float = DEFAULT_SCORE_UTILITY_SCALE,
     ):
@@ -333,7 +332,7 @@ class WelfareAwareOrchestrator:
         self.pup_alpha = pup_alpha
         self.rm_epsilon = rm_epsilon
         self.coord_scale_km = coord_scale_km
-        # Euclidean (grid) by default; OSM mode injects haversine for (lat, lon).
+        # Straight-line (lat, lon) distance in km for the travel-cost estimate.
         self.coord_distance_km = coord_distance_km
         self.score_to_utility_mode = score_to_utility_mode
         self.score_utility_scale = score_utility_scale

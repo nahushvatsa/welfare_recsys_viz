@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import hashlib
 import math
@@ -9,15 +10,13 @@ import random
 from collections import Counter
 from pathlib import Path
 
-import numpy as np
-
 from . import params
 from .agent import Agent
-from .city import City
-from .datastructures import Activity, Trip
-from .utils import clamp, softmax
+from .datastructures import Trip
+from .utils import clamp, haversine_km, softmax
 from .recommender_systems import (
     Place,
+    PlaceDynamics,
     build_recommender_stack,
 )
 
@@ -29,12 +28,18 @@ class SimulationCancelled(Exception):
 
 
 class Simulation:
-    """Orchestrates the day, applies mode choice, and aggregates statistics."""
+    """Orchestrates the day, applies mode choice, and aggregates statistics.
+
+    The simulation runs on a real OSM street network (:class:`welfare_rs.geo.
+    RoadNetwork`, required); every location in the model is a (lat, lon) network
+    node. The simulation itself is the agents' environment: it owns the shared
+    context (weather, norms, authority constraints), network distances, the POI
+    catalog, and the live per-POI visit/feedback state (:class:`PlaceDynamics`).
+    """
 
     def __init__(
         self,
         num_agents=None,
-        city_size=None,
         seed=None,
         time_step=None,
         context=None,
@@ -49,27 +54,44 @@ class Simulation:
         recommender_override=None,
         recommender_factory=None,
     ):
+        if road_network is None:
+            raise ValueError(
+                "Simulation requires a road_network (build one with "
+                "welfare_rs.build_road_network(<city preset>))."
+            )
         sd = params.SIM_DEFAULTS
+        cp = params.CITY_PARAMS
         self.seed = seed if seed is not None else sd["seed"]
         self.rng = random.Random(self.seed)
-        self.np_rng = np.random.default_rng(self.seed)
+        # Dedicated stream for home/work/fallback location sampling, so those
+        # draws are independent of the main decision stream.
+        self._loc_rng = random.Random(self.seed)
         self.time_step = time_step if time_step is not None else sd["time_step"]
         self.use_recommenders = use_recommenders
         self.rs_policy = rs_policy or {}
         self.eta_shift = eta_shift
         self.use_persona_agents = use_persona_agents
-        self.persona_csv_path = persona_csv_path if persona_csv_path is not None else params.DEFAULT_PERSONA_CSV_PATH
+        self.persona_csv_path = persona_csv_path if persona_csv_path is not None else params.NYC_PERSONA_CSV_PATH
         self.poi_csv_path = poi_csv_path
-        # Optional OSM road network (geo.RoadNetwork). When provided, the city is
-        # backed by a real street network and locations are (lat, lon) tuples.
         self.road_network = road_network
-        self._persona_lat_bounds = None
-        self._persona_lon_bounds = None
 
-        _city_size = city_size if city_size is not None else sd["city_size"]
-        self.city = City(_city_size, _city_size, seed=self.seed, road_network=road_network)
+        # Shared context (weather, norms, authority constraints) — deep-copy so
+        # runtime patches don't mutate the template in params.py.
+        self.context = copy.deepcopy(cp["default_context"])
+        self.context["community_mode_bias"] = dict(cp["community_mode_bias"])
         if context:
-            self.city.context.update(context)
+            self.context.update(context)
+
+        # Congestion capacities scale with network size. Base (intersection)
+        # nodes only, so capacity doesn't drift when POIs are inserted as extra
+        # mid-block nodes or when a POI-augmented network is reused across runs.
+        area = road_network.num_base_nodes
+        self.road_capacity = max(
+            cp["road_capacity_floor"], int(area * cp["road_capacity_multiplier"])
+        )
+        self.transit_capacity = max(
+            cp["transit_capacity_floor"], int(area * cp["transit_capacity_multiplier"])
+        )
 
         # Mode parameters — read from params at init time. ``disabled_modes``
         # lets a caller drop modes entirely (e.g., the frontend removes transit).
@@ -83,18 +105,21 @@ class Simulation:
         # can finish wiring treatment-specific stacks (for example Oracle).
         self.place_catalog = self._build_place_catalog()
 
+        # Live per-POI rating/review/popularity state, fed by visits and
+        # like/dislike feedback during the run and consumed by the recommenders.
+        self.place_dynamics = PlaceDynamics(self.place_catalog)
+
         # Index the catalog by leisure subtype so organic leisure choices resolve
-        # to real POIs (City.sample_poi) rather than random intersections — both
-        # organic and recommended visits now land on catalog places, which is what
+        # to real POIs (sample_poi) rather than random intersections — both
+        # organic and recommended visits land on catalog places, which is what
         # makes footfall-per-POI meaningful and matches the paper's proximity-based
         # self-selected alternative.
         from .recommender_systems import LEISURE_SUBTYPE_TO_CATEGORIES
 
-        pois_by_subtype = {}
+        self._pois_by_subtype = {}
         for _subtype, _cats in LEISURE_SUBTYPE_TO_CATEGORIES.items():
             _catset = set(_cats)
-            pois_by_subtype[_subtype] = [p for p in self.place_catalog if p.category in _catset]
-        self.city.set_pois(pois_by_subtype)
+            self._pois_by_subtype[_subtype] = [p for p in self.place_catalog if p.category in _catset]
 
         _num_agents = num_agents if num_agents is not None else sd["num_agents"]
         self.agents = []
@@ -121,14 +146,48 @@ class Simulation:
             recommender_override=recommender_override,
             recommender_factory=recommender_factory,
         )
-        rs_for_agent = self.recommender_stack if self.use_recommenders else None
-        for agent in self.agents:
-            agent.plan_day(self.city, self.rng, recommender_stack=rs_for_agent, day_index=0)
+        self._plan_agents_for_day(day_index=0)
 
         self.stats = None
         self.last_road_volume = 0
         self.last_transit_volume = 0
         self.last_mode_counts = Counter()
+
+    # ── Environment interface (shared with Agent.plan_day) ───────────────────
+
+    def distance_km(self, a, b):
+        """Network shortest-path distance in km between two (lat, lon) nodes."""
+        return self.road_network.route_length_km_latlon(a, b)
+
+    def community_mode_bias(self, mode):
+        """Return a social-practice bias for a mode (SPT)."""
+        return self.context.get("community_mode_bias", {}).get(mode, 0.0)
+
+    def sample_poi(self, subtype, origin, rng):
+        """Sample an organic destination POI for a leisure subtype.
+
+        Among the catalog POIs of the chosen subtype, a place is drawn with
+        probability ``∝ exp(-dist/scale)`` so closer options dominate — the
+        proximity-driven "self-selected alternative" from the paper. Distances
+        use straight-line (haversine) proximity, mirroring the recommenders'
+        proximity heuristic; realized travel cost is still measured on the
+        network downstream.
+
+        Returns ``(location, place_id)``; falls back to a random intersection
+        (with ``place_id=""``) when the catalog has no POI for the subtype.
+        """
+        places = self._pois_by_subtype.get(subtype) or []
+        if not places:
+            return self.road_network.sample_node_latlon(self._loc_rng), ""
+        if len(places) == 1:
+            return places[0].location, places[0].place_id
+        scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
+        weights = [math.exp(-haversine_km(origin, p.location) / scale) for p in places]
+        if sum(weights) <= 0:
+            place = rng.choice(places)
+        else:
+            place = rng.choices(places, weights=weights, k=1)[0]
+        return place.location, place.place_id
 
     # ── Persona loading ──────────────────────────────────────────────────────
 
@@ -144,40 +203,11 @@ class Simulation:
             for row in reader:
                 if row.get("PersonaID"):
                     rows.append(row)
-        lats, lons = [], []
-        for row in rows:
-            try:
-                lats.append(float(row.get("start_latitude", "")))
-                lons.append(float(row.get("start_longitude", "")))
-            except ValueError:
-                continue
-        if lats and lons:
-            self._persona_lat_bounds = (min(lats), max(lats))
-            self._persona_lon_bounds = (min(lons), max(lons))
         return rows
 
-    def _latlon_to_grid(self, lat, lon):
-        if self._persona_lat_bounds is None or self._persona_lon_bounds is None:
-            return self.city.sample_location("residential")
-        lat_min, lat_max = self._persona_lat_bounds
-        lon_min, lon_max = self._persona_lon_bounds
-        if math.isclose(lat_min, lat_max) or math.isclose(lon_min, lon_max):
-            return self.city.sample_location("residential")
-        lat_norm = (lat - lat_min) / (lat_max - lat_min)
-        lon_norm = (lon - lon_min) / (lon_max - lon_min)
-        x = int(round(clamp(lat_norm, 0.0, 1.0) * (self.city.size_x - 1)))
-        y = int(round(clamp(lon_norm, 0.0, 1.0) * (self.city.size_y - 1)))
-        return (x, y)
-
     def _home_from_latlon(self, lat, lon):
-        """Map a persona's real (lat, lon) to a home location.
-
-        OSM mode snaps to the nearest network node; grid mode projects onto the
-        synthetic grid via min-max normalization.
-        """
-        if self.road_network is not None:
-            return self.road_network.snap_latlon(lat, lon)
-        return self._latlon_to_grid(lat, lon)
+        """Map a persona's real (lat, lon) to the nearest network node."""
+        return self.road_network.snap_latlon(lat, lon)
 
     @staticmethod
     def _coerce_unit_interval(value):
@@ -335,8 +365,8 @@ class Simulation:
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
         bike_ownership = self.rng.random() < ad["bike_ownership_prob"]
-        home = self.city.sample_location("residential")
-        work = self.city.sample_location("employment")
+        home = self.road_network.sample_node_latlon(self._loc_rng)
+        work = self.road_network.sample_node_latlon(self._loc_rng)
         agent = Agent(i, income, age, car_ownership, bike_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
         agent.car_access_type = "own car" if car_ownership else "no car"
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
@@ -392,8 +422,8 @@ class Simulation:
             lon = float(persona.get("start_longitude", ""))
             home = self._home_from_latlon(lat, lon)
         except ValueError:
-            home = self.city.sample_location("residential")
-        work = self.city.sample_location("employment")
+            home = self.road_network.sample_node_latlon(self._loc_rng)
+        work = self.road_network.sample_node_latlon(self._loc_rng)
 
         agent = Agent(i, income, age, car_ownership, bike_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
 
@@ -500,17 +530,14 @@ class Simulation:
         synthetic = {col: rng.choice([p.get(col, "") for p in personas]) for col in columns}
         synthetic["PersonaID"] = f"SYN{idx:04d}"
 
-        if self.road_network is not None:
+        home = self.road_network.sample_node_latlon(rng)
+        for _ in range(25):  # resample to keep homes distinct
+            if (round(home[0], 6), round(home[1], 6)) not in used_homes:
+                break
             home = self.road_network.sample_node_latlon(rng)
-            for _ in range(25):  # resample to keep homes distinct
-                if (round(home[0], 6), round(home[1], 6)) not in used_homes:
-                    break
-                home = self.road_network.sample_node_latlon(rng)
-            used_homes.add((round(home[0], 6), round(home[1], 6)))
-            synthetic["start_latitude"] = f"{home[0]:.6f}"
-            synthetic["start_longitude"] = f"{home[1]:.6f}"
-        else:
-            synthetic["start_latitude"] = synthetic["start_longitude"] = ""
+        used_homes.add((round(home[0], 6), round(home[1], 6)))
+        synthetic["start_latitude"] = f"{home[0]:.6f}"
+        synthetic["start_longitude"] = f"{home[1]:.6f}"
         return synthetic
 
     # ── Place catalog ────────────────────────────────────────────────────────
@@ -605,53 +632,16 @@ class Simulation:
             )
         return catalog
 
-    def _load_poi_catalog(self, poi_csv_path):
-        if self.road_network is not None:
-            return self._load_osm_poi_catalog(poi_csv_path)
-        if not poi_csv_path:
-            return []
-        path = Path(poi_csv_path)
-        if not path.exists():
-            return []
-        catalog = []
-        with path.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    pid = str(row.get("place_id", "")).strip()
-                    name = str(row.get("name", pid or "poi")).strip()
-                    category = str(row.get("category", "cafe")).strip()
-                    x = float(row.get("x", "0"))
-                    y = float(row.get("y", "0"))
-                    rating = float(row.get("rating", "4.0"))
-                    review_count = int(float(row.get("review_count", "100")))
-                    popularity = float(row.get("popularity", str(review_count)))
-                    kw = str(row.get("keywords", category)).strip()
-                    keywords = tuple(k.strip() for k in kw.split("|") if k.strip())
-                    if not pid:
-                        pid = f"poi_{len(catalog)+1}"
-                except ValueError:
-                    continue
-                catalog.append(Place(place_id=pid, name=name, category=category, location=(x, y), keywords=keywords, rating=rating, review_count=review_count, popularity=popularity))
-        return catalog
-
     def _build_default_recommender_stack(self):
-        gm_cfg = self.rs_policy.get("google_maps", {})
-        if self.road_network is not None:
-            # OSM mode: locations are (lat, lon). The RS proximity heuristic uses
-            # straight-line (haversine) distance — the paper's "as the crow flies"
-            # signal, deliberately cruder than the network cost of the realised
-            # trip — so coord_scale is 1.0 (haversine already returns km).
-            from .geo import haversine_km
-
-            gm_cfg = {**gm_cfg, "coord_scale_km": 1.0, "coord_distance_km": haversine_km}
-        elif "coord_scale_km" not in gm_cfg:
-            gm_cfg = {**gm_cfg, "coord_scale_km": self.city.block_km}
-        pop_cfg = self.rs_policy.get("popularity", {})
+        # The RS proximity heuristic uses straight-line (haversine) distance —
+        # the paper's "as the crow flies" signal, deliberately cruder than the
+        # network cost of the realised trip (haversine already returns km, so
+        # no coordinate scaling is needed).
         return build_recommender_stack(
             self.place_catalog,
-            google_maps_config=gm_cfg,
-            popularity_config=pop_cfg,
+            google_maps_config=self.rs_policy.get("google_maps", {}),
+            popularity_config=self.rs_policy.get("popularity", {}),
+            dynamics=self.place_dynamics,
         )
 
     def _resolve_recommender_stack(self, recommender_override=None, recommender_factory=None):
@@ -665,8 +655,8 @@ class Simulation:
     def _build_synthetic_osm_catalog(self):
         """Synthetic POIs placed on real network nodes.
 
-        Used until the real (lab-provided) NYC POI dataset is wired in via
-        ``_load_osm_poi_catalog``. Every category in ``CATEGORY_KEYWORDS`` gets a
+        Fallback when no real POI dataset is available (see
+        ``_load_osm_poi_catalog``). Every category in ``CATEGORY_KEYWORDS`` gets a
         handful of places, guaranteeing each leisure subtype has candidates.
         """
         cp = params.CATALOG_PARAMS
@@ -676,7 +666,7 @@ class Simulation:
         for category, keywords in params.CATEGORY_KEYWORDS.items():
             for _ in range(self.rng.randint(lo, hi)):
                 place_index += 1
-                location = self.city.road_network.sample_node_latlon(self.rng)
+                location = self.road_network.sample_node_latlon(self.rng)
                 rating = round(self.rng.uniform(*cp["rating_range"]), 2)
                 review_count = self.rng.randint(*cp["review_count_range"])
                 popularity = max(
@@ -698,53 +688,10 @@ class Simulation:
         return catalog
 
     def _build_place_catalog(self):
-        loaded = self._load_poi_catalog(self.poi_csv_path)
+        loaded = self._load_osm_poi_catalog(self.poi_csv_path)
         if loaded:
             return loaded
-        if self.road_network is not None:
-            return self._build_synthetic_osm_catalog()
-        cp = params.CATALOG_PARAMS
-        catalog = []
-        place_index = 0
-
-        def create_place(category, location):
-            nonlocal place_index
-            place_index += 1
-            name = f"{category}_{place_index}"
-            rating = round(self.rng.uniform(*cp["rating_range"]), 2)
-            review_count = self.rng.randint(*cp["review_count_range"])
-            popularity = max(cp["popularity_floor"], review_count * self.rng.uniform(*cp["popularity_multiplier_range"]))
-            keywords = params.CATEGORY_KEYWORDS.get(category, (category,))
-            return Place(
-                place_id=f"pl_{place_index}",
-                name=name,
-                category=category,
-                location=(float(location[0]), float(location[1])),
-                keywords=tuple(keywords),
-                rating=rating,
-                review_count=review_count,
-                popularity=popularity,
-            )
-
-        for x in range(self.city.size_x):
-            for y in range(self.city.size_y):
-                zone = self.city.zones[x, y]
-                categories = params.ZONE_CATEGORY_MIX.get(zone, ("cafe",))
-                lo, hi = cp["places_per_zone"].get(zone, (0, 2))
-                n_places = self.rng.randint(lo, hi)
-                for _ in range(n_places):
-                    category = self.rng.choice(categories)
-                    catalog.append(create_place(category, (x, y)))
-
-        present = {p.category for p in catalog}
-        for category in cp["required_categories"]:
-            if category in present:
-                continue
-            x = self.rng.randrange(self.city.size_x)
-            y = self.rng.randrange(self.city.size_y)
-            catalog.append(create_place(category, (x, y)))
-
-        return catalog
+        return self._build_synthetic_osm_catalog()
 
     # ── Mode choice infrastructure ───────────────────────────────────────────
 
@@ -757,7 +704,7 @@ class Simulation:
     def _plan_agents_for_day(self, day_index):
         rs_for_agent = self.recommender_stack if self.use_recommenders else None
         for agent in self.agents:
-            agent.plan_day(self.city, self.rng, recommender_stack=rs_for_agent, day_index=day_index)
+            agent.plan_day(self, self.rng, recommender_stack=rs_for_agent, day_index=day_index)
 
     def run_days(self, num_days=7, progress=None, on_day_complete=None, should_stop=None):
         """Run ``num_days`` days. If ``should_stop`` is given and returns True at
@@ -814,22 +761,20 @@ class Simulation:
 
     def _road_congestion_factor(self, volume):
         cp = params.CONGESTION_PARAMS
-        capacity = self.city.road_capacity
-        x = max(0.0, volume / capacity)
+        x = max(0.0, volume / self.road_capacity)
         return 1.0 + cp["bpr_alpha"] * (x ** cp["bpr_beta"])
 
     def _transit_crowding_factor(self, volume):
         cp = params.CONGESTION_PARAMS
-        capacity = self.city.transit_capacity
-        x = max(0.0, volume / capacity)
+        x = max(0.0, volume / self.transit_capacity)
         return 1.0 + cp["transit_crowding_coeff"] * (x ** cp["transit_crowding_exponent"])
 
     def _weather_speed_factor(self, mode):
-        weather = self.city.context["weather"]
+        weather = self.context["weather"]
         return params.WEATHER_FACTORS.get(weather, {}).get(mode, 1.0)
 
     def _policy_cost_adjustment(self, mode, distance_km):
-        policy = self.city.context["ai_intervention"]
+        policy = self.context["ai_intervention"]
         cp = params.CONGESTION_PARAMS
         if policy == "congestion_pricing" and mode == "car":
             return cp["congestion_pricing_base"] + cp["congestion_pricing_per_km"] * distance_km
@@ -856,7 +801,7 @@ class Simulation:
         emissions = spec["emissions_g_per_km"] * distance_km
         comfort = spec["comfort"]
         green_weight = agent.preferences["green"]
-        if self.city.context["social_norms"] == "green":
+        if self.context["social_norms"] == "green":
             green_weight *= uw["green_norm_boost"]
 
         utility = -gen_cost / uw["gen_cost_denominator"] + comfort * agent.preferences["comfort"]
@@ -891,7 +836,7 @@ class Simulation:
         status_delta = self.mode_status[mode] - peer_status
         utility += positionality * agent.attitudes["status_seeking"] * status_delta
 
-        practice_bias = self.city.community_mode_bias(mode)
+        practice_bias = self.community_mode_bias(mode)
         utility += practice_bias * agent.attitudes["practice_conformity"]
         utility += agent.mode_preference_bias.get(mode, 0.0)
 
@@ -919,7 +864,7 @@ class Simulation:
         }
 
     def _evaluate_modes(self, agent, origin, destination, current_activity, next_activity):
-        distance_km = self.city.distance_km(origin, destination)
+        distance_km = self.distance_km(origin, destination)
         road_factor = self._road_congestion_factor(self.last_road_volume)
         transit_factor = self._transit_crowding_factor(self.last_transit_volume)
         peer_status = self._peer_status_average()
@@ -1010,37 +955,12 @@ class Simulation:
             return agent.habit_mode
         return self._choose_mode_utility(outcomes)
 
-    # ── Position interpolation (for visualization) ───────────────────────────
-
-    def _interpolate_position(self, origin, destination, progress):
-        progress = clamp(progress, 0.0, 1.0)
-        dx = destination[0] - origin[0]
-        dy = destination[1] - origin[1]
-        dist = abs(dx) + abs(dy)
-        if dist == 0:
-            return origin
-        steps = progress * dist
-        step_x = min(abs(dx), steps)
-        x = origin[0] + (1 if dx >= 0 else -1) * step_x
-        steps -= step_x
-        step_y = min(abs(dy), steps)
-        y = origin[1] + (1 if dy >= 0 else -1) * step_y
-        return (x, y)
-
-    def _agent_position(self, agent, t):
-        if agent.in_transit and agent.current_trip:
-            trip = agent.current_trip
-            total = max(1, trip["arrival_time"] - trip["depart_time"])
-            progress = (t - trip["depart_time"]) / total
-            return self._interpolate_position(trip["origin"], trip["destination"], progress)
-        if agent.schedule:
-            idx = min(agent.current_activity_index, len(agent.schedule) - 1)
-            return agent.schedule[idx].location
-        return agent.home
-
     def _record_recommendation_feedback(self, agent, feedback_trip, feedback_params):
-        liked, p_like = agent.evaluate_recommendation_feedback(feedback_trip, self.city, self.rng)
+        liked, p_like = agent.evaluate_recommendation_feedback(feedback_trip, self, self.rng)
         feedback_trip.user_feedback_like = liked
+        # Public review: the like/dislike also moves the POI's live rating and
+        # review count, which every recommender scores with from now on.
+        self.place_dynamics.record_feedback(feedback_trip.place_id, bool(liked))
         feedback_strength = clamp(
             max(
                 feedback_params["feedback_strength_floor"],
@@ -1072,7 +992,7 @@ class Simulation:
 
     # ── Day simulation ───────────────────────────────────────────────────────
 
-    def run_day(self, record_history=False, record_positions=False):
+    def run_day(self, record_history=False):
         sd = params.SIM_DEFAULTS
         fp = params.FEEDBACK_PARAMS
         stats = {
@@ -1104,6 +1024,10 @@ class Simulation:
                     if delay > 0:
                         stats["late_arrivals"] += 1
                     agent.activity_end_time = actual_start + activity.duration
+                    # Footfall: arriving at a catalog POI counts as a visit
+                    # (recommended or organic), feeding its live popularity.
+                    if activity.type == "leisure" and activity.place_id:
+                        self.place_dynamics.record_visit(activity.place_id)
 
             # Departures
             departures = []
@@ -1137,6 +1061,9 @@ class Simulation:
                     else:
                         agent.current_activity_index += 1
                         agent.activity_end_time = t + next_activity.duration
+                        # Zero-distance transition into a POI still counts as a visit.
+                        if next_activity.type == "leisure" and next_activity.place_id:
+                            self.place_dynamics.record_visit(next_activity.place_id)
 
             chosen = []
             road_volume = 0
@@ -1183,6 +1110,7 @@ class Simulation:
                         accepted_recommendation=next_activity.accepted_recommendation if next_activity.type == "leisure" else False,
                         eta_acceptance=agent.last_eta if next_activity.type == "leisure" else 0.0,
                         recommended_place_id=next_activity.recommended_place_id if next_activity.type == "leisure" else "",
+                        place_id=next_activity.place_id,
                         user_feedback_like=-1,
                         distance_km=data["distance_km"],
                         travel_time_min=travel_time_min,
@@ -1226,8 +1154,6 @@ class Simulation:
                     "transit_crowding_factor": self._transit_crowding_factor(transit_volume),
                     "in_transit": sum(1 for a in self.agents if a.in_transit),
                 }
-                if record_positions:
-                    step["positions"] = [self._agent_position(a, t) for a in self.agents]
                 history.append(step)
 
         stats["total_delay"] = sum(a.total_delay for a in self.agents)

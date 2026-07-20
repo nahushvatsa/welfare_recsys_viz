@@ -22,13 +22,13 @@ from __future__ import annotations
 
 from . import params
 from .agent import Agent
-from .city import City
 from .datastructures import Activity, Trip
 from .geo import RoadNetwork, build_road_network, haversine_km
 from .recommender_systems import (
     GoogleMapsReplica,
     LeisureRSOrchestrator,
     Place,
+    PlaceDynamics,
     PopularityRecommender,
     Recommendation,
     RecommenderSystem,
@@ -51,7 +51,6 @@ __all__ = [
     "params",
     "Simulation",
     "Agent",
-    "City",
     "Activity",
     "Trip",
     "RoadNetwork",
@@ -64,6 +63,7 @@ __all__ = [
     "LeisureRSOrchestrator",
     "build_recommender_stack",
     "Place",
+    "PlaceDynamics",
     "UserContext",
     "Recommendation",
     # welfare layer
