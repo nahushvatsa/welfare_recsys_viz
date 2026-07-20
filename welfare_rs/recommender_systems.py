@@ -90,8 +90,11 @@ class PlaceDynamics:
       pseudo-weight ``prior_weight``; each like counts as a ``like_star`` review
       and each dislike as a ``dislike_star`` review.
     * ``review_count`` — base count plus one review per recorded feedback.
-    * ``popularity``   — base popularity plus ``visit_popularity_boost`` per
-      recorded visit (recommended *and* organic footfall).
+    * ``popularity``   — pure footfall: the number of recorded visits
+      (recommended *and* organic), plus the flat ``popularity_prior_visits``
+      smoothing constant. The synthetic base popularity is deliberately NOT
+      carried in — it exists only as a cold-start stand-in for recommenders
+      that run without a PlaceDynamics.
 
     Deterministic (pure counters, no RNG); shared by every recommender in the
     stack so a like on one platform raises the POI's public prominence on all.
@@ -108,7 +111,7 @@ class PlaceDynamics:
         self.dislike_star = float(cfg["dislike_star"])
         self.rating_min = float(cfg["rating_min"])
         self.rating_max = float(cfg["rating_max"])
-        self.visit_popularity_boost = float(cfg["visit_popularity_boost"])
+        self.popularity_prior_visits = float(cfg["popularity_prior_visits"])
 
         self._base: Dict[str, Tuple[float, int, float]] = {
             p.place_id: (p.rating, p.review_count, p.popularity) for p in catalog
@@ -145,8 +148,7 @@ class PlaceDynamics:
         return base + self.likes.get(place.place_id, 0) + self.dislikes.get(place.place_id, 0)
 
     def popularity(self, place: Place) -> float:
-        base = self._base.get(place.place_id, (0.0, 0, place.popularity))[2]
-        return base + self.visit_popularity_boost * self.visits.get(place.place_id, 0)
+        return self.popularity_prior_visits + self.visits.get(place.place_id, 0)
 
     def snapshot(self, place_id: str) -> Dict[str, float]:
         """Current dynamic state for one place (diagnostics)."""

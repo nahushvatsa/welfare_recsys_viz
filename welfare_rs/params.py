@@ -457,7 +457,7 @@ FEEDBACK_PARAMS: dict = {
 # ── Synthetic place catalog ──────────────────────────────────────────────────
 
 CATALOG_PARAMS: dict = {
-    "rating_range": (3.5, 4.9),
+    "rating_range": (2.8, 4.9),
     "review_count_range": (20, 5000),
     "popularity_multiplier_range": (1.0, 9.0),
     "popularity_floor": 10.0,
@@ -469,9 +469,14 @@ CATALOG_PARAMS: dict = {
 # ── Dynamic POI prominence (PlaceDynamics) ───────────────────────────────────
 #
 # Live per-POI state accumulated during a run: every leisure visit (recommended
-# or organic) adds footfall to the place's popularity, and every like/dislike
-# from an accepted recommendation posts a "review" that moves the place's
-# rating via a Bayesian average around the synthetic base rating.
+# or organic) adds footfall, and every like/dislike from an accepted
+# recommendation posts a "review" that moves the place's rating via a Bayesian
+# average around the synthetic base rating.
+#
+# Dynamic popularity is *pure footfall* — the count of recorded visits. The
+# synthetic base popularity on each Place is not carried into it (it only
+# matters when no PlaceDynamics is wired), so rankings respond to what agents
+# actually do rather than to a fabricated visitor history.
 
 POI_DYNAMICS: dict = {
     # Pseudo-review weight of the base (prior) rating: higher = new feedback
@@ -482,8 +487,10 @@ POI_DYNAMICS: dict = {
     "dislike_star": 1.0,
     "rating_min": 1.0,
     "rating_max": 5.0,
-    # Popularity points added per recorded visit (footfall signal).
-    "visit_popularity_boost": 25.0,
+    # Flat pseudo-visit count added to every place's footfall. 0 = raw visit
+    # counts (strongest rich-get-richer feedback); raising it smooths early
+    # dynamics when only a handful of visits have happened.
+    "popularity_prior_visits": 0.0,
 }
 
 # ── Agent defaults ───────────────────────────────────────────────────────────
