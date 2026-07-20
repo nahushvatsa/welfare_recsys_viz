@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import random
 from collections.abc import Mapping
 
@@ -24,14 +23,13 @@ class Agent:
     - Self-determination theory: intrinsic vs extrinsic motivation split.
     """
 
-    def __init__(self, agent_id, income, age, car_ownership, bike_ownership, home, work, seed=0, eta_shift=0.0):
+    def __init__(self, agent_id, income, age, car_ownership, home, work, seed=0, eta_shift=0.0):
         ad = params.AGENT_DEFAULTS
         self.id = agent_id
         self.characteristics = {
             "income": income,
             "age": age,
             "car_ownership": car_ownership,
-            "bike_ownership": bike_ownership,
         }
 
         # Value of time (VOT).
@@ -47,7 +45,6 @@ class Agent:
 
         # Attitudes (TPB) and social practice conformity.
         self.attitudes = {
-            "pro_environment": rng.uniform(*ad["attitude_range"]),
             "travel_affinity": rng.uniform(*ad["attitude_range"]),
             "status_seeking": rng.uniform(*ad["attitude_range"]),
             "practice_conformity": rng.uniform(*ad["attitude_range"]),
@@ -70,21 +67,13 @@ class Agent:
                 "escape": 0.0,
                 "positionality": 0.0,
             }
-        self.intrinsic_extrinsic = {
-            "intrinsic": self.motivation_weights["intrinsic"],
-            "extrinsic": self.motivation_weights["derived"] + self.motivation_weights["positionality"],
-        }
         self.leisure_preferences = {
             segment: rng.uniform(*ad["leisure_pref_range"]) for segment in params.LEISURE_SEGMENTS
         }
-        self.eta_baseline = rng.uniform(*ad["eta_baseline_range"])
         self.eta_shift = eta_shift
         self.last_eta = 0.0
-        self.last_recommendation_accepted = False
         self.accepted_recommendation_count = 0
         self.daily_recommendations = {}
-        self.daily_recommendation_choice = None
-        self.daily_recommendation_source = "organic"
         # Per-day welfare-metric flags (reflect the most recently planned day).
         # had_leisure_opportunity: agent committed to a leisure outing (a slot
         # where the RS could have issued a suggestion). rs_abstained: that outing
@@ -100,12 +89,6 @@ class Agent:
         self.mobility_needs = "none"
         self.primary_interest = "cultural"
         self.time_window_pref = "weekday evening"
-        self.group_type = "solo"
-        self.willingness_ai_level = "med"
-        self.risk_salience_level = "low"
-        self.env_conscious_level = "low"
-        self.top_rated_pref = False
-        self.language = "English"
         self.feedback_sensitivity = rng.uniform(*ad["feedback_sensitivity_range"])
         self.car_access_penalty = 0.0
 
@@ -191,7 +174,6 @@ class Agent:
         self._base_preferences = dict(self.preferences)
         self._base_attitudes = dict(self.attitudes)
         self._base_motivation_weights = dict(self.motivation_weights)
-        self._base_eta_baseline = self.eta_baseline
         self._base_feedback_sensitivity = self.feedback_sensitivity
         self._base_loss_aversion = self.loss_aversion
         self._base_satisficing_threshold = self.satisficing_threshold
@@ -211,7 +193,6 @@ class Agent:
         self._base_preferences = dict(self.preferences)
         self._base_attitudes = dict(self.attitudes)
         self._base_motivation_weights = dict(self.motivation_weights)
-        self._base_eta_baseline = self.eta_baseline
         self._base_feedback_sensitivity = self.feedback_sensitivity
         self._base_loss_aversion = self.loss_aversion
         self._base_satisficing_threshold = self.satisficing_threshold
@@ -341,7 +322,6 @@ class Agent:
         self.preferences = dict(self._base_preferences)
         self.attitudes = dict(self._base_attitudes)
         self.motivation_weights = dict(self._base_motivation_weights)
-        self.eta_baseline = self._base_eta_baseline
         self.feedback_sensitivity = self._base_feedback_sensitivity
         self.loss_aversion = self._base_loss_aversion
         self.satisficing_threshold = self._base_satisficing_threshold
@@ -390,12 +370,6 @@ class Agent:
             0.0,
             1.0,
         )
-        self.attitudes["pro_environment"] = clamp(
-            self.attitudes["pro_environment"] + sp["attitude_shift"]["pro_environment_openness"] * (bf["openness"] - 0.5),
-            0.0,
-            1.0,
-        )
-
         # TOGGLE: when DERIVED_DEMAND_ONLY is on, skip all motivation updates
         # and keep weights pinned at pure-derived-demand.
         if params.SIMPLIFICATION_TOGGLES.get("DERIVED_DEMAND_ONLY", False):
@@ -405,7 +379,6 @@ class Agent:
                 "escape": 0.0,
                 "positionality": 0.0,
             }
-            self.intrinsic_extrinsic = {"intrinsic": 0.0, "extrinsic": 1.0}
         else:
             mw = dict(self.motivation_weights)
             mw["derived"] += sp["motivation_shift"]["derived_planning"] * (planning_orientation - 0.5)
@@ -416,21 +389,7 @@ class Agent:
             for key in mw:
                 mw[key] = max(0.01, mw[key]) / total
             self.motivation_weights = mw
-            self.intrinsic_extrinsic = {
-                "intrinsic": mw["intrinsic"],
-                "extrinsic": mw["derived"] + mw["positionality"],
-            }
 
-        self.eta_baseline = clamp(
-            self.eta_baseline
-            + sp["eta_shift"]["trust"] * (lv["trust_platforms"] - 0.5)
-            + sp["eta_shift"]["ai_follow"] * (it["follow_through_ai"] - 0.5)
-            + sp["eta_shift"]["ai_itinerary_comfort"] * (it["ai_itinerary_comfort"] - 0.5)
-            - sp["eta_shift"]["autonomy_guard"] * (autonomy_guard - 0.5)
-            - sp["eta_shift"]["awareness_caution"] * (lv["algorithmic_awareness"] - 0.5),
-            0.02,
-            0.98,
-        )
         self.feedback_sensitivity = clamp(
             self.feedback_sensitivity
             + sp["feedback_sensitivity_shift"]["feedback_loop"] * (feedback_loop_strength - 0.5)
@@ -449,13 +408,6 @@ class Agent:
             + sp["satisficing_shift"]["budget"] * (budget_sensitivity - 0.5)
             - sp["satisficing_shift"]["maximization"] * (lv["maximization"] - 0.5),
         )
-        if ai_affinity >= 0.67:
-            self.willingness_ai_level = "high"
-        elif ai_affinity <= 0.33:
-            self.willingness_ai_level = "low"
-        else:
-            self.willingness_ai_level = "med"
-        self.risk_salience_level = "high" if risk_aversion >= 0.66 else "low"
         paradigm_scores = {
             "utility": 1.0 + sp["paradigm_shift"]["utility_variety"] * variety_seeking,
             "regret": 1.0 + sp["paradigm_shift"]["regret_maximization"] * lv["maximization"],
@@ -639,16 +591,6 @@ class Agent:
 
     # ── Leisure helpers ──────────────────────────────────────────────────────
 
-    def _sample_leisure_segment(self, rng):
-        """Sample one leisure subtype from the segmented catalog."""
-        segments = list(params.LEISURE_SEGMENTS.keys())
-        weights = []
-        for segment in segments:
-            base_w = params.LEISURE_SEGMENTS[segment]["base_weight"]
-            personal_w = self.leisure_preferences.get(segment, 1.0)
-            weights.append(base_w * personal_w)
-        return rng.choices(segments, weights=weights, k=1)[0]
-
     def _authority_window(self, env, segment):
         """Return opening window for a leisure subtype."""
         authority = env.context.get("authority_constraints", {})
@@ -678,80 +620,27 @@ class Agent:
 
     # ── Eta (recommendation acceptance) ──────────────────────────────────────
 
-    def _estimate_eta(self, env, leisure_start, recommendation_score, leisure_subtype):
-        """Estimate dynamic willingness to accept recommendation (eta)."""
-        # TOGGLE: simplified willingness-to-accept model.
-        # When SIMPLIFY_ETA is True we collapse eta to a function of only
-        # three things: a baseline calibrated from the agent's trust-in-
-        # platforms and autonomy-preference latent variables, a quality term
-        # proportional to the RS's own score, and a memory term proportional
-        # to the count of previously accepted recommendations. All persona-
-        # column-driven influences (weather, language, group type, risk
-        # salience, top-rated preference, mobility needs, time window,
-        # WillingnessAI, EnvConscious) are removed. The population-wide
-        # eta_shift knob still applies, as in the full model.
-        if params.SIMPLIFICATION_TOGGLES.get("SIMPLIFY_ETA", False):
-            sep = params.SIMPLIFIED_ETA_PARAMS
-            trust = self.latent_variables.get("trust_platforms", 0.5)
-            autonomy = self.latent_variables.get("autonomy_preference", 0.5)
-            eta_base = (
-                sep["baseline_intercept"]
-                + sep["baseline_trust_coeff"] * (trust - 0.5)
-                - sep["baseline_autonomy_coeff"] * (autonomy - 0.5)
-            )
-            quality_effect = sep["quality_weight"] * (recommendation_score - 0.5)
-            memory_effect = sep["memory_weight"] * min(
-                sep["memory_cap"], self.accepted_recommendation_count
-            )
-            eta = eta_base + self.eta_shift + quality_effect + memory_effect
-            return clamp(eta, sep["eta_min"], sep["eta_max"])
+    def _estimate_eta(self, recommendation_score):
+        """Willingness to accept a recommendation (eta).
 
-        ep = params.ETA_PARAMS
-        sp = params.SURVEY_BEHAVIOR_PARAMS["eta_dynamic_shift"]
-        hour = leisure_start / 60.0
-
-        # Time effect.
-        if 17 <= hour <= 22:
-            time_effect = ep["time_effect_evening"]
-        elif hour < 9:
-            time_effect = ep["time_effect_morning"]
-        else:
-            time_effect = ep["time_effect_daytime"]
-
-        # User effect.
-        user_effect = 0.0
-        user_effect += ep["practice_conformity_weight"] * (self.attitudes["practice_conformity"] - 0.5)
-        user_effect += ep["travel_affinity_weight"] * (self.attitudes["travel_affinity"] - 0.5)
-        user_effect += ep["eta_baseline_weight"] * (self.eta_baseline - 0.5)
-        if self.group_type in {"family w/ small kids", "older adult pair"}:
-            user_effect += ep["group_family_or_older"]
-        if self.language == "non-English":
-            user_effect += ep["non_english"]
-        user_effect += sp["trust"] * (self.latent_variables["trust_platforms"] - 0.5)
-        user_effect -= sp["autonomy_preference"] * (self.latent_variables["autonomy_preference"] - 0.5)
-        user_effect += sp["follow_through_ai"] * (self.survey_items["follow_through_ai"] - 0.5)
-        user_effect += sp["follow_through_platform"] * (self.survey_items["follow_through_platform"] - 0.5)
-        user_effect += sp["algorithmic_literacy"] * (self.survey_items["objective_algorithmic_literacy"] - 0.5)
-        user_effect -= sp["autonomy_guard"] * (self.behavioral_coefficients["autonomy_guard"] - 0.5)
-        user_effect -= sp["awareness_caution"] * (self.latent_variables["algorithmic_awareness"] - 0.5)
-
-        # Context effect.
-        weather = env.context.get("weather", "fair")
-        context_effect = 0.0
-        if weather in {"rain", "heat"}:
-            context_effect += ep["adverse_weather"]
-            if leisure_subtype in {"park", "workout_or_run"}:
-                context_effect += ep["adverse_weather_outdoor_override"]
-        if env.context.get("travel_norm") == "pro_travel":
-            context_effect += ep["pro_travel_norm"]
-        elif env.context.get("travel_norm") == "anti_travel":
-            context_effect += ep["anti_travel_norm"]
-
-        quality_effect = ep["quality_weight"] * (recommendation_score - 0.5)
-        memory_effect = ep["memory_weight"] * min(ep["memory_cap"], self.accepted_recommendation_count)
-
-        eta = self.eta_baseline + self.eta_shift + time_effect + user_effect + context_effect + quality_effect + memory_effect
-        return clamp(eta, ep["eta_min"], ep["eta_max"])
+        eta = baseline(trust, autonomy) + population-wide eta_shift
+              + quality term (RS score) + memory term (accepted count),
+        clamped to [eta_min, eta_max]. See ``params.SIMPLIFIED_ETA_PARAMS``.
+        """
+        sep = params.SIMPLIFIED_ETA_PARAMS
+        trust = self.latent_variables.get("trust_platforms", 0.5)
+        autonomy = self.latent_variables.get("autonomy_preference", 0.5)
+        eta_base = (
+            sep["baseline_intercept"]
+            + sep["baseline_trust_coeff"] * (trust - 0.5)
+            - sep["baseline_autonomy_coeff"] * (autonomy - 0.5)
+        )
+        quality_effect = sep["quality_weight"] * (recommendation_score - 0.5)
+        memory_effect = sep["memory_weight"] * min(
+            sep["memory_cap"], self.accepted_recommendation_count
+        )
+        eta = eta_base + self.eta_shift + quality_effect + memory_effect
+        return clamp(eta, sep["eta_min"], sep["eta_max"])
 
     # ── Feedback ─────────────────────────────────────────────────────────────
 
@@ -813,8 +702,6 @@ class Agent:
             pbc += tp["pbc_own_car"]
         elif self.car_access_type == "carshare":
             pbc += tp["pbc_carshare"]
-        if self.characteristics["bike_ownership"]:
-            pbc += tp["pbc_bike"]
         pbc += tp["pbc_transit_weight"] * (self.transit_access_level - 0.5)
         if self.characteristics["age"] > 75:
             pbc += tp["pbc_age_75_penalty"]
@@ -849,9 +736,6 @@ class Agent:
         schedule = []
         schedule.append(Activity("home", "", "organic", False, "", 0, work_start, self.home, is_mandatory=True))
         self.last_eta = 0.0
-        self.last_recommendation_accepted = False
-        self.daily_recommendation_source = "organic"
-        self.daily_recommendation_choice = None
         self.had_leisure_opportunity = False
         self.rs_abstained = False
 
@@ -863,30 +747,12 @@ class Agent:
         after_work_start = work_start + work_duration
         origin_after_work = self.home if remote_today else self.work
 
-        # (1) Gather RS recommendations for every leisure subtype.
         self.daily_recommendations = {}
-        interest_keywords = self._interest_keywords()
-        for subtype in ls:
-            query_keywords = LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS.get(subtype, ())
-            user_ctx = UserContext(
-                user_id=self.id,
-                location=origin_after_work,
-                query_keywords=query_keywords,
-                interest_keywords=interest_keywords,
-            )
-            by_source = {}
-            if recommender_stack is not None:
-                by_source = recommender_stack.recommend(user_ctx, subtype, top_k_per_system=3)
 
-            by_source = {
-                source: [getattr(rec, "recommendation", rec) for rec in recs]
-                for source, recs in by_source.items()
-            }
-            flat = [rec for recs in by_source.values() for rec in recs]
-            best = max(flat, key=lambda rec: rec.score) if flat else None
-            self.daily_recommendations[subtype] = {"by_source": by_source, "best": best}
-
-        # (2)-(3) Evaluate leisure participation and subtype choice from net utility.
+        # (1)-(2) Evaluate leisure participation and subtype choice from net utility.
+        # The RS is deliberately NOT consulted here: participation and subtype
+        # choice are built from organic ingredients only, so the (expensive) RS
+        # query can wait until a subtype is actually chosen — see step (3).
         intention = self._tpb_intention(env, "leisure")
         motivation_boost = (
             pp["motivation_intrinsic_coeff"] * self.motivation_weights["intrinsic"]
@@ -976,12 +842,30 @@ class Agent:
                 probs = softmax([o["net_utility"] * temperature for o in options])
                 chosen = rng.choices(options, weights=probs, k=1)[0]
 
-        # (4) Decide recommendation acceptance with dynamic eta.
-        self.daily_recommendation_choice = None
-        self.daily_recommendation_source = "organic"
+        # (3)-(4) Query the RS for the chosen subtype only, then decide
+        # acceptance with dynamic eta. Recommenders are deterministic and
+        # side-effect-free (no RNG, no state mutation), so querying after the
+        # organic participation/subtype choice is behaviour-identical to the
+        # old query-all-subtypes-up-front — agents who stay home skip the RS
+        # entirely, and the other six subtypes are never scored.
         if do_leisure and chosen is not None:
             subtype = chosen["subtype"]
-            best_rec = self.daily_recommendations.get(subtype, {}).get("best")
+            best_rec = None
+            if recommender_stack is not None:
+                user_ctx = UserContext(
+                    user_id=self.id,
+                    location=origin_after_work,
+                    query_keywords=LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS.get(subtype, ()),
+                    interest_keywords=self._interest_keywords(),
+                )
+                by_source = recommender_stack.recommend(user_ctx, subtype, top_k_per_system=3)
+                by_source = {
+                    source: [getattr(rec, "recommendation", rec) for rec in recs]
+                    for source, recs in by_source.items()
+                }
+                flat = [rec for recs in by_source.values() for rec in recs]
+                best_rec = max(flat, key=lambda rec: rec.score) if flat else None
+                self.daily_recommendations[subtype] = {"by_source": by_source, "best": best_rec}
             # Abstention bookkeeping: this leisure outing is a recommendation
             # opportunity; it counts as withheld when the RS surfaced no candidate
             # for the chosen subtype (filtered out under PUP/RM, none available, or
@@ -994,7 +878,7 @@ class Agent:
             chosen_place_id = chosen["desired_place_id"]
             source = "organic"
             if best_rec is not None:
-                eta = self._estimate_eta(env, chosen["start"], best_rec.score, subtype)
+                eta = self._estimate_eta(best_rec.score)
                 accepted = rng.random() < eta
                 if accepted:
                     chosen_location = best_rec.place.location
@@ -1002,17 +886,8 @@ class Agent:
                     source = best_rec.source
 
             self.last_eta = eta
-            self.last_recommendation_accepted = accepted
             if accepted:
                 self.accepted_recommendation_count += 1
-            self.daily_recommendation_source = source
-            self.daily_recommendation_choice = {
-                "subtype": subtype,
-                "eta": eta,
-                "accepted": accepted,
-                "source": source,
-                "recommended_place_id": chosen_place_id if accepted else "",
-            }
 
             schedule.append(
                 Activity(

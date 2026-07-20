@@ -25,16 +25,6 @@ _REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # we can quantify its marginal contribution to the final outcomes. All toggles
 # default to ``False`` (i.e., full-rich model). Flip to ``True`` to ablate.
 #
-# * ``SIMPLIFY_ETA``: collapses the willingness-to-accept model to a function
-#   of only (1) a baseline calibrated from the agent's trust-in-platforms and
-#   autonomy-preference latent variables, (2) a quality term that scales
-#   linearly with the RS's own score for the suggestion, and (3) a memory
-#   term that grows with the count of previously accepted recommendations.
-#   All persona-column-driven influences (``WillingnessAI``, ``RiskSalience``,
-#   ``TopRated``, ``Language``, ``Group``, ``MobilityNeeds``, ``TimeWindow``,
-#   ``EnvConscious``, and ``weather``) are removed. This matches the
-#   simplified formulation in Appendix B.4 of ``latex/main.tex``.
-#
 # * ``CAR_ONLY_MODE``: removes the mode-choice model. Every trip is assigned
 #   ``mode = "car"``. The effects of ``CarAccess`` and ``TransitAccess``
 #   persona columns are neutralised (all agents behave as car owners with no
@@ -49,13 +39,15 @@ SIMPLIFICATION_TOGGLES: dict = {
     # Defaults are ON: the simplified model is the one we now run by
     # default. Flip any of these to ``False`` to restore the
     # corresponding piece of the original (richer) model for comparison.
-    "SIMPLIFY_ETA": True,
     "CAR_ONLY_MODE": True,
     "DERIVED_DEMAND_ONLY": True,
 }
 
-# Parameters used by the simplified willingness-to-accept model (only applied
-# when SIMPLIFICATION_TOGGLES["SIMPLIFY_ETA"] is True).
+# Willingness-to-accept (eta) model: a baseline from the trust-in-platforms and
+# autonomy-preference latent variables, a quality term from the RS's own score,
+# and a memory term from the count of previously accepted recommendations.
+# This is the only eta model (the richer persona/context-driven variant was
+# removed; see Appendix B.4 of ``latex/main.tex`` for the formulation).
 SIMPLIFIED_ETA_PARAMS: dict = {
     # eta_base = intercept + trust_coeff*(trust-0.5) - autonomy_coeff*(autonomy-0.5)
     "baseline_intercept": 0.52,
@@ -354,31 +346,6 @@ WEATHER_FACTORS: dict = {
     "fair": {"bike": 1.0, "walk": 1.0, "transit": 1.0, "car": 1.0},
 }
 
-# ── Recommendation acceptance (eta) ─────────────────────────────────────────
-
-ETA_PARAMS: dict = {
-    "time_effect_evening": 0.08,       # 17:00-22:00
-    "time_effect_morning": -0.03,      # <09:00
-    "time_effect_daytime": 0.02,       # 09:00-17:00
-    "practice_conformity_weight": 0.15,
-    "travel_affinity_weight": 0.12,
-    "eta_baseline_weight": 0.10,
-    "willingness_ai_high": 0.12,
-    "willingness_ai_low": -0.12,
-    "risk_salience_high": -0.06,
-    "group_family_or_older": 0.03,
-    "non_english": 0.02,
-    "adverse_weather": 0.07,
-    "adverse_weather_outdoor_override": -0.10,
-    "pro_travel_norm": 0.03,
-    "anti_travel_norm": -0.03,
-    "quality_weight": 0.20,
-    "memory_weight": 0.04,
-    "memory_cap": 5,
-    "eta_min": 0.02,
-    "eta_max": 0.98,
-}
-
 # ── TPB intention model ──────────────────────────────────────────────────────
 
 TPB_PARAMS: dict = {
@@ -392,7 +359,6 @@ TPB_PARAMS: dict = {
     "norm_anti_travel": 0.2,
     "pbc_own_car": 0.4,
     "pbc_carshare": 0.18,
-    "pbc_bike": 0.2,
     "pbc_transit_weight": 0.25,
     "pbc_age_75_penalty": -0.1,
     "pbc_ada_penalty": -0.08,
@@ -502,7 +468,6 @@ AGENT_DEFAULTS: dict = {
     "car_ownership_prob_low_income": 0.45,
     "car_ownership_prob_high_income": 0.72,
     "car_ownership_income_threshold": 50000,
-    "bike_ownership_prob": 0.35,
     "no_car_access_penalty": 2.0,
     # Preference draws
     "pref_time_range": (0.8, 1.2),
@@ -515,8 +480,6 @@ AGENT_DEFAULTS: dict = {
     "motivation_dirichlet": [2.0, 1.5, 1.2, 1.0],
     # Leisure preferences
     "leisure_pref_range": (0.7, 1.3),
-    # Eta
-    "eta_baseline_range": (0.20, 0.80),
     "feedback_sensitivity_range": (0.8, 1.2),
     "psych_default_range": (0.35, 0.65),
     # Decision paradigm weights
@@ -619,20 +582,12 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
         "status_trend": 0.28,
         "practice_social": 0.20,
         "practice_trend": 0.20,
-        "pro_environment_openness": 0.18,
     },
     "motivation_shift": {
         "derived_planning": 0.20,
         "intrinsic_variety": 0.30,
         "escape_spontaneity": 0.18,
         "positionality_trend": 0.25,
-    },
-    "eta_shift": {
-        "trust": 0.15,
-        "ai_follow": 0.12,
-        "ai_itinerary_comfort": 0.10,
-        "autonomy_guard": 0.16,
-        "awareness_caution": 0.06,
     },
     "feedback_sensitivity_shift": {
         "feedback_loop": 0.35,
@@ -689,15 +644,6 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
         "min": 0.65,
         "max": 1.45,
     },
-    "eta_dynamic_shift": {
-        "trust": 0.14,
-        "autonomy_preference": 0.09,
-        "follow_through_ai": 0.10,
-        "follow_through_platform": 0.08,
-        "algorithmic_literacy": 0.04,
-        "autonomy_guard": 0.12,
-        "awareness_caution": 0.07,
-    },
     "feedback_shift": {
         "trust_platforms": 0.16,
         "feedback_loop_strength": 0.12,
@@ -737,10 +683,6 @@ PERSONA_MAPPING: dict = {
     "transit_access_levels": {"high": 0.85, "medium": 0.55, "low": 0.25},
     "no_car_penalty": 2.2,
     "carshare_penalty": 0.9,
-    "eta_baseline_by_ai_willingness": {"high": 0.72, "med": 0.52, "low": 0.32},
-    "risk_salience_eta_penalty": 0.05,
-    "top_rated_eta_bonus": 0.03,
-    "eta_jitter_range": (-0.05, 0.05),
     # Motivation adjustments from persona traits
     "motivation_adjustments": {
         "food_cultural_derived": 0.15,

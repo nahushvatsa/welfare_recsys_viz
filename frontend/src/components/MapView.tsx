@@ -9,6 +9,12 @@ import type { BBox, Poi, RunMeta, Trip, Stay, TripGeometry } from "../types";
 const DAY = 1440;
 const TRAIL = 60; // minutes of trail for the inspected trip
 
+// Playback pace bounds, in real seconds per simulated day. The slider is
+// linear in s/day (not in raw speed) so the slow end gets usable resolution.
+const MIN_SEC_PER_DAY = 1;
+const MAX_SEC_PER_DAY = 90;
+const DEFAULT_SEC_PER_DAY = 30;
+
 const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
 
 interface MapViewProps {
@@ -65,7 +71,7 @@ export default function MapView({ run, seed }: MapViewProps) {
   // Animation state lives in refs so the rAF loop never re-subscribes.
   const timeRef = useRef(0);
   const playingRef = useRef(true);
-  const speedRef = useRef(240); // simulated minutes per real second
+  const speedRef = useRef(DAY / DEFAULT_SEC_PER_DAY); // simulated minutes per real second
   const lastRef = useRef(performance.now());
 
   // Streamed data for the current window+viewport.
@@ -92,7 +98,7 @@ export default function MapView({ run, seed }: MapViewProps) {
   const scrubRef = useRef<HTMLInputElement | null>(null);
 
   const [playing, setPlaying] = useState(true);
-  const [speed, setSpeed] = useState(240);
+  const [secPerDay, setSecPerDay] = useState(DEFAULT_SEC_PER_DAY);
   const [loading, setLoading] = useState(false);
   const [inspected, setInspected] = useState<string | null>(null);
 
@@ -391,16 +397,16 @@ export default function MapView({ run, seed }: MapViewProps) {
     setPlaying(false);
   }
   function onSpeed(e: React.ChangeEvent<HTMLInputElement>) {
+    // Slider value is inverted (right = faster): v -> (max+min) - v s/day.
     const v = parseFloat(e.target.value);
-    speedRef.current = v;
-    setSpeed(v);
+    const spd = MAX_SEC_PER_DAY + MIN_SEC_PER_DAY - v;
+    speedRef.current = DAY / spd;
+    setSecPerDay(spd);
   }
   function clearInspect() {
     selectedTripRef.current = null;
     setInspected(null);
   }
-
-  const secPerDay = DAY / speed;
 
   return (
     <div className="map-wrap">
@@ -418,8 +424,16 @@ export default function MapView({ run, seed }: MapViewProps) {
           onChange={onScrub}
           className="scrub"
         />
-        <span className="speed-label">⏩ {secPerDay < 1 ? secPerDay.toFixed(1) : Math.round(secPerDay)}s/day</span>
-        <input type="range" min={30} max={1440} step={30} value={speed} onChange={onSpeed} className="speed" />
+        <span className="speed-label">⏩ {secPerDay}s/day</span>
+        <input
+          type="range"
+          min={MIN_SEC_PER_DAY}
+          max={MAX_SEC_PER_DAY}
+          step={1}
+          value={MAX_SEC_PER_DAY + MIN_SEC_PER_DAY - secPerDay}
+          onChange={onSpeed}
+          className="speed"
+        />
         {loading && <span className="loading-dot" title="streaming viewport data" />}
       </div>
       {inspected && (

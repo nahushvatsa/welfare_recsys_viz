@@ -99,12 +99,18 @@ class RoadNetwork:
         self.bounds: BBox = (min(lats), min(lons), max(lats), max(lons))
         self.center: LatLon = center or (sum(lats) / len(lats), sum(lons) / len(lons))
 
-        # Caches: coord->node snap, (orig,dest)->km, source->{node: meters},
+        # Caches: coord->node snap, (orig,dest)->km, source->pruned distances,
         # (orig,dest)->route polyline.
         self._snap_cache: Dict[Tuple[float, float], int] = {}
         self._dist_cache: Dict[Tuple[int, int], float] = {}
-        self._ss_cache: Dict[int, Dict[int, float]] = {}
+        # Single-source results are pruned to registered *target* nodes (agent
+        # homes/works + POIs) — storing distances to every intermediate
+        # intersection serves no query and dominates memory at metro scale.
+        # Entries are (targets_version, {target_node: meters}).
+        self._ss_cache: Dict[int, Tuple[int, Dict[int, float]]] = {}
         self._geom_cache: Dict[Tuple[int, int], List[LatLon]] = {}
+        self._route_targets: set = set()
+        self._targets_version = 0
 
         # Lazily-built acceleration structures (invalidated by _refresh_nodes):
         #   _kdtree: haversine BallTree over node coords — O(log n) snapping,
@@ -213,12 +219,19 @@ class RoadNetwork:
         Served from the (cached) single-source tree out of ``orig`` rather than a
         fresh per-pair search: the planner scores many destinations from the same
         origin, so one Dijkstra amortises across all of them. Identical values.
+
+        Destinations are registered as route targets on first use (see
+        ``register_route_targets``); a query for a not-yet-registered target
+        self-heals by registering it and recomputing the source tree once.
         """
         if orig == dest:
             return 0.0
         key = (orig, dest)
         dist = self._dist_cache.get(key)
         if dist is None:
+            if dest not in self._route_targets:
+                self._route_targets.add(dest)
+                self._targets_version += 1
             meters = self._single_source(orig).get(dest)
             if meters is None:  # unreachable (shouldn't happen on the routable core)
                 dist = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
@@ -259,39 +272,50 @@ class RoadNetwork:
         self._csr_row = row_of
         self._csr_nodes = np.array(node_ids)
 
-    def _single_source(self, src: int) -> Dict[int, float]:
-        """Shortest-path lengths (metres) from ``src`` to every reachable node,
-        cached per source. Computed with scipy csgraph Dijkstra (C-level) instead
-        of networkx — identical distances, ~10-20x faster."""
-        lengths = self._ss_cache.get(src)
-        if lengths is None:
-            from scipy.sparse.csgraph import dijkstra
+    def register_route_targets(self, latlons: Sequence[LatLon]) -> None:
+        """Register (lat, lon) points as routing targets.
 
-            self._ensure_csr()
-            dist = dijkstra(self._csr, directed=True, indices=self._csr_row[src])
-            nodes = self._csr_nodes
-            finite = np.nonzero(np.isfinite(dist))[0]
-            lengths = {int(nodes[i]): float(dist[i]) for i in finite}
-            self._ss_cache[src] = lengths
-        return lengths
-
-    def distances_from_latlon(self, origin: LatLon, dests: Sequence[LatLon]) -> List[float]:
-        """Network distances (km) from one origin to many destinations.
-
-        One Dijkstra serves all destinations and is cached per source node — the
-        agent day-planner scores many candidate leisure locations from the same
-        (repeating) post-work origin, so this amortises well across days.
+        Single-source Dijkstra results are stored only for registered target
+        nodes — the closed set of places routing ever ends at (agent homes and
+        work places, catalog POIs). Intermediate intersections are just passed
+        through and their distances are never queried, so at metro scale
+        pruning cuts each cached source tree from ~all-nodes to ~|targets|.
+        Call this once up front; unregistered destinations still self-heal
+        lazily in :meth:`route_length_km` (one extra Dijkstra per stale source).
         """
-        src = self.nearest_node(*origin)
-        lengths = self._single_source(src)
-        out: List[float] = []
-        for dest in dests:
-            node = self.nearest_node(*dest)
-            if node in lengths:
-                out.append(float(lengths[node]) / 1000.0)
-            else:
-                out.append(haversine_km(self.node_latlon(src), self.node_latlon(node)))
-        return out
+        added = False
+        for lat, lon in latlons:
+            node = self.nearest_node(lat, lon)
+            if node not in self._route_targets:
+                self._route_targets.add(node)
+                added = True
+        if added:
+            self._targets_version += 1
+
+    def _single_source(self, src: int) -> Dict[int, float]:
+        """Shortest-path lengths (metres) from ``src`` to every *registered
+        target* node, cached per source. Computed with scipy csgraph Dijkstra
+        (C-level); the full distance array is pruned to targets before storing.
+        A cached entry is recomputed if targets were registered after it was
+        built (version check)."""
+        entry = self._ss_cache.get(src)
+        if entry is not None and entry[0] == self._targets_version:
+            return entry[1]
+        from scipy.sparse.csgraph import dijkstra
+
+        self._ensure_csr()
+        dist = dijkstra(self._csr, directed=True, indices=self._csr_row[src])
+        lengths: Dict[int, float] = {src: 0.0}
+        row_of = self._csr_row
+        for target in self._route_targets:
+            row = row_of.get(target)
+            if row is None:
+                continue
+            d = dist[row]
+            if np.isfinite(d):
+                lengths[int(target)] = float(d)
+        self._ss_cache[src] = (self._targets_version, lengths)
+        return lengths
 
     def route_geometry_latlon(self, a: LatLon, b: LatLon) -> List[LatLon]:
         """Return the route polyline as ``[(lat, lon), ...]`` for visualization."""

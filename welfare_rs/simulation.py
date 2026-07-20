@@ -142,6 +142,15 @@ class Simulation:
                 agent = self._build_random_agent(i)
             self.agents.append(agent)
 
+        # Routing only ever runs between agent homes/works and catalog POIs;
+        # registering them lets the network prune each cached Dijkstra tree to
+        # just these target nodes (rare fallback destinations self-heal lazily).
+        self.road_network.register_route_targets(
+            [p.location for p in self.place_catalog]
+            + [a.home for a in self.agents]
+            + [a.work for a in self.agents]
+        )
+
         self.recommender_stack = self._resolve_recommender_stack(
             recommender_override=recommender_override,
             recommender_factory=recommender_factory,
@@ -364,10 +373,9 @@ class Simulation:
             car_ownership = self.rng.random() < ad["car_ownership_prob_low_income"]
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
-        bike_ownership = self.rng.random() < ad["bike_ownership_prob"]
         home = self.road_network.sample_node_latlon(self._loc_rng)
         work = self.road_network.sample_node_latlon(self._loc_rng)
-        agent = Agent(i, income, age, car_ownership, bike_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
+        agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
         agent.car_access_type = "own car" if car_ownership else "no car"
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
         return agent
@@ -387,7 +395,6 @@ class Simulation:
         transit_access = str(persona.get("TransitAccess", "medium")).strip()
         mobility_needs = str(persona.get("MobilityNeeds", "none")).strip()
         env_conscious = str(persona.get("EnvConscious", "low")).strip()
-        willingness_ai = str(persona.get("WillingnessAI", "med")).strip()
         risk_salience = str(persona.get("RiskSalience", "low")).strip()
         walk_tol = int(float(str(persona.get("WalkTolerance", "15")).strip()))
         budget = str(persona.get("Budget", "medium")).strip()
@@ -395,7 +402,6 @@ class Simulation:
         time_window = str(persona.get("TimeWindow", "weekday evening")).strip()
         group = str(persona.get("Group", "solo")).strip()
         top_rated = str(persona.get("TopRated", "no")).strip().lower() == "yes"
-        language = str(persona.get("Language", "English")).strip()
 
         # TOGGLE: when CAR_ONLY_MODE is on we neutralise CarAccess /
         # TransitAccess persona columns. Every agent is treated as a car
@@ -415,8 +421,6 @@ class Simulation:
             car_ownership = False
             car_access_penalty = pm["no_car_penalty"]
 
-        bike_ownership = (walk_tol >= 15 and env_conscious == "high" and mobility_needs != "ADA/wheelchair")
-
         try:
             lat = float(persona.get("start_latitude", ""))
             lon = float(persona.get("start_longitude", ""))
@@ -425,7 +429,7 @@ class Simulation:
             home = self.road_network.sample_node_latlon(self._loc_rng)
         work = self.road_network.sample_node_latlon(self._loc_rng)
 
-        agent = Agent(i, income, age, car_ownership, bike_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
+        agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
 
         agent.persona_id = str(persona.get("PersonaID", f"P{i:04d}"))
         agent.car_access_type = car_access
@@ -435,18 +439,10 @@ class Simulation:
         agent.mobility_needs = mobility_needs
         agent.primary_interest = primary_interest
         agent.time_window_pref = time_window
-        agent.group_type = group
-        agent.willingness_ai_level = willingness_ai
-        agent.risk_salience_level = risk_salience
-        agent.env_conscious_level = env_conscious
-        agent.top_rated_pref = top_rated
-        agent.language = language
         agent.feedback_sensitivity = 1.1 if risk_salience == "high" else 0.95
 
         agent.characteristics["car_ownership"] = car_ownership
-        agent.characteristics["bike_ownership"] = bool(bike_ownership)
 
-        agent.attitudes["pro_environment"] = 0.8 if env_conscious == "high" else 0.3
         agent.preferences["green"] = 0.75 if env_conscious == "high" else 0.25
         if budget == "low":
             agent.preferences["cost"] = 1.2
@@ -468,7 +464,6 @@ class Simulation:
                 "escape": 0.0,
                 "positionality": 0.0,
             }
-            agent.intrinsic_extrinsic = {"intrinsic": 0.0, "extrinsic": 1.0}
         else:
             ma = pm["motivation_adjustments"]
             mw = dict(agent.motivation_weights)
@@ -484,35 +479,15 @@ class Simulation:
             for k in mw:
                 mw[k] = max(0.01, mw[k]) / total
             agent.motivation_weights = mw
-            agent.intrinsic_extrinsic = {
-                "intrinsic": mw["intrinsic"],
-                "extrinsic": mw["derived"] + mw["positionality"],
-            }
 
-        # TOGGLE: SIMPLIFY_ETA removes all persona-column-driven eta
-        # adjustments. The eta baseline stored on the agent is not used
-        # at recommendation time under this toggle (see Agent._estimate_eta,
-        # which re-derives the baseline from trust_platforms and
-        # autonomy_preference), so the value here is inert. We still set a
-        # neutral baseline so downstream diagnostics remain sensible.
-        if params.SIMPLIFICATION_TOGGLES.get("SIMPLIFY_ETA", False):
-            agent.eta_baseline = 0.52
-        else:
-            eta_base = pm["eta_baseline_by_ai_willingness"].get(willingness_ai, 0.52)
-            if risk_salience == "high":
-                eta_base -= pm["risk_salience_eta_penalty"]
-            if top_rated:
-                eta_base += pm["top_rated_eta_bonus"]
-            agent.eta_baseline = clamp(eta_base + self.rng.uniform(*pm["eta_jitter_range"]), 0.05, 0.95)
         agent.sync_behavior_baselines()
 
-        # Survey-driven attitudinal adjustments are also suppressed under
-        # SIMPLIFY_ETA (their only purpose in the richer model is to shift
-        # the eta baseline), so that persona columns cannot leak back in.
-        if not params.SIMPLIFICATION_TOGGLES.get("SIMPLIFY_ETA", False):
-            survey_profile = self._build_survey_profile_from_persona(persona)
-            if survey_profile:
-                agent.apply_survey_profile(survey_profile)
+        # Survey overlay: measured latent variables / items from the persona row
+        # (plus coarse fallbacks from stated columns like Budget / WillingnessAI)
+        # remap the agent's behavioural coefficients.
+        survey_profile = self._build_survey_profile_from_persona(persona)
+        if survey_profile:
+            agent.apply_survey_profile(survey_profile)
 
         return agent
 
@@ -743,8 +718,9 @@ class Simulation:
                 return distance_km >= ma["carshare_min_distance_km"]
             return distance_km >= ma["no_car_min_distance_km"]
         if mode == "bike":
-            if not agent.characteristics["bike_ownership"]:
-                return False
+            # No ownership gate: bike-share (e.g., Citi Bike) makes cycling
+            # available to any able rider within range. ACS has no bike-
+            # ownership variable, so we don't model one.
             if agent.characteristics["age"] > ma["bike_max_age"]:
                 return False
             if agent.mobility_needs == "ADA/wheelchair":
