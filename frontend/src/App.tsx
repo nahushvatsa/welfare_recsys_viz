@@ -120,7 +120,7 @@ export default function App() {
       <main className="content">
         {status === "idle" && (
           <div className="placeholder">
-            <p>Pick an area, set options on the left, then press ▶ Run simulation.</p>
+            <p>Pick a city, set options on the left, then press ▶ Run simulation.</p>
           </div>
         )}
         {runMeta && (
@@ -128,7 +128,7 @@ export default function App() {
             <section>
               <div className="section-head">
                 <h3>
-                  Activity-travel over the day · {runMeta.area_label} · {runMeta.config.treatment}
+                  Activity-travel over the day · {runMeta.city_label} · {runMeta.config.treatment}
                 </h3>
                 {runMeta.seeds.length > 1 && (
                   <label className="seed-picker">

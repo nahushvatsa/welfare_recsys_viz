@@ -42,15 +42,15 @@ export interface Headline {
   mean_orc: number | null;
 }
 
-export interface Area {
+export interface City {
   key: string;
   label: string;
 }
 
 export interface CitiesResponse {
-  areas: Area[];
+  cities: City[];
   treatments: string[];
-  pois_available: boolean;
+  pois_available: Record<string, boolean>; // per city key
   defaults: RunConfig;
 }
 
@@ -65,12 +65,13 @@ export interface RunMeta {
   headline: Headline;
   aggregate: Record<string, number>;
   view: { latitude: number; longitude: number };
-  bounds: { south: number; west: number; north: number; east: number };
+  bounds: { south: number; west: number; north: number; east: number }; // full metro
+  core_bounds: { south: number; west: number; north: number; east: number }; // principal city
   num_days: number;
   num_intersections: number;
   poi_count: number;
   poi_source: string;
-  area_label: string;
+  city_label: string;
 }
 
 export interface CreateRunResponse {

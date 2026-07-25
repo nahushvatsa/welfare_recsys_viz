@@ -41,13 +41,6 @@ body { background: var(--bg); color: var(--ink); }
 .field-error { display: block; color: #dc2626; font-size: 11px; margin-top: 3px; }
 .sidebar input[aria-invalid="true"] { border-color: #dc2626; outline-color: #dc2626; }
 
-.area-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-.area-btn {
-  padding: 8px 6px; font-size: 12px; border: 1px solid var(--border);
-  border-radius: 6px; background: #fff; cursor: pointer; color: var(--ink);
-}
-.area-btn.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-
 .run-btn {
   width: 100%; margin-top: 18px; padding: 10px; font-size: 15px; font-weight: 600;
   background: var(--accent); color: #fff; border: 0; border-radius: 8px; cursor: pointer;

@@ -96,21 +96,70 @@ GEO_PARAMS: dict = {
     },
 }
 
-# ── Real POI dataset (filtered to New York) ──────────────────────────────────
+# ── Two-layer metro geography (metro.py) ─────────────────────────────────────
+#
+# Each metro is ONE road network thought of as two layers: the principal city
+# ("core", full drive detail — the only place POIs and work locations live) and
+# an arterial-only shell over the metro counties (motorway/trunk/primary/
+# secondary), where agent homes may also live. The counties included are those
+# composing ``county_coverage`` (90%) of the workers commuting into the core,
+# largest first — county flow data itself lives ON DISK (never in git; see
+# ``datasource.py``), keyed by the metro keys below.
+#
+# ``core_places`` are Nominatim geocode queries; their union is the core
+# polygon (POI bound + work-location pool + full-detail graph extent).
+
+METRO_PARAMS: dict = {
+    # Disk registry of county flows (gitignored; schema in datasource.py).
+    "county_registry_path": os.environ.get(
+        "WELFARE_RS_METRO_COUNTIES",
+        os.path.join(_REPO_ROOT, "data", "metro", "metro_counties.json"),
+    ),
+    # Keep the smallest prefix of counties (sorted by inbound workers, desc)
+    # whose cumulative share of inbound workers reaches this coverage.
+    "county_coverage": 0.90,
+    # OSM ``highway`` classes kept outside the core (the metro "shell").
+    "arterial_filter": (
+        '["highway"~"motorway|motorway_link|trunk|trunk_link'
+        '|primary|primary_link|secondary|secondary_link"]'
+    ),
+    "default_metro": "nyc",
+    "metros": {
+        "nyc": {"label": "New York (Manhattan)",
+                "core_places": ["Manhattan, New York, USA"]},
+        "seattle": {"label": "Seattle",
+                    "core_places": ["Seattle, Washington, USA"]},
+        "sf_bay": {"label": "SF Bay Area (SF + Oakland)",
+                   "core_places": ["San Francisco, California, USA",
+                                   "Oakland, California, USA"]},
+        "chicago": {"label": "Chicago",
+                    "core_places": ["Chicago, Illinois, USA"]},
+        "houston": {"label": "Houston",
+                    "core_places": ["Houston, Texas, USA"]},
+        "dc": {"label": "Washington, DC",
+               "core_places": ["Washington, District of Columbia, USA"]},
+        "miami": {"label": "Miami",
+                  "core_places": ["Miami, Florida, USA"]},
+        "la": {"label": "Los Angeles",
+               "core_places": ["Los Angeles, California, USA"]},
+    },
+}
+
+# ── Real POI dataset (filtered per metro core city) ──────────────────────────
 #
 # The raw dataset (poi_children_merged_by_wkt.csv, ~375 MB, all US) is filtered
-# once to NYC leisure POIs by ``data/filter_nyc_pois.py`` into the small file
-# below; ``Simulation._load_osm_poi_catalog`` loads it. NAICS / category-text are
-# mapped to the recommender's leisure categories (see recommender_systems.
-# LEISURE_SUBTYPE_TO_CATEGORIES). The raw file has no ratings/reviews, so those
-# prominence signals are synthesised deterministically per place at load time.
+# once per metro to core-city leisure POIs by ``data/filter_metro_pois.py``
+# into ``<cache>/pois/<metro>_leisure_pois.csv`` (local data, never in git);
+# ``LocalDataSource.poi_rows`` serves them and ``Simulation._load_osm_poi_
+# catalog`` loads them. NAICS / category-text are mapped to the recommender's
+# leisure categories (see recommender_systems.LEISURE_SUBTYPE_TO_CATEGORIES).
+# The raw file has no ratings/reviews, so those prominence signals are
+# synthesised deterministically per place at load time.
 
+# Legacy single-file pointer (the pre-metro NYC filter output).
 NYC_POI_CSV_PATH: str = os.path.join(GEO_PARAMS["cache_dir"], "pois", "nyc_leisure_pois.csv")
 
 POI_PARAMS: dict = {
-    # Coarse 5-borough bounding box (west, south, east, north) for the one-time
-    # filter; the loader further restricts to the active network's bounds.
-    "nyc_filter_bbox": (-74.30, 40.47, -73.68, 40.93),
     # Cap POIs kept per category (random sample) so dense areas stay responsive.
     "max_per_category": 600,
     # NAICS 6-digit code -> leisure category understood by the recommenders.

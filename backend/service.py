@@ -40,26 +40,23 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from welfare_rs import params
+from welfare_rs.datasource import get_datasource
 from welfare_rs.experiment_harness import table1_metrics, table2_metrics
-from welfare_rs.geo import build_road_network, haversine_km
+from welfare_rs.geo import haversine_km
+from welfare_rs.metro import build_network
 from welfare_rs.simulation import Simulation, SimulationCancelled
 
 import viz
 
-# ── Treatments / areas (mirror the old Streamlit UI) ─────────────────────────
+# ── Treatments / cities ──────────────────────────────────────────────────────
 
 TREATMENTS = ["No RS", "Standard RS", "PUP", "RM", "PUP+RM"]
 _WELFARE_MODE = {"PUP": "pup", "RM": "rm", "PUP+RM": "pup_rm"}
 
-# (city-preset key, friendly label) — surfaced to the frontend as area choices.
-AREAS = [
-    ("nyc_manhattan", "Manhattan"),
-    ("nyc_lower_manhattan", "Lower Manhattan"),
-    ("brooklyn_full", "Brooklyn (full)"),
-    ("brooklyn_downtown_park_slope", "Downtown BK / Park Slope"),
-    ("brooklyn_south_prospect_bay_ridge", "South BK · Prospect / Bay Ridge"),
-]
-_AREA_LABELS = dict(AREAS)
+# (metro key, friendly label) — the two-layer metros surfaced to the frontend.
+CITIES = [(key, spec["label"]) for key, spec in params.METRO_PARAMS["metros"].items()]
+_CITY_LABELS = dict(CITIES)
+DEFAULT_CITY = params.METRO_PARAMS["default_metro"]
 
 MAX_SEEDS = 12
 
@@ -68,7 +65,7 @@ MAX_SEEDS = 12
 
 @dataclass(frozen=True)
 class RunConfig:
-    city: str = "nyc_manhattan"
+    city: str = DEFAULT_CITY
     num_agents: int = 80
     num_days: int = 3
     seed: int = 42          # base seed; the study sweeps seed .. seed+num_seeds-1
@@ -114,7 +111,8 @@ class Run:
     headline: dict
     aggregate: dict
     view: dict
-    bounds: dict
+    bounds: dict                  # full metro network extent
+    core_bounds: dict             # principal-city extent (initial map frame)
     num_days: int
     num_intersections: int
     poi_count: int
@@ -134,11 +132,12 @@ class Run:
             "aggregate": self.aggregate,
             "view": self.view,
             "bounds": self.bounds,
+            "core_bounds": self.core_bounds,
             "num_days": self.num_days,
             "num_intersections": self.num_intersections,
             "poi_count": self.poi_count,
             "poi_source": self.poi_source,
-            "area_label": _AREA_LABELS.get(self.config.city, self.config.city),
+            "city_label": _CITY_LABELS.get(self.config.city, self.config.city),
         }
 
     def viz(self, seed: Optional[int]) -> Optional[SeedViz]:
@@ -218,24 +217,16 @@ def _make_recommender_factory(treatment: str, pup_alpha: float, rm_epsilon: floa
     return factory
 
 
-def _resolve_poi_path() -> Optional[str]:
-    """Locate the filtered NYC POI CSV, robust to a remapped HOME env var."""
-    candidates = [params.NYC_POI_CSV_PATH]
-    try:
-        import pwd
-
-        real_home = pwd.getpwuid(os.getuid()).pw_dir
-        candidates.append(os.path.join(real_home, ".cache", "welfare_rs", "pois", "nyc_leisure_pois.csv"))
-    except Exception:
-        pass
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return None
-
-
-def pois_available() -> bool:
-    return _resolve_poi_path() is not None
+def pois_available() -> Dict[str, bool]:
+    """Per-city real-POI availability (drives the frontend toggle)."""
+    ds = get_datasource()
+    out = {}
+    for key, _label in CITIES:
+        try:
+            out[key] = ds.has_pois(key)
+        except Exception:
+            out[key] = False
+    return out
 
 
 # ── Worker: run one seed (treatment + matched No-RS) ─────────────────────────
@@ -251,19 +242,20 @@ def _worker_network(city: str, use_real_pois: bool):
     key = (city, bool(use_real_pois))
     net = _WORKER_NET_CACHE.get(key)
     if net is None:
-        net = build_road_network(city)
+        net = build_network(city)  # metro two-layer or legacy preset
         _WORKER_NET_CACHE[key] = net
     return net
 
 
-def _build_sim(cfg: dict, seed: int, treatment: str, network, poi_csv_path):
+def _build_sim(cfg: dict, seed: int, treatment: str, network, poi_rows):
+    ds = get_datasource()
     return Simulation(
         num_agents=int(cfg["num_agents"]),
         seed=int(seed),
         use_recommenders=(treatment != "No RS"),
-        persona_csv_path=params.NYC_PERSONA_CSV_PATH,
+        persona_csv_path=ds.persona_csv_path() or params.NYC_PERSONA_CSV_PATH,
         road_network=network,
-        poi_csv_path=poi_csv_path,
+        poi_rows=poi_rows,
         disabled_modes=("transit",),
         recommender_factory=_make_recommender_factory(
             treatment, cfg["pup_alpha"], cfg["rm_epsilon"]
@@ -282,8 +274,8 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
     params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"] = not bool(cfg["multimodal"])
 
     treatment = cfg["treatment"]
-    use_real_pois = bool(cfg["use_real_pois"]) and pois_available()
-    poi_csv_path = _resolve_poi_path() if use_real_pois else None
+    poi_rows = get_datasource().poi_rows(cfg["city"]) if bool(cfg["use_real_pois"]) else None
+    use_real_pois = bool(poi_rows)
     network = _worker_network(cfg["city"], use_real_pois)
 
     # Cooperative cancellation: checked between days by the engine. `cancel_event`
@@ -292,7 +284,7 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
 
     # Treatment run — capture per-day timelines for the map.
     per_day: List[Dict[int, dict]] = []
-    treat_sim = _build_sim(cfg, seed, treatment, network, poi_csv_path)
+    treat_sim = _build_sim(cfg, seed, treatment, network, poi_rows)
     treat_sim.run_days(
         int(cfg["num_days"]),
         on_day_complete=lambda _d, s: per_day.append(viz.build_timelines(s)),
@@ -304,7 +296,7 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
     if treatment == "No RS":
         no_rs_sim = treat_sim
     else:
-        no_rs_sim = _build_sim(cfg, seed, "No RS", network, poi_csv_path)
+        no_rs_sim = _build_sim(cfg, seed, "No RS", network, poi_rows)
         no_rs_sim.run_days(int(cfg["num_days"]), should_stop=should_stop)
 
     t1_treatment = table1_metrics(treat_sim)
@@ -314,6 +306,7 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
     merged = viz.merge_day_timelines(per_day)
     net = treat_sim.road_network
     south, west, north, east = net.bounds
+    csouth, cwest, cnorth, ceast = net.core_bounds
     pois = [
         {"lon": round(p.location[1], 6), "lat": round(p.location[0], 6),
          "category": p.category, "label": f"{p.name} · {p.category}"}
@@ -337,11 +330,14 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
             "time_span": viz.time_span(merged),
         },
         "net": {
-            "view": {"latitude": net.center[0], "longitude": net.center[1]},
+            # Initial map frame: the principal city; agents commute in from
+            # the wider metro bounds visible on zoom-out.
+            "view": {"latitude": net.core_center[0], "longitude": net.core_center[1]},
             "bounds": {"south": south, "west": west, "north": north, "east": east},
+            "core_bounds": {"south": csouth, "west": cwest, "north": cnorth, "east": ceast},
             "num_intersections": net.num_base_nodes,
             "poi_count": len(treat_sim.place_catalog),
-            "poi_source": "real NYC dataset" if use_real_pois else "synthetic",
+            "poi_source": "real dataset" if use_real_pois else "synthetic",
         },
     }
 
@@ -442,8 +438,8 @@ class RunManager:
         job.total = len(seeds)
 
         # Pre-build the network once so worker processes only ever *load* the
-        # GraphML cache (no concurrent Overpass download race).
-        build_road_network(cfg.city)
+        # disk caches (no concurrent Overpass download / warm-pickle race).
+        build_network(cfg.city)
 
         cfg_dict = asdict(cfg)
         results: Dict[int, dict] = {}
@@ -534,6 +530,7 @@ class RunManager:
             aggregate=aggregate,
             view=net0["view"],
             bounds=net0["bounds"],
+            core_bounds=net0["core_bounds"],
             num_days=int(cfg.num_days),
             num_intersections=net0["num_intersections"],
             poi_count=net0["poi_count"],

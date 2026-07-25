@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import AREAS, TREATMENTS, RunConfig, manager
+from service import CITIES, TREATMENTS, RunConfig, manager
 
 app = FastAPI(title="welfare-rs", version="0.1.0")
 
@@ -87,9 +87,9 @@ def health() -> dict:
 @app.get("/api/cities")
 def cities() -> dict:
     return {
-        "areas": [{"key": k, "label": label} for k, label in AREAS],
+        "cities": [{"key": k, "label": label} for k, label in CITIES],
         "treatments": TREATMENTS,
-        "pois_available": manager.pois_available(),
+        "pois_available": manager.pois_available(),  # per-city: {key: bool}
         "defaults": RunRequest().model_dump(),
     }
 

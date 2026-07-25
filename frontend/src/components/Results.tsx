@@ -15,7 +15,7 @@ export default function Results({ run }: { run: RunMeta }) {
   return (
     <div className="results">
       <h3>
-        Welfare metrics (final day, paper-aligned) · {run.area_label} · {run.config.treatment}
+        Welfare metrics (final day, paper-aligned) · {run.city_label} · {run.config.treatment}
         <span className="muted">
           {" "}
           · {nSeeds} seed{nSeeds > 1 ? "s" : ""}

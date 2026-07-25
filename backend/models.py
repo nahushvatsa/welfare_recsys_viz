@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from service import MAX_SEEDS, TREATMENTS, RunConfig
+from service import DEFAULT_CITY, MAX_SEEDS, TREATMENTS, RunConfig
 
 
 class RunRequest(BaseModel):
@@ -13,7 +13,7 @@ class RunRequest(BaseModel):
     ``seed`` is the base seed; the study sweeps ``seed .. seed + num_seeds - 1``.
     """
 
-    city: str = "nyc_manhattan"
+    city: str = DEFAULT_CITY
     num_agents: int = Field(80, ge=1, le=5000)
     num_days: int = Field(3, ge=1, le=60)
     seed: int = 42

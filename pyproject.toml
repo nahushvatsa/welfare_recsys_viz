@@ -35,6 +35,10 @@ notebook = [
     "pandas",
     "scipy",
 ]
+# Server-DB datasource (WELFARE_RS_DATASOURCE=postgres; see welfare_rs/datasource.py).
+postgres = [
+    "psycopg[binary]>=3.1",
+]
 
 [tool.setuptools]
 # Ship only the importable engine. The backend/ and frontend/ are the app, not

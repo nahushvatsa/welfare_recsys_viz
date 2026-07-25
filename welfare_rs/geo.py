@@ -63,6 +63,7 @@ class RoadNetwork:
         bbox: Optional[BBox] = None,
         center: Optional[LatLon] = None,
         dist_m: Optional[float] = None,
+        graph=None,
         network_type: str = "drive",
         cache_dir: Optional[str] = None,
         simplify: bool = True,
@@ -77,13 +78,21 @@ class RoadNetwork:
         # would otherwise try to write to a (possibly unwritable) ./cache dir.
         ox.settings.use_cache = False
 
-        self.G = self._load_or_download(
-            bbox=bbox,
-            center=center,
-            dist_m=dist_m,
-            simplify=simplify,
-            strongly_connected=strongly_connected,
-        )
+        if graph is not None:
+            # Pre-assembled graph (metro.py composes core + arterial shell).
+            self.G = graph
+        else:
+            self.G = self._load_or_download(
+                bbox=bbox,
+                center=center,
+                dist_m=dist_m,
+                simplify=simplify,
+                strongly_connected=strongly_connected,
+            )
+        # Per-edge speeds/travel times (car routing minimises time so freeway
+        # commutes beat surface streets). Upgraded-in-place old caches persist.
+        if self._ensure_travel_times() and graph is None:
+            ox.save_graphml(self.G, self._graph_path())
 
         # Node coordinate lookups + sampling pool.
         self.nodes: List[int] = list(self.G.nodes)
@@ -108,6 +117,10 @@ class RoadNetwork:
         # intersection serves no query and dominates memory at metro scale.
         # Entries are (targets_version, {target_node: meters}).
         self._ss_cache: Dict[int, Tuple[int, Dict[int, float]]] = {}
+        # Time-weighted analogues for car routing: source -> {target: (min, km)}
+        # (km measured along the *fastest* path), and a per-pair front cache.
+        self._ss_time_cache: Dict[int, Tuple[int, Dict[int, Tuple[float, float]]]] = {}
+        self._car_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
         self._geom_cache: Dict[Tuple[int, int], List[LatLon]] = {}
         self._route_targets: set = set()
         self._targets_version = 0
@@ -117,11 +130,16 @@ class RoadNetwork:
         #            built once instead of osmnx rebuilding its index per call.
         #   _csr:    CSR adjacency (min length per directed edge) — lets scipy
         #            run Dijkstra in C. Both yield identical results to before.
+        #   _csr_t:  CSR adjacency weighted by travel_time (car routing), with
+        #            _time_edge_len mapping each kept edge to its length so km
+        #            along the fastest path can be accumulated.
         self._kdtree = None
         self._kdtree_nodes = None  # np.ndarray: tree row -> node id
         self._csr = None
         self._csr_row: Optional[Dict[int, int]] = None   # node id -> CSR row
         self._csr_nodes = None     # np.ndarray: CSR row -> node id
+        self._csr_t = None
+        self._time_edge_len: Optional[Dict[Tuple[int, int], float]] = None
 
         # Original road (intersection) nodes — homes/work/organic locations sample
         # only these. POIs may be inserted as extra mid-block nodes (see
@@ -130,13 +148,26 @@ class RoadNetwork:
         self._poi_nodes: Dict[str, int] = {}
         self._next_poi_node_id = 10_000_000_000_000
 
+        # Two-layer metro state (attach_layers): the principal-city polygon,
+        # its node pool, and per-county core/shell pools for home sampling.
+        # None on plain single-area networks.
+        self.core_polygon = None
+        self.county_meta: Optional[Dict[str, dict]] = None
+        self._core_nodes: Optional[List[int]] = None
+        self._county_pools: Optional[Dict[str, Dict[str, List[int]]]] = None
+        self._county_ids: Optional[List[str]] = None
+        self._county_weights: Optional[List[float]] = None
+        self._core_bounds: Optional[BBox] = None
+        self._core_center: Optional[LatLon] = None
+
     def __getstate__(self) -> dict:
         """Exclude the lazily-rebuilt acceleration structures from pickling (so
         the disk cache stays small and isn't coupled to sklearn/scipy pickle
         versions); they rebuild on first use after a load. The graph + routing
         caches (the expensive, reusable parts) are persisted."""
         state = self.__dict__.copy()
-        for k in ("_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes"):
+        for k in ("_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes",
+                  "_csr_t", "_time_edge_len"):
             state[k] = None
         return state
 
@@ -165,6 +196,29 @@ class RoadNetwork:
         graph = ox.truncate.largest_component(graph, strongly=strongly_connected)
         ox.save_graphml(graph, path)
         return graph
+
+    def _ensure_travel_times(self) -> bool:
+        """Guarantee per-edge ``speed_kph``/``travel_time`` attributes.
+
+        Speeds come from OSM ``maxspeed`` where tagged, imputed by highway
+        class otherwise (OSMnx's standard method) — this is what makes a
+        freeway commute faster than the same km on surface streets. Returns
+        True when attributes were added (caller may want to re-save). Sets
+        ``self._has_edge_times`` either way; on failure (very old osmnx)
+        routing falls back to distance / flat mode speeds.
+        """
+        edge = next(iter(self.G.edges(data=True)), None)
+        if edge is not None and "travel_time" in edge[2]:
+            self._has_edge_times = True
+            return False
+        try:
+            ox.routing.add_edge_speeds(self.G)
+            ox.routing.add_edge_travel_times(self.G)
+            self._has_edge_times = True
+            return True
+        except Exception:
+            self._has_edge_times = False
+            return False
 
     # ── snapping ───────────────────────────────────────────────────────────--
 
@@ -244,9 +298,11 @@ class RoadNetwork:
         return self.route_length_km(self.nearest_node(*a), self.nearest_node(*b))
 
     def _ensure_csr(self) -> None:
-        """Build (once) a CSR adjacency: the minimum ``length`` among parallel
-        directed edges for each (u, v). networkx Dijkstra also uses the min
-        parallel edge, so distances are identical — but scipy runs in C."""
+        """Build (once) the CSR adjacencies: minimum ``length`` among parallel
+        directed edges for each (u, v) — identical distances to networkx
+        Dijkstra, but scipy runs in C — and, when every edge carries a
+        ``travel_time``, a second matrix of minimum time (keeping that fastest
+        edge's length, so km along fastest paths can be accumulated)."""
         if self._csr is not None:
             return
         import scipy.sparse as sp
@@ -254,21 +310,41 @@ class RoadNetwork:
         node_ids = list(self.G.nodes)
         row_of = {n: i for i, n in enumerate(node_ids)}
         best: Dict[Tuple[int, int], float] = {}
+        best_t: Dict[Tuple[int, int], Tuple[float, float]] = {}  # (sec, meters)
+        timed_all = True
         for u, v, d in self.G.edges(data=True):
             w = float(d.get("length", 1.0))
             key = (row_of[u], row_of[v])
             if key not in best or w < best[key]:
                 best[key] = w
+            t = d.get("travel_time")
+            if t is None:
+                timed_all = False
+            else:
+                t = float(t)
+                cur = best_t.get(key)
+                if cur is None or t < cur[0]:
+                    best_t[key] = (t, w)
         n = len(node_ids)
-        if best:
-            keys = list(best.keys())
-            rows = np.fromiter((k[0] for k in keys), dtype=np.int32, count=len(keys))
-            cols = np.fromiter((k[1] for k in keys), dtype=np.int32, count=len(keys))
-            data = np.fromiter((best[k] for k in keys), dtype=np.float64, count=len(keys))
+
+        def _to_csr(weights: Dict[Tuple[int, int], float]):
+            if weights:
+                keys = list(weights.keys())
+                rows = np.fromiter((k[0] for k in keys), dtype=np.int32, count=len(keys))
+                cols = np.fromiter((k[1] for k in keys), dtype=np.int32, count=len(keys))
+                data = np.fromiter((weights[k] for k in keys), dtype=np.float64, count=len(keys))
+            else:
+                rows = cols = np.empty(0, dtype=np.int32)
+                data = np.empty(0, dtype=np.float64)
+            return sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+
+        self._csr = _to_csr(best)
+        if timed_all and best_t:
+            self._csr_t = _to_csr({k: v[0] for k, v in best_t.items()})
+            self._time_edge_len = {k: v[1] for k, v in best_t.items()}
         else:
-            rows = cols = np.empty(0, dtype=np.int32)
-            data = np.empty(0, dtype=np.float64)
-        self._csr = sp.csr_matrix((data, (rows, cols)), shape=(n, n))
+            self._csr_t = None
+            self._time_edge_len = None
         self._csr_row = row_of
         self._csr_nodes = np.array(node_ids)
 
@@ -317,6 +393,72 @@ class RoadNetwork:
         self._ss_cache[src] = (self._targets_version, lengths)
         return lengths
 
+    def _single_source_time(self, src: int) -> Optional[Dict[int, Tuple[float, float]]]:
+        """Fastest-path ``(minutes, km)`` from ``src`` to every registered
+        target, cached per source (None when edges carry no travel_time).
+
+        One time-weighted Dijkstra with predecessors; km is accumulated by
+        walking each target's predecessor chain, so it is the length of the
+        *driven* (fastest) path — a freeway detour counts its real km."""
+        entry = self._ss_time_cache.get(src)
+        if entry is not None and entry[0] == self._targets_version:
+            return entry[1]
+        from scipy.sparse.csgraph import dijkstra
+
+        self._ensure_csr()
+        if self._csr_t is None:
+            return None
+        src_row = self._csr_row[src]
+        seconds, preds = dijkstra(
+            self._csr_t, directed=True, indices=src_row, return_predecessors=True
+        )
+        out: Dict[int, Tuple[float, float]] = {src: (0.0, 0.0)}
+        edge_len = self._time_edge_len
+        for target in self._route_targets:
+            row = self._csr_row.get(target)
+            if row is None or not np.isfinite(seconds[row]):
+                continue
+            meters, r = 0.0, row
+            while r != src_row:
+                p = int(preds[r])
+                if p < 0:
+                    meters = -1.0
+                    break
+                meters += edge_len[(p, r)]
+                r = p
+            if meters >= 0.0:
+                out[int(target)] = (float(seconds[row]) / 60.0, meters / 1000.0)
+        self._ss_time_cache[src] = (self._targets_version, out)
+        return out
+
+    def route_car_latlon(self, a: LatLon, b: LatLon) -> Optional[Tuple[float, float]]:
+        """Fastest-path ``(free-flow minutes, km)`` between two points for car
+        routing, or None when the graph has no travel_time data (callers fall
+        back to distance / flat mode speed). Cached; targets self-heal like
+        :meth:`route_length_km`. Congestion and weather scale the minutes
+        downstream — this is the uncongested network time."""
+        orig = self.nearest_node(*a)
+        dest = self.nearest_node(*b)
+        if orig == dest:
+            return (0.0, 0.0)
+        key = (orig, dest)
+        cached = self._car_cache.get(key)
+        if cached is None:
+            if dest not in self._route_targets:
+                self._route_targets.add(dest)
+                self._targets_version += 1
+            times = self._single_source_time(orig)
+            if times is None:
+                return None
+            cached = times.get(dest)
+            if cached is None:  # unreachable (shouldn't happen on the SCC core)
+                km = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
+                cached = (None, km)
+            self._car_cache[key] = cached
+        if cached[0] is None:
+            return None
+        return cached
+
     def route_geometry_latlon(self, a: LatLon, b: LatLon) -> List[LatLon]:
         """Return the route polyline as ``[(lat, lon), ...]`` for visualization."""
         orig = self.nearest_node(*a)
@@ -326,12 +468,15 @@ class RoadNetwork:
         cached = self._geom_cache.get((orig, dest))
         if cached is not None:
             return cached
-        route = ox.routing.shortest_path(self.G, orig, dest, weight="length")
+        # Match the metric the model routes by: fastest path when edge times
+        # exist (how car km/time are measured), shortest otherwise.
+        weight = "travel_time" if getattr(self, "_has_edge_times", False) else "length"
+        route = ox.routing.shortest_path(self.G, orig, dest, weight=weight)
         if not route or len(route) < 2:
             pts = [self.node_latlon(orig), self.node_latlon(dest)]
         else:
             try:
-                gdf = ox.routing.route_to_gdf(self.G, route, weight="length")
+                gdf = ox.routing.route_to_gdf(self.G, route, weight=weight)
                 pts = []
                 for geom in gdf["geometry"]:
                     for x, y in geom.coords:  # shapely stores coordinates as (lon, lat)
@@ -372,6 +517,8 @@ class RoadNetwork:
         self._snap_cache.clear()
         self._dist_cache.clear()
         self._ss_cache.clear()
+        self._ss_time_cache.clear()
+        self._car_cache.clear()
         self._geom_cache.clear()
         # Acceleration structures must be rebuilt against the new node set.
         self._kdtree = None
@@ -379,6 +526,8 @@ class RoadNetwork:
         self._csr = None
         self._csr_row = None
         self._csr_nodes = None
+        self._csr_t = None
+        self._time_edge_len = None
 
     def _split_edge_through(self, a: int, b: int, k, poi_node_ids: List[int]) -> None:
         """Replace directed edge (a,b,k) with a chain a → … → b through the given
@@ -393,7 +542,11 @@ class RoadNetwork:
             orig_len = haversine_km(
                 (G.nodes[a]["y"], G.nodes[a]["x"]), (G.nodes[b]["y"], G.nodes[b]["x"])
             ) * 1000.0
-        attrs = {kk: vv for kk, vv in data.items() if kk not in ("geometry", "length")}
+        # travel_time is length-proportional, so each segment gets its share
+        # (copying the whole edge's time to every segment would overcount).
+        orig_time = data.get("travel_time")
+        attrs = {kk: vv for kk, vv in data.items()
+                 if kk not in ("geometry", "length", "travel_time")}
 
         # Rank breaks ties: the origin endpoint must sort first and the far
         # endpoint last even when a POI projects exactly onto one of them —
@@ -410,6 +563,8 @@ class RoadNetwork:
                 continue
             seg = dict(attrs)
             seg["length"] = max(0.1, orig_len * (db - da) / total)
+            if orig_time is not None:
+                seg["travel_time"] = max(0.01, float(orig_time) * (db - da) / total)
             try:
                 sub = substring(line, da, db)
                 if sub.length > 0:
@@ -471,6 +626,97 @@ class RoadNetwork:
             for pid, _, _ in pts if pid in self._poi_nodes
         }
 
+    # ── two-layer metro classification (attach_layers) ───────────────────────
+
+    def attach_layers(self, core_polygon, county_polygons: Dict[str, object],
+                      county_meta: Dict[str, dict]) -> None:
+        """Classify base nodes into the two abstract layers of a metro network.
+
+        One graph, two layers: nodes inside ``core_polygon`` (the principal
+        city) form the pool for work locations and POI placement; every county
+        polygon gets a core/shell node-pool split for home sampling.
+
+        ``county_meta``: ``{fips: {"name", "workers", "core_share"}}`` —
+        ``workers`` weights county choice when sampling homes; ``core_share``
+        is the probability a home in that county falls inside the core city
+        (provisional until ACS block-level homes arrive; see datasource.py).
+        """
+        import shapely
+
+        lats = np.fromiter((self._lat[n] for n in self._base_nodes),
+                           dtype=np.float64, count=len(self._base_nodes))
+        lons = np.fromiter((self._lon[n] for n in self._base_nodes),
+                           dtype=np.float64, count=len(self._base_nodes))
+        ids = np.array(self._base_nodes)
+
+        shapely.prepare(core_polygon)
+        core_mask = shapely.contains_xy(core_polygon, lons, lats)
+        self.core_polygon = core_polygon
+        self._core_nodes = [int(n) for n in ids[core_mask]]
+        if not self._core_nodes:
+            raise ValueError(
+                f"core polygon of {self.name!r} contains no network nodes"
+            )
+
+        unassigned = np.ones(len(ids), dtype=bool)
+        pools: Dict[str, Dict[str, List[int]]] = {}
+        for fips, poly in county_polygons.items():
+            shapely.prepare(poly)
+            mask = shapely.contains_xy(poly, lons, lats) & unassigned
+            unassigned &= ~mask
+            pools[fips] = {
+                "core": [int(n) for n in ids[mask & core_mask]],
+                "shell": [int(n) for n in ids[mask & ~core_mask]],
+            }
+        self._county_pools = pools
+        self.county_meta = {f: dict(m) for f, m in county_meta.items()}
+        self._county_ids = [
+            f for f in pools
+            if (pools[f]["core"] or pools[f]["shell"])
+            and self.county_meta.get(f, {}).get("workers", 0) > 0
+        ]
+        self._county_weights = [
+            float(self.county_meta[f]["workers"]) for f in self._county_ids
+        ]
+
+        core_lats, core_lons = lats[core_mask], lons[core_mask]
+        self._core_bounds = (float(core_lats.min()), float(core_lons.min()),
+                             float(core_lats.max()), float(core_lons.max()))
+        self._core_center = (float(core_lats.mean()), float(core_lons.mean()))
+
+    @property
+    def has_layers(self) -> bool:
+        return self._core_nodes is not None
+
+    @property
+    def core_bounds(self) -> BBox:
+        """(south, west, north, east) of the core; full bounds when unlayered."""
+        return self._core_bounds if self._core_bounds is not None else self.bounds
+
+    @property
+    def core_center(self) -> LatLon:
+        return self._core_center if self._core_center is not None else self.center
+
+    def in_core(self, lat: float, lon: float) -> bool:
+        """True when a point lies in the principal city (always True unlayered)."""
+        if self.core_polygon is None:
+            return True
+        import shapely
+
+        return bool(shapely.contains_xy(self.core_polygon, lon, lat))
+
+    def in_core_mask(self, lats: Sequence[float], lons: Sequence[float]):
+        """Vectorised :meth:`in_core` for bulk POI clipping."""
+        if self.core_polygon is None:
+            return np.ones(len(lats), dtype=bool)
+        import shapely
+
+        shapely.prepare(self.core_polygon)
+        return shapely.contains_xy(
+            self.core_polygon, np.asarray(lons, dtype=np.float64),
+            np.asarray(lats, dtype=np.float64),
+        )
+
     # ── sampling ───────────────────────────────────────────────────────────--
 
     def sample_node_latlon(self, rng: random.Random) -> LatLon:
@@ -480,6 +726,31 @@ class RoadNetwork:
         homes/work/organic destinations stay on real intersections.
         """
         return self.node_latlon(rng.choice(self._base_nodes))
+
+    def sample_core_latlon(self, rng: random.Random) -> LatLon:
+        """Random intersection inside the principal city (work locations,
+        synthetic POIs, fallback destinations). Any intersection unlayered."""
+        if not self.has_layers:
+            return self.sample_node_latlon(rng)
+        return self.node_latlon(rng.choice(self._core_nodes))
+
+    def sample_home_latlon(self, rng: random.Random) -> LatLon:
+        """Random home: county drawn ∝ inbound workers, then core vs rest of
+        county by that county's ``core_share``. Any intersection unlayered.
+
+        Provisional placement — the county weights say *where commuters live*;
+        within a pool nodes are uniform until ACS block-level homes replace
+        this via the datasource.
+        """
+        if not self.has_layers:
+            return self.sample_node_latlon(rng)
+        fips = rng.choices(self._county_ids, weights=self._county_weights, k=1)[0]
+        pool = self._county_pools[fips]
+        share = float(self.county_meta[fips].get("core_share", 0.0))
+        nodes = pool["core"] if (pool["core"] and rng.random() < share) else pool["shell"]
+        if not nodes:
+            nodes = pool["core"] or pool["shell"]
+        return self.node_latlon(rng.choice(nodes))
 
     # ── stats ────────────────────────────────────────────────────────────────
 

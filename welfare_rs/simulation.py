@@ -49,6 +49,7 @@ class Simulation:
         use_persona_agents=True,
         persona_csv_path=None,
         poi_csv_path=None,
+        poi_rows=None,
         road_network=None,
         disabled_modes=None,
         recommender_override=None,
@@ -73,6 +74,9 @@ class Simulation:
         self.use_persona_agents = use_persona_agents
         self.persona_csv_path = persona_csv_path if persona_csv_path is not None else params.NYC_PERSONA_CSV_PATH
         self.poi_csv_path = poi_csv_path
+        # Real-POI rows may be handed in directly (datasource-driven backends);
+        # they take precedence over reading poi_csv_path.
+        self.poi_rows = poi_rows
         self.road_network = road_network
 
         # Shared context (weather, norms, authority constraints) — deep-copy so
@@ -187,7 +191,8 @@ class Simulation:
         """
         places = self._pois_by_subtype.get(subtype) or []
         if not places:
-            return self.road_network.sample_node_latlon(self._loc_rng), ""
+            # Fallback destinations stay in the principal city on metro networks.
+            return self.road_network.sample_core_latlon(self._loc_rng), ""
         if len(places) == 1:
             return places[0].location, places[0].place_id
         scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
@@ -373,8 +378,8 @@ class Simulation:
             car_ownership = self.rng.random() < ad["car_ownership_prob_low_income"]
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
-        home = self.road_network.sample_node_latlon(self._loc_rng)
-        work = self.road_network.sample_node_latlon(self._loc_rng)
+        home = self.road_network.sample_home_latlon(self._loc_rng)
+        work = self.road_network.sample_core_latlon(self._loc_rng)
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
         agent.car_access_type = "own car" if car_ownership else "no car"
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
@@ -421,13 +426,19 @@ class Simulation:
             car_ownership = False
             car_access_penalty = pm["no_car_penalty"]
 
-        try:
-            lat = float(persona.get("start_latitude", ""))
-            lon = float(persona.get("start_longitude", ""))
-            home = self._home_from_latlon(lat, lon)
-        except ValueError:
-            home = self.road_network.sample_node_latlon(self._loc_rng)
-        work = self.road_network.sample_node_latlon(self._loc_rng)
+        if self.road_network.has_layers:
+            # Two-layer metro: personas supply behaviour only. Homes follow the
+            # county commuter weights (the persona's stored coordinates belong
+            # to another city); work is always inside the principal city.
+            home = self.road_network.sample_home_latlon(self._loc_rng)
+        else:
+            try:
+                lat = float(persona.get("start_latitude", ""))
+                lon = float(persona.get("start_longitude", ""))
+                home = self._home_from_latlon(lat, lon)
+            except ValueError:
+                home = self.road_network.sample_node_latlon(self._loc_rng)
+        work = self.road_network.sample_core_latlon(self._loc_rng)
 
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
 
@@ -505,11 +516,11 @@ class Simulation:
         synthetic = {col: rng.choice([p.get(col, "") for p in personas]) for col in columns}
         synthetic["PersonaID"] = f"SYN{idx:04d}"
 
-        home = self.road_network.sample_node_latlon(rng)
+        home = self.road_network.sample_home_latlon(rng)
         for _ in range(25):  # resample to keep homes distinct
             if (round(home[0], 6), round(home[1], 6)) not in used_homes:
                 break
-            home = self.road_network.sample_node_latlon(rng)
+            home = self.road_network.sample_home_latlon(rng)
         used_homes.add((round(home[0], 6), round(home[1], 6)))
         synthetic["start_latitude"] = f"{home[0]:.6f}"
         synthetic["start_longitude"] = f"{home[1]:.6f}"
@@ -533,43 +544,59 @@ class Simulation:
         popularity = max(cp["popularity_floor"], review_count * r.uniform(*cp["popularity_multiplier_range"]))
         return rating, review_count, popularity
 
-    def _load_osm_poi_catalog(self, poi_csv_path):
-        """Load real NYC leisure POIs (from data/filter_nyc_pois.py) onto the network.
+    def _load_osm_poi_catalog(self, poi_csv_path, poi_rows=None):
+        """Load real leisure POIs (filtered CSV or datasource rows) onto the network.
 
-        POIs are restricted to the active network's bounds and capped per category
-        for responsiveness; rating/review/popularity are synthesised (the source
-        lacks them — see ``_synth_prominence``). Returns ``[]`` when no POI file is
-        available, so the simulation falls back to ``_build_synthetic_osm_catalog``.
+        POIs are restricted to the principal-city (core) polygon on two-layer
+        metro networks — the sim's leisure supply lives only in the core — and
+        to the network's bounds otherwise. Capped per category for
+        responsiveness; rating/review/popularity are synthesised (the source
+        lacks them — see ``_synth_prominence``). Returns ``[]`` when no POI data
+        is available, so the simulation falls back to
+        ``_build_synthetic_osm_catalog``.
         """
-        if not poi_csv_path:
-            return []
-        path = Path(poi_csv_path)
-        if not path.exists():
-            return []
+        rows = poi_rows
+        if rows is None:
+            if not poi_csv_path:
+                return []
+            path = Path(poi_csv_path)
+            if not path.exists():
+                return []
+            with path.open(newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
 
         south, west, north, east = self.road_network.bounds
+        candidates = []
+        seen_ids = set()
+        for row in rows:
+            try:
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            if not (south <= lat <= north and west <= lon <= east):
+                continue
+            category = (row.get("category") or "").strip()
+            if category not in params.CATEGORY_KEYWORDS:
+                continue
+            place_id = row.get("place_id", "")
+            if place_id and place_id in seen_ids:
+                continue
+            seen_ids.add(place_id)
+            candidates.append((place_id, row.get("name", ""), category, lat, lon))
+
+        # Two-layer bound: POIs exist only in the principal city (no-op mask
+        # on unlayered networks, where the bbox check above is the bound).
+        if candidates and self.road_network.has_layers:
+            keep = self.road_network.in_core_mask(
+                [c[3] for c in candidates], [c[4] for c in candidates]
+            )
+            candidates = [c for c, k in zip(candidates, keep) if k]
+
         cap = params.POI_PARAMS.get("max_per_category", 600)
         by_category: dict = {}
-        seen_ids = set()
-        with path.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                try:
-                    lat = float(row["latitude"])
-                    lon = float(row["longitude"])
-                except (KeyError, ValueError):
-                    continue
-                if not (south <= lat <= north and west <= lon <= east):
-                    continue
-                category = (row.get("category") or "").strip()
-                if category not in params.CATEGORY_KEYWORDS:
-                    continue
-                place_id = row.get("place_id", "")
-                if place_id and place_id in seen_ids:
-                    continue
-                seen_ids.add(place_id)
-                by_category.setdefault(category, []).append(
-                    (place_id, row.get("name", ""), category, lat, lon)
-                )
+        for cand in candidates:
+            by_category.setdefault(cand[2], []).append(cand)
 
         # Cap per category with a fixed seed (not the simulation seed) so the POI
         # set is identical across treatments/seeds — keeping the network mutation
@@ -641,7 +668,9 @@ class Simulation:
         for category, keywords in params.CATEGORY_KEYWORDS.items():
             for _ in range(self.rng.randint(lo, hi)):
                 place_index += 1
-                location = self.road_network.sample_node_latlon(self.rng)
+                # Core-only on metro networks: synthetic POIs are stand-ins for
+                # the principal city's leisure supply.
+                location = self.road_network.sample_core_latlon(self.rng)
                 rating = round(self.rng.uniform(*cp["rating_range"]), 2)
                 review_count = self.rng.randint(*cp["review_count_range"])
                 popularity = max(
@@ -663,7 +692,7 @@ class Simulation:
         return catalog
 
     def _build_place_catalog(self):
-        loaded = self._load_osm_poi_catalog(self.poi_csv_path)
+        loaded = self._load_osm_poi_catalog(self.poi_csv_path, self.poi_rows)
         if loaded:
             return loaded
         return self._build_synthetic_osm_catalog()
@@ -756,13 +785,23 @@ class Simulation:
             return cp["congestion_pricing_base"] + cp["congestion_pricing_per_km"] * distance_km
         return 0.0
 
-    def _base_mode_utility(self, agent, mode, distance_km, road_factor, transit_factor):
+    def _base_mode_utility(self, agent, mode, distance_km, road_factor, transit_factor,
+                           car_route=None):
         uw = params.UTILITY_WEIGHTS
         spec = self.modes[mode]
-        speed = spec["speed_kmh"] * self._weather_speed_factor(mode)
-        in_vehicle = (distance_km / max(1e-3, speed)) * 60
-        if mode == "car":
-            in_vehicle *= road_factor
+        if mode == "car" and car_route is not None:
+            # Network fastest-path (free-flow) time — freeway km are faster
+            # than surface km, which matters for metro commutes. Weather slows
+            # it the same way it scaled the flat speed; congestion multiplies
+            # as before. Costs/emissions accrue over the driven path's km.
+            base_min, car_km = car_route
+            in_vehicle = (base_min / max(1e-3, self._weather_speed_factor(mode))) * road_factor
+            distance_km = car_km
+        else:
+            speed = spec["speed_kmh"] * self._weather_speed_factor(mode)
+            in_vehicle = (distance_km / max(1e-3, speed)) * 60
+            if mode == "car":
+                in_vehicle *= road_factor
         if mode == "transit":
             in_vehicle *= transit_factor
         wait = spec["wait_min"]
@@ -789,11 +828,12 @@ class Simulation:
             return 0.0
         return params.LEISURE_MODE_TASTE_SHIFTS.get(next_activity.subtype, {}).get(mode, 0.0)
 
-    def _mode_outcome(self, agent, mode, distance_km, road_factor, transit_factor, peer_status, next_activity):
+    def _mode_outcome(self, agent, mode, distance_km, road_factor, transit_factor, peer_status,
+                      next_activity, car_route=None):
         """Utility/cost outcome for a single mode (shared by evaluation + fallback)."""
         uw = params.UTILITY_WEIGHTS
         utility, travel_time, monetary_cost, emissions, gen_cost = self._base_mode_utility(
-            agent, mode, distance_km, road_factor, transit_factor
+            agent, mode, distance_km, road_factor, transit_factor, car_route=car_route
         )
 
         if next_activity.is_mandatory:
@@ -836,11 +876,17 @@ class Simulation:
             "cost": monetary_cost,
             "emissions": emissions,
             "gen_cost": gen_cost,
-            "distance_km": distance_km,
+            "distance_km": (car_route[1] if (mode == "car" and car_route is not None)
+                            else distance_km),
         }
 
     def _evaluate_modes(self, agent, origin, destination, current_activity, next_activity):
         distance_km = self.distance_km(origin, destination)
+        # Car rides the fastest network path: (free-flow minutes, km) along it,
+        # or None on graphs without edge travel times (flat-speed fallback).
+        car_route = None
+        if "car" in self.modes:
+            car_route = self.road_network.route_car_latlon(origin, destination)
         road_factor = self._road_congestion_factor(self.last_road_volume)
         transit_factor = self._transit_crowding_factor(self.last_transit_volume)
         peer_status = self._peer_status_average()
@@ -850,7 +896,8 @@ class Simulation:
             if not self._mode_available(mode, agent, distance_km):
                 continue
             outcomes[mode] = self._mode_outcome(
-                agent, mode, distance_km, road_factor, transit_factor, peer_status, next_activity
+                agent, mode, distance_km, road_factor, transit_factor, peer_status,
+                next_activity, car_route=car_route
             )
 
         if not outcomes:
@@ -859,7 +906,8 @@ class Simulation:
             # possible, so use it as the universal fallback.
             fallback = "walk" if "walk" in self.modes else next(iter(self.modes))
             outcomes[fallback] = self._mode_outcome(
-                agent, fallback, distance_km, road_factor, transit_factor, peer_status, next_activity
+                agent, fallback, distance_km, road_factor, transit_factor, peer_status,
+                next_activity, car_route=car_route
             )
 
         return outcomes
