@@ -6,13 +6,15 @@ welfare on a real OpenStreetMap street network.
 
 Quick start
 -----------
-    from welfare_rs import Simulation, build_road_network
+    from welfare_rs import Simulation, build_metro_network
 
-    net = build_road_network("nyc_manhattan")
+    net = build_metro_network("miami")     # two-layer metro (cached after first build)
     sim = Simulation(num_agents=80, seed=42, road_network=net,
                      disabled_modes=("transit",))
     day_summaries = sim.run_days(3)
     print(sim.summarize())
+
+Legacy single-area presets remain available via ``build_road_network``.
 
 The :mod:`welfare_rs.params` module is the central registry of tunable
 assumptions; patch it before constructing a :class:`Simulation`.
@@ -22,8 +24,10 @@ from __future__ import annotations
 
 from . import params
 from .agent import Agent
+from .datasource import DataSource, LocalDataSource, PostgresDataSource, get_datasource
 from .datastructures import Activity, Trip
 from .geo import RoadNetwork, build_road_network, haversine_km
+from .metro import build_metro_network, build_network, is_metro
 from .recommender_systems import (
     GoogleMapsReplica,
     LeisureRSOrchestrator,
@@ -55,7 +59,15 @@ __all__ = [
     "Trip",
     "RoadNetwork",
     "build_road_network",
+    "build_metro_network",
+    "build_network",
+    "is_metro",
     "haversine_km",
+    # data access
+    "DataSource",
+    "LocalDataSource",
+    "PostgresDataSource",
+    "get_datasource",
     # recommenders
     "RecommenderSystem",
     "GoogleMapsReplica",

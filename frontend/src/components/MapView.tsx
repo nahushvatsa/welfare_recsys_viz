@@ -217,11 +217,17 @@ export default function MapView({ run, seed }: MapViewProps) {
     shownSeedRef.current = seed;
     timeSpanRef.current = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
 
+    // Open framed on the principal city (where POIs and leisure live); the
+    // full metro — suburban homes, commutes — is one zoom-out away.
+    const core = run.core_bounds ?? run.bounds;
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: MAP_STYLE,
-      center: [run.view.longitude, run.view.latitude],
-      zoom: 11.5,
+      bounds: [
+        [core.west, core.south],
+        [core.east, core.north],
+      ],
+      fitBoundsOptions: { padding: 24 },
       attributionControl: false,
     });
     mapRef.current = map;

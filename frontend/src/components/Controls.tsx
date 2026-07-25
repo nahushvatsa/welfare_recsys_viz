@@ -44,23 +44,32 @@ export default function Controls({
   const seeds = validateInt(seedsText, 1, 12);
   const inputError = agents.error ?? days.error ?? seeds.error;
 
+  const poisAvailable = cities.pois_available[config.city] ?? false;
+
   return (
     <aside className="sidebar">
-      <h1>Welfare-RS · NYC</h1>
+      <h1>Welfare-RS</h1>
       <p className="muted">Welfare-oriented activity-travel simulation</p>
 
-      <h2>Area</h2>
-      <div className="area-grid">
-        {cities.areas.map((a) => (
-          <button
-            key={a.key}
-            className={`area-btn ${config.city === a.key ? "active" : ""}`}
-            onClick={() => setConfig({ city: a.key })}
-          >
-            {a.label}
-          </button>
-        ))}
-      </div>
+      <h2>City</h2>
+      <label title="Two-layer metro: homes across the commuter counties, work and leisure POIs inside the principal city.">
+        <select
+          className="city-select"
+          value={config.city}
+          onChange={(e) => setConfig({ city: e.target.value })}
+        >
+          {cities.cities.map((c) => (
+            <option key={c.key} value={c.key}>
+              {c.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="muted">
+        Homes span the metro's commuter counties; work &amp; leisure stay in the
+        principal city. A city's first-ever run downloads its road network
+        (several minutes) — later runs load from cache.
+      </p>
 
       <h2>Settings</h2>
       <label>
@@ -145,10 +154,10 @@ export default function Controls({
         <input
           type="checkbox"
           checked={config.use_real_pois}
-          disabled={!cities.pois_available}
+          disabled={!poisAvailable}
           onChange={(e) => setConfig({ use_real_pois: e.target.checked })}
         />
-        Real NYC POIs {cities.pois_available ? "" : "(dataset not found)"}
+        Real POIs {poisAvailable ? "" : "(no dataset for this city — synthetic)"}
       </label>
       {showPup && (
         <label>

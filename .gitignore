@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.claude/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -213,3 +214,8 @@ frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
+
+# ── Local data artifacts (data lives on disk / the server DB, never in git) ──
+data/metro/
+data/pois/
+data/poi_children_merged_by_wkt.csv
