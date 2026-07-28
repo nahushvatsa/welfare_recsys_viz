@@ -185,8 +185,14 @@ POI_PARAMS: dict = {
         ("nature park", "park"), ("botanical", "park"), ("zoos", "park"),
         ("museum", "museum"), ("historical site", "museum"),
         ("fitness", "fitness_studio"), ("recreational sports", "fitness_studio"),
-        ("musical", "live_music"), ("performing arts", "live_music"),
-        ("theater", "live_music"), ("promoters", "concert_venue"),
+        # Match the NAICS *sub*-category, never the group name. Bare "musical"
+        # hit "Sporting Goods, Hobby, Musical Instrument, and Book Stores",
+        # labelling every bookstore, toy shop and fabric store a music venue;
+        # bare "performing arts" hit all of NAICS 711 incl. spectator sports;
+        # bare "theater" hit "Motion Picture Theaters". Keep only places where
+        # a live performance actually happens.
+        ("musical groups", "live_music"), ("theater companies", "live_music"),
+        ("other performing arts", "live_music"), ("promoters", "concert_venue"),
         ("drinking place", "restaurant"), ("full-service restaurant", "restaurant"),
         ("limited-service restaurant", "food_takeout"), ("restaurant", "restaurant"),
     ],

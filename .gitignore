@@ -26,6 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 .claude/
+data/pois.parquet
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -137,6 +138,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -219,3 +221,9 @@ frontend/.vite/
 data/metro/
 data/pois/
 data/poi_children_merged_by_wkt.csv
+
+# ── Server DB schema + ETL (kept off the public repo by request) ──
+# Contains no credentials (passwords come from .env via psql -v / libpq env
+# vars), so this is a distribution choice, not a security one. Note the only
+# copy now lives on the server — back it up outside git.
+db/
