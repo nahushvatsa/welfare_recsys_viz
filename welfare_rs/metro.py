@@ -37,11 +37,18 @@ from typing import Dict, Optional
 import networkx as nx
 import osmnx as ox
 
-from . import params
+from . import params, routing_matrix
 from .datasource import DataSource, get_datasource, select_counties
 from .geo import RoadNetwork
+from .poi_select import catalog_fingerprint, select_catalog_rows
 
 _PICKLE_PROTOCOL = 4
+
+# Bumped when the contents of a warm pickle change shape. v2 bakes the catalog
+# POIs into the graph, so the pickled node ids are final and can index the
+# precomputed routing matrices. A v1 pickle is rebuilt from the cached GraphML
+# (purely local — no Overpass, no Nominatim).
+WARM_VERSION = 2
 
 
 # ── Boundary polygons (geocoded once, cached on disk) ────────────────────────
@@ -179,12 +186,21 @@ def build_metro_network(
     datasource: Optional[DataSource] = None,
     cache_dir: Optional[str] = None,
     use_warm: bool = True,
+    allow_degraded: bool = False,
 ) -> RoadNetwork:
     """Build (or load from cache) the two-layer network for a metro key.
 
     The datasource decides which counties are in (90% inbound-worker rule)
     and provides their weights; geometry comes from Nominatim + Overpass on
     first build and pure disk caches afterwards.
+
+    Refuses to overwrite a warm pickle with a **degraded** one — a graph with no
+    catalog POIs or no commute pairs. Both come from the datasource, and the
+    datasource silently falls back to :class:`LocalDataSource` when
+    ``WELFARE_RS_DATASOURCE``/``WELFARE_RS_PG_DSN`` are unset, so a rebuild run
+    from a shell without the environment would otherwise quietly replace a good
+    cache with an empty one. Pass ``allow_degraded=True`` when that really is
+    what you want (a metro with genuinely no POI or LODES coverage).
     """
     metros = params.METRO_PARAMS["metros"]
     if metro not in metros:
@@ -194,15 +210,31 @@ def build_metro_network(
     cache_dir = cache_dir or params.GEO_PARAMS["cache_dir"]
 
     warm = _warm_path(cache_dir, metro)
+    cap_now = params.POI_PARAMS.get("max_per_category", 0)
     if use_warm and os.path.exists(warm):
         with open(warm, "rb") as f:
             net = pickle.load(f)
-        net.cache_dir = cache_dir
-        # Commute pairs are deliberately not pickled (millions of rows); each
-        # process re-attaches them, restricted to the counties this graph
-        # actually covers — county_meta is exactly that set.
-        _attach_commutes(net, metro, datasource, list(net.county_meta or {}))
-        return net
+        cap_baked = getattr(net, "poi_cap", None)
+        if cap_baked is not None and cap_baked != cap_now:
+            # The cap decides which POIs become graph nodes, so changing it
+            # renumbers the graph and invalidates the routing matrices. Rebuild
+            # rather than run on a graph that disagrees with params — otherwise
+            # the simulation would insert the extra POIs at run time, which
+            # calls _refresh_nodes() and silently detaches the matrices.
+            print(f"  {metro}: POI cap changed {cap_baked} -> {cap_now}; "
+                  f"rebuilding warm graph (re-run scripts/warm_metros.py to "
+                  f"regenerate the routing matrices)", flush=True)
+        elif getattr(net, "warm_version", 1) >= WARM_VERSION:
+            net.cache_dir = cache_dir
+            # Commute pairs are deliberately not pickled (millions of rows); each
+            # process re-attaches them, restricted to the counties this graph
+            # actually covers — county_meta is exactly that set.
+            _attach_commutes(net, metro, datasource, list(net.county_meta or {}))
+            routing_matrix.attach(net, metro, cache_dir,
+                                  getattr(net, "poi_fingerprint", ""))
+            return net
+        # Pre-v2 pickle: no POIs baked in, so its node ids cannot index the
+        # matrices. Fall through and rebuild from the cached GraphML.
 
     ds = datasource or get_datasource()
     drop = excluded_counties(metro)
@@ -231,9 +263,55 @@ def build_metro_network(
         {c.fips: {"name": c.name, "workers": c.workers, "core_share": c.core_share}
          for c in counties},
     )
+
+    # Bake the catalog POIs into the graph *before* pickling. They are static
+    # (a fixed-seed sample of a static table), and inserting them splits edges
+    # and adds mid-block nodes — so doing it here is what makes the pickled node
+    # ids final, which is what lets the routing matrices index by them. The
+    # simulation makes the identical selection and finds every id already
+    # present, so its add_pois_as_nodes call becomes a no-op lookup.
+    poi_fingerprint = ""
+    try:
+        poi_rows = ds.poi_rows(metro)
+    except Exception:
+        poi_rows = None
+    selected = select_catalog_rows(net, poi_rows)
+    if selected:
+        net.add_pois_as_nodes([(pid, lat, lon)
+                               for (pid, _n, _c, lat, lon) in selected])
+        poi_fingerprint = catalog_fingerprint(selected)
+    # The dataset's exact coordinates, kept because routing snaps *these* (a
+    # Place keeps its true location, not its street projection) and the endpoint
+    # universe has to cover whatever they resolve to.
+    net.poi_latlon = {pid: (lat, lon) for (pid, _n, _c, lat, lon) in selected}
+    net.poi_fingerprint = poi_fingerprint
+    net.poi_cap = cap_now
+    net.warm_version = WARM_VERSION
+
+    # Attach before pickling so the result can be validated. Commute pairs are
+    # excluded from the pickle either way (see RoadNetwork.__getstate__).
+    _attach_commutes(net, metro, ds, [c.fips for c in counties])
+
+    if not allow_degraded:
+        missing = []
+        if not selected:
+            missing.append("no catalog POIs")
+        if not net.has_commutes:
+            missing.append("no commute pairs")
+        if missing:
+            raise RuntimeError(
+                f"refusing to write a degraded warm cache for {metro!r}: "
+                f"{' and '.join(missing)}. The datasource in use is "
+                f"{type(ds).__name__} — for the server data set, export "
+                f"WELFARE_RS_DATASOURCE=postgres and WELFARE_RS_PG_DSN "
+                f"(see .env.server / scripts/warm_all.sh). "
+                f"Pass allow_degraded=True only if this metro genuinely has no "
+                f"POI or LODES coverage."
+            )
+
     with open(warm, "wb") as f:
         pickle.dump(net, f, protocol=_PICKLE_PROTOCOL)
-    _attach_commutes(net, metro, ds, [c.fips for c in counties])
+    routing_matrix.attach(net, metro, cache_dir, poi_fingerprint)
     return net
 
 
@@ -258,6 +336,35 @@ def _attach_commutes(net: RoadNetwork, metro: str,
     except Exception:
         pairs = None
     net.attach_commutes(pairs)
+
+
+def ensure_routing_matrices(
+    metro: str,
+    *,
+    datasource: Optional[DataSource] = None,
+    cache_dir: Optional[str] = None,
+    workers: Optional[int] = None,
+    rebuild: bool = False,
+    log=print,
+) -> RoadNetwork:
+    """Warm ``metro`` and make sure its routing matrices exist and are current.
+
+    Idempotent: an up-to-date matrix set (fingerprint matches the graph) is left
+    alone, so this is safe to run over every metro repeatedly. Pass
+    ``rebuild=True`` to force recomputation.
+    """
+    cache_dir = cache_dir or params.GEO_PARAMS["cache_dir"]
+    net = build_metro_network(metro, datasource=datasource, cache_dir=cache_dir)
+    poi_fp = getattr(net, "poi_fingerprint", "")
+    if net.has_routing_matrix and not rebuild:
+        meta = routing_matrix.read_meta(cache_dir, metro) or {}
+        log(f"  {metro}: routing matrices already current "
+            f"({meta.get('universe', 0):,} endpoint nodes)")
+        return net
+    routing_matrix.build(net, metro, cache_dir=cache_dir,
+                         poi_fingerprint=poi_fp, workers=workers, log=log)
+    routing_matrix.attach(net, metro, cache_dir, poi_fp)
+    return net
 
 
 def is_metro(city_key: str) -> bool:

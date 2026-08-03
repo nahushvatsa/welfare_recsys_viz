@@ -324,9 +324,14 @@ class PostgresDataSource(DataSource):
         ]
 
     def poi_rows(self, metro: str) -> Optional[List[dict]]:
+        # ORDER BY is load-bearing, not cosmetic: the per-category cap in
+        # welfare_rs.poi_select samples BY POSITION, and the POI set fixes the
+        # graph's node ids, which index the precomputed routing matrices. An
+        # unordered scan is stable in practice but promises nothing — one table
+        # rewrite would silently select a different catalog.
         rows = self._query(
             "SELECT place_id, name, category, latitude, longitude "
-            "FROM metro_pois WHERE metro = %s",
+            "FROM metro_pois WHERE metro = %s ORDER BY place_id, latitude, longitude",
             (metro,),
         )
         if not rows:

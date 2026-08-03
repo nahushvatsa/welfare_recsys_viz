@@ -179,17 +179,17 @@ def table1_metrics(sim) -> Dict[str, float]:
     }
 
 
-def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
-    """Paper Table 2 (over-recommendation cost) for a treatment vs its matched
-    No-RS counterfactual, on the eval day.
+def table2_from_utilities(
+    u_rec: Dict[int, float], u_org: Dict[int, float]
+) -> Dict[str, float]:
+    """Paper Table 2 from two ``agent_id -> eval-day leisure utility`` maps.
 
-    Agents are matched by id over those who took a leisure trip in *both* runs.
-    Harmed % / Improved %: fraction whose eval-day leisure net utility is lower /
-    higher under the treatment than under No RS. Mean ORC: mean of
-    ``U_organic - U_rec`` over harmed agents only (Eq. 14).
+    Split out of :func:`table2_metrics` so the paired comparison can be made
+    from *serialized* per-agent utilities instead of two live Simulation
+    objects. That is what lets a treatment and its matched No-RS baseline run in
+    separate processes: each worker returns only its own utility map (a few MB
+    even at 100k agents) and the parent does the pairing afterwards.
     """
-    u_rec = eval_day_leisure_utilities(rec_sim.agents)
-    u_org = eval_day_leisure_utilities(organic_sim.agents)
     common = sorted(set(u_rec) & set(u_org))
     n = len(common)
     if n == 0:
@@ -204,6 +204,21 @@ def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
         "mean_orc": float(np.mean([-d for d in harmed])) if harmed else 0.0,
         "n_matched": n,
     }
+
+
+def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
+    """Paper Table 2 (over-recommendation cost) for a treatment vs its matched
+    No-RS counterfactual, on the eval day.
+
+    Agents are matched by id over those who took a leisure trip in *both* runs.
+    Harmed % / Improved %: fraction whose eval-day leisure net utility is lower /
+    higher under the treatment than under No RS. Mean ORC: mean of
+    ``U_organic - U_rec`` over harmed agents only (Eq. 14).
+    """
+    return table2_from_utilities(
+        eval_day_leisure_utilities(rec_sim.agents),
+        eval_day_leisure_utilities(organic_sim.agents),
+    )
 
 
 # ── RM epsilon calibration ───────────────────────────────────────────────────

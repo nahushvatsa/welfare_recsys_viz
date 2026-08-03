@@ -289,13 +289,16 @@ def trip_geometry(mv: dict) -> dict:
     faithful TripsLayer trail for the inspected trip.
     """
     cum = mv["cum"]
-    total = cum[-1] or 1.0
+    # float() on both sides, as in _trip_record: `cum` is a float32 array, and
+    # without the casts every timestamp comes back a numpy.float32, which the
+    # JSON serializer refuses — a 500 on every click-to-inspect.
+    total = float(cum[-1]) or 1.0
     t0, t1 = mv["t0"], mv["t1"]
     return {
         "trip_id": mv["trip_id"],
         "agent_id": int(mv["trip_id"].split("-")[0]),
         "path": [[round(float(lon), 6), round(float(lat), 6)] for lat, lon in mv["path"]],
-        "timestamps": [round(t0 + (t1 - t0) * (c / total), 1) for c in cum],
+        "timestamps": [round(t0 + (t1 - t0) * (float(c) / total), 1) for c in cum],
         "mode": mv["mode"],
         "purpose": mv["purpose"],
         "color": MODE_COLOR.get(mv["mode"], [200, 200, 200]),

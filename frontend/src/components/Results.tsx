@@ -7,20 +7,28 @@ function num(v: number | null | undefined, digits = 3): string {
   return v == null ? "—" : v.toFixed(digits);
 }
 
-export default function Results({ run }: { run: RunMeta }) {
-  const h = run.headline;
-  const t2 = run.table2;
+export default function Results({ run, condition }: { run: RunMeta; condition: string }) {
+  // Headline tiles track whichever condition the map is showing, so the numbers
+  // and the animation always describe the same run.
+  const shown = run.headlines[condition] ? condition : run.default_condition;
+  const h = run.headlines[shown];
   const nSeeds = run.seeds.length;
+  const agg = run.aggregate[shown] ?? {};
 
   return (
     <div className="results">
       <h3>
-        Welfare metrics (final day, paper-aligned) · {run.city_label} · {run.config.treatment}
+        Welfare metrics (final day, paper-aligned) · {run.city_label}
         <span className="muted">
           {" "}
-          · {nSeeds} seed{nSeeds > 1 ? "s" : ""}
+          · {nSeeds} seed{nSeeds > 1 ? "s" : ""} · {run.conditions.length} conditions
         </span>
       </h3>
+
+      <p className="muted small">
+        Headline figures below are for <b>{shown}</b> — the condition the map is
+        showing. The tables cover every condition in the study.
+      </p>
 
       <div className="metric-grid">
         <Metric
@@ -65,7 +73,7 @@ export default function Results({ run }: { run: RunMeta }) {
           </thead>
           <tbody>
             {run.table1.map((r) => (
-              <tr key={r.condition} className={r.condition === run.config.treatment ? "row-hi" : ""}>
+              <tr key={r.condition} className={r.condition === shown ? "row-hi" : ""}>
                 <td>{r.condition}</td>
                 <td>{num(r.mean_utility)}</td>
                 <td>{num(r.sigma_u)}</td>
@@ -78,7 +86,7 @@ export default function Results({ run }: { run: RunMeta }) {
         </table>
       </div>
 
-      {t2 && (
+      {run.table2.length > 0 && (
         <div className="card">
           <h4>Table 2 · Over-recommendation cost (vs matched No RS)</h4>
           <table className="metrics-table">
@@ -92,21 +100,23 @@ export default function Results({ run }: { run: RunMeta }) {
               </tr>
             </thead>
             <tbody>
-              <tr className="row-hi">
-                <td>{t2.condition}</td>
-                <td>{pct(t2.harmed_pct)}</td>
-                <td>{pct(t2.improved_pct)}</td>
-                <td>{num(t2.mean_orc)}</td>
-                <td>{t2.n_matched}</td>
-              </tr>
+              {run.table2.map((r) => (
+                <tr key={r.condition} className={r.condition === shown ? "row-hi" : ""}>
+                  <td>{r.condition}</td>
+                  <td>{pct(r.harmed_pct)}</td>
+                  <td>{pct(r.improved_pct)}</td>
+                  <td>{num(r.mean_orc)}</td>
+                  <td>{r.n_matched}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>
       )}
 
       <p className="muted small">
-        Across {nSeeds} seed{nSeeds > 1 ? "s" : ""}: rec. acceptance {pct(run.aggregate.acceptance_rate)} ·
-        avg travel time {num(run.aggregate.avg_travel_time_min, 1)} min ·{" "}
+        {shown}, across {nSeeds} seed{nSeeds > 1 ? "s" : ""}: rec. acceptance{" "}
+        {pct(agg.acceptance_rate)} · avg travel time {num(agg.avg_travel_time_min, 1)} min ·{" "}
         {run.table1[0]?.n_leisure_trips ?? 0} leisure trips (No RS).
       </p>
     </div>

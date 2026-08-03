@@ -1,18 +1,30 @@
-"""Run management for the FastAPI backend (multi-seed studies).
+"""Run management for the FastAPI backend (multi-condition, multi-seed studies).
 
-A *study* is one treatment swept across N random seeds. For each seed we run the
-selected treatment **and** a matched No-RS counterfactual (same seed → same agent
-population), which is what the paper's Table 2 (over-recommendation cost) requires.
-Seeds are embarrassingly parallel, so they fan out across a ``ProcessPoolExecutor``:
+A *study* is a set of recommender **conditions** swept across N random seeds. The
+No-RS control is always one of them — it is the baseline every Table-2 row is
+paired against, and its movement is worth watching on the map in its own right.
+
+The unit of parallelism is one simulation: every ``(seed, condition)`` pair is a
+separate task on a ``ProcessPoolExecutor``. A 3-seed study over 4 recommenders is
+15 simulations running at once, not 3 sequential pairs. Why processes, and what
+they do and don't share:
 
 * Threads wouldn't help — the agent loop is pure-Python (GIL-bound), and the
   per-run ``params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"]`` global would race.
   Separate processes each get their own module globals, so the toggle is set
-  safely per worker and there is no cross-seed contention.
-* The OSM network is loaded from the on-disk GraphML cache (no Overpass at run
-  time); the parent pre-builds it once so workers never race to download it. A
-  worker keeps its (POI-augmented) network in a process-global cache and reuses it
-  across the seeds it handles — the geometry is seed-independent.
+  safely per worker and there is no cross-task contention.
+* The metro graph is *not* shared: the pool uses 'spawn', so each worker
+  unpickles its own copy (tens of MB on disk, a few hundred resident). The parent
+  pre-builds it once so no worker downloads from Overpass or races to write the
+  warm pickle, and after the first read the file is served from page cache. A
+  worker caches the network process-globally and reuses it across its tasks.
+* The routing matrices (welfare_rs.routing_matrix, 3-35 GB per metro) ARE shared:
+  they are opened ``mmap_mode="r"``, so every worker reads one page-cache copy.
+  That is what makes a wide fan-out affordable.
+
+Table 2 pairs a recommender against No RS agent-by-agent, which would otherwise
+force both runs into one process. Instead each task returns its per-agent eval-day
+utilities and the pairing happens here, in the parent (see ``_assemble``).
 
 Metrics are computed the paper's way (welfare_rs.experiment_harness): Table 1 over
 the **last (evaluation) day's** leisure trips per run, then aggregated across seeds
@@ -33,15 +45,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import multiprocessing as mp
 import queue
 import threading
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from welfare_rs import params
+from welfare_rs import params, routing_matrix
 from welfare_rs.datasource import get_datasource
-from welfare_rs.experiment_harness import table1_metrics, table2_metrics
+from welfare_rs.experiment_harness import (
+    eval_day_leisure_utilities,
+    table1_metrics,
+    table2_from_utilities,
+)
 from welfare_rs.geo import haversine_km
 from welfare_rs.metro import build_network
 from welfare_rs.simulation import Simulation, SimulationCancelled
@@ -76,7 +93,34 @@ def warmed_cities() -> dict:
         for key, _ in CITIES
     }
 
+
+def precomputed_cities() -> dict:
+    """``{metro key: routing matrices present}``.
+
+    A warmed metro without matrices still runs — it just falls back to computing
+    Dijkstra trees per run, which is what makes runs expensive and serialised.
+    Read fresh each call so a metro precomputed while the service is up is
+    reflected without a restart.
+    """
+    cache_dir = params.GEO_PARAMS["cache_dir"]
+    out = {}
+    for key, _ in CITIES:
+        meta = routing_matrix.read_meta(cache_dir, key)
+        out[key] = bool(meta and meta.get("version") == routing_matrix.MATRIX_VERSION)
+    return out
+
 MAX_SEEDS = 12
+
+# Ceiling on simulations running at once. Each is a process holding its own copy
+# of the metro graph (a few hundred MB resident); the multi-GB routing matrices
+# are memmapped read-only, so those cost one shared page-cache copy no matter how
+# many workers there are. Defaults to every core — set WELFARE_RS_MAX_WORKERS to
+# leave the box headroom for other work.
+MAX_WORKERS = int(os.environ.get("WELFARE_RS_MAX_WORKERS", "0") or 0) or (os.cpu_count() or 1)
+
+
+def _worker_count(n_tasks: int) -> int:
+    return max(1, min(n_tasks, os.cpu_count() or 1, MAX_WORKERS))
 
 
 # ── Config / run records ─────────────────────────────────────────────────────
@@ -88,7 +132,9 @@ class RunConfig:
     num_days: int = 3
     seed: int = 42          # base seed; the study sweeps seed .. seed+num_seeds-1
     num_seeds: int = 3
-    treatment: str = "Standard RS"
+    # Recommenders to run *besides* the No-RS control, which is always included.
+    # A tuple, not a list, so the frozen dataclass stays hashable.
+    conditions: Tuple[str, ...] = ("Standard RS",)
     multimodal: bool = False
     use_real_pois: bool = True
     pup_alpha: float = 0.6
@@ -98,10 +144,22 @@ class RunConfig:
         n = max(1, min(int(self.num_seeds), MAX_SEEDS))
         return [int(self.seed) + i for i in range(n)]
 
+    def all_conditions(self) -> List[str]:
+        """``["No RS", *selected recommenders]`` in canonical TREATMENTS order.
+
+        No RS is always present and always first: every Table-2 row is defined
+        relative to it. Deduplicating and canonically ordering here (rather than
+        trusting the request) is what makes ticking PUP-then-Standard resolve to
+        the same ``run_id`` — and therefore the same cached study — as
+        Standard-then-PUP.
+        """
+        picked = {c for c in self.conditions if c in TREATMENTS}
+        return [t for t in TREATMENTS if t == "No RS" or t in picked]
+
     def run_id(self) -> str:
         key = (
             self.city, int(self.num_agents), int(self.num_days), int(self.seed),
-            int(self.num_seeds), self.treatment, bool(self.multimodal),
+            int(self.num_seeds), tuple(self.all_conditions()), bool(self.multimodal),
             bool(self.use_real_pois), round(float(self.pup_alpha), 4),
             round(float(self.rm_epsilon), 4),
         )
@@ -110,11 +168,15 @@ class RunConfig:
 
 @dataclass
 class SeedViz:
-    """Per-seed geometry for the map (the *treatment* condition's trips)."""
+    """One condition's geometry at one seed — what the map plays back.
+
+    POIs are deliberately *not* held here. The catalog varies with the seed (in
+    synthetic mode) but never with which recommender ran, so it lives once per
+    seed on the Run rather than being duplicated across every condition.
+    """
     seed: int
     merged: Dict[int, dict]
     trip_index: Dict[str, dict]
-    pois: List[dict]
     time_span: int
 
 
@@ -123,11 +185,13 @@ class Run:
     run_id: str
     config: RunConfig
     seeds: List[int]
-    per_seed: Dict[int, SeedViz]
-    table1: List[dict]            # rows: No RS, then the treatment (if not No RS)
-    table2: Optional[dict]        # treatment's ORC row, or None for the No-RS study
-    headline: dict
-    aggregate: dict
+    conditions: List[str]                        # No RS first, then recommenders
+    per_condition: Dict[str, Dict[int, SeedViz]]  # condition -> seed -> geometry
+    pois_by_seed: Dict[int, List[dict]]          # condition-independent
+    table1: List[dict]            # one row per condition (No RS first)
+    table2: List[dict]            # one row per recommender, paired vs No RS
+    headlines: Dict[str, dict]    # condition -> headline metrics
+    aggregate: Dict[str, dict]    # condition -> acceptance / travel-time summary
     view: dict
     bounds: dict                  # full metro network extent
     core_bounds: dict             # principal-city extent (initial map frame)
@@ -135,18 +199,34 @@ class Run:
     num_intersections: int
     poi_count: int
     poi_source: str
+    # Wall-clock cost of the study, filled in once it completes.
+    created_at: Optional[float] = None
+    duration_sec: Optional[float] = None
+
+    def default_condition(self) -> str:
+        """What the map opens on: the first recommender, else the No-RS control."""
+        for c in self.conditions:
+            if c != "No RS":
+                return c
+        return "No RS"
 
     def meta(self) -> dict:
-        """Aggregated metrics + per-seed index (no geometry)."""
+        """Aggregated metrics + per-condition/seed index (no geometry)."""
         return {
             "run_id": self.run_id,
             "config": asdict(self.config),
             "seeds": self.seeds,
             "default_seed": self.seeds[0] if self.seeds else self.config.seed,
-            "time_spans": {str(s): v.time_span for s, v in self.per_seed.items()},
+            "conditions": self.conditions,
+            "default_condition": self.default_condition(),
+            # {condition: {seed: span}} — the scrubber's extent depends on both.
+            "time_spans": {
+                cond: {str(s): sv.time_span for s, sv in by_seed.items()}
+                for cond, by_seed in self.per_condition.items()
+            },
             "table1": self.table1,
             "table2": self.table2,
-            "headline": self.headline,
+            "headlines": self.headlines,
             "aggregate": self.aggregate,
             "view": self.view,
             "bounds": self.bounds,
@@ -156,12 +236,30 @@ class Run:
             "poi_count": self.poi_count,
             "poi_source": self.poi_source,
             "city_label": _CITY_LABELS.get(self.config.city, self.config.city),
+            "created_at": self.created_at,
+            "duration_sec": self.duration_sec,
         }
 
-    def viz(self, seed: Optional[int]) -> Optional[SeedViz]:
-        if seed is not None and int(seed) in self.per_seed:
-            return self.per_seed[int(seed)]
-        return self.per_seed.get(self.seeds[0]) if self.seeds else None
+    def viz(self, condition: Optional[str], seed: Optional[int]) -> Optional[SeedViz]:
+        """Geometry for (condition, seed); unknown values fall back to defaults."""
+        by_seed = None
+        if condition is not None:
+            by_seed = self.per_condition.get(condition)
+        if by_seed is None:
+            by_seed = self.per_condition.get(self.default_condition())
+        if not by_seed:
+            return None
+        if seed is not None and int(seed) in by_seed:
+            return by_seed[int(seed)]
+        return by_seed.get(self.seeds[0]) if self.seeds else None
+
+    def pois_for(self, seed: Optional[int]) -> List[dict]:
+        """The POI catalog for a seed (identical across conditions)."""
+        if seed is not None and int(seed) in self.pois_by_seed:
+            return self.pois_by_seed[int(seed)]
+        if self.seeds and self.seeds[0] in self.pois_by_seed:
+            return self.pois_by_seed[self.seeds[0]]
+        return next(iter(self.pois_by_seed.values()), [])
 
 
 # ── Job (background study execution + progress) ──────────────────────────────
@@ -170,9 +268,23 @@ class Run:
 class Job:
     run_id: str
     status: str = "running"  # running | done | error | cancelled
+    # Progress is counted in simulated DAYS across the whole (seed x condition)
+    # grid — the finest unit the parent can observe now that a task is a whole
+    # simulation. `per_condition` breaks that down per arm (days done, out of
+    # `cond_total` = seeds x days each), because every condition is running at
+    # the same time: a single "most recent tick" label would show one arm at
+    # random and read as if the study were sequential.
     current: int = 0
     total: int = 0
+    per_condition: Dict[str, int] = field(default_factory=dict)
+    cond_total: int = 0
     error: Optional[str] = None
+    # Retained so /api/runs can describe a study that is still computing (and
+    # therefore has no Run record yet), and so a browser that never saw the
+    # submission can still show what it is.
+    config: Optional["RunConfig"] = None
+    created_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
     # Cancellation: `cancel` is the in-process signal (inline single-seed path);
     # `mp_cancel` is a multiprocessing Event shared with spawned seed workers,
     # created per study while the process pool is live. Both are checked between
@@ -195,12 +307,35 @@ class Job:
             for q in self._subs:
                 q.put(event)
 
+    def snapshot(self) -> dict:
+        """Status + progress only (no geometry), for the run list."""
+        with self._lock:
+            return {
+                "status": self.status,
+                "created_at": self.created_at,
+                "finished_at": self.finished_at,
+                "error": self.error,
+                "progress": {
+                    "current": self.current,
+                    "total": self.total,
+                    "cond_total": self.cond_total,
+                    "per_condition": dict(self.per_condition),
+                },
+            }
+
+    def finish(self, status: str) -> None:
+        self.status = status
+        self.finished_at = time.time()
+
     def subscribe(self) -> "queue.Queue":
         q: "queue.Queue" = queue.Queue()
         with self._lock:
             self._subs.append(q)
             if self.status == "running":
-                q.put({"type": "progress", "current": self.current, "total": self.total})
+                q.put({"type": "progress", "current": self.current,
+                       "total": self.total, "cond_total": self.cond_total,
+                       "per_condition": dict(self.per_condition),
+                       "elapsed_sec": time.time() - self.created_at})
             elif self.status == "done":
                 q.put({"type": "done", "run_id": self.run_id})
             elif self.status == "error":
@@ -212,14 +347,14 @@ class Job:
 
 # ── Recommender wiring (welfare gate) ────────────────────────────────────────
 
-def _make_recommender_factory(treatment: str, pup_alpha: float, rm_epsilon: float):
+def _make_recommender_factory(condition: str, pup_alpha: float, rm_epsilon: float):
     """Return a recommender_factory wiring the welfare gate, or None for the
     pass-through Standard RS / No RS conditions."""
-    if treatment not in _WELFARE_MODE:
+    if condition not in _WELFARE_MODE:
         return None
     from welfare_rs import TravelCostEstimator, WelfareAwareOrchestrator
 
-    mode = _WELFARE_MODE[treatment]
+    mode = _WELFARE_MODE[condition]
 
     def factory(_sim, base_stack):
         return WelfareAwareOrchestrator(
@@ -247,11 +382,12 @@ def pois_available() -> Dict[str, bool]:
     return out
 
 
-# ── Worker: run one seed (treatment + matched No-RS) ─────────────────────────
+# ── Worker: run ONE simulation (one seed, one condition) ─────────────────────
 #
 # Module-level so it is picklable by ProcessPoolExecutor. Each worker keeps the
 # (POI-augmented) network for a (city, use_real_pois) in a process-global cache
-# and reuses it across the seeds it handles; the geometry is seed-independent.
+# and reuses it across every task it handles; the geometry is independent of both
+# seed and condition.
 
 _WORKER_NET_CACHE: Dict[tuple, object] = {}
 
@@ -265,33 +401,38 @@ def _worker_network(city: str, use_real_pois: bool):
     return net
 
 
-def _build_sim(cfg: dict, seed: int, treatment: str, network, poi_rows):
+def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows):
     ds = get_datasource()
     return Simulation(
         num_agents=int(cfg["num_agents"]),
         seed=int(seed),
-        use_recommenders=(treatment != "No RS"),
+        use_recommenders=(condition != "No RS"),
         persona_csv_path=ds.persona_csv_path() or params.NYC_PERSONA_CSV_PATH,
         road_network=network,
         poi_rows=poi_rows,
         disabled_modes=("transit",),
         recommender_factory=_make_recommender_factory(
-            treatment, cfg["pup_alpha"], cfg["rm_epsilon"]
+            condition, cfg["pup_alpha"], cfg["rm_epsilon"]
         ),
     )
 
 
-def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
-    """Run the treatment (+ matched No-RS counterfactual) for one seed.
+def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
+             progress_q=None) -> dict:
+    """Run ONE simulation: one condition at one seed. The unit of parallelism.
 
-    Returns a picklable dict of per-seed metrics and the treatment viz payload.
+    Returns a picklable dict of that run's metrics, its per-agent utilities and
+    its viz payload. ``utils`` is the piece that makes the fan-out possible:
+    Table 2 pairs a recommender against No RS agent-by-agent, and shipping the
+    ``{agent_id: eval-day leisure utility}`` map back lets the parent do that
+    pairing across process boundaries (one float per agent).
+
     Raises SimulationCancelled if ``cancel_event`` is set between days.
     """
     # Mode model: paper default is car-only; the toggle re-enables multimodal.
     # Safe to set on the module global — this is the worker's own process.
     params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"] = not bool(cfg["multimodal"])
 
-    treatment = cfg["treatment"]
     poi_rows = get_datasource().poi_rows(cfg["city"]) if bool(cfg["use_real_pois"]) else None
     use_real_pois = bool(poi_rows)
     network = _worker_network(cfg["city"], use_real_pois)
@@ -300,43 +441,29 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
     # is the Job's threading.Event (inline) or a shared mp Event (pool workers).
     should_stop = (lambda: cancel_event.is_set()) if cancel_event is not None else None
 
-    # Treatment run — capture per-day timelines for the map.
     per_day: List[Dict[int, dict]] = []
-    treat_sim = _build_sim(cfg, seed, treatment, network, poi_rows)
-    treat_sim.run_days(
-        int(cfg["num_days"]),
-        on_day_complete=lambda _d, s: per_day.append(viz.build_timelines(s)),
-        should_stop=should_stop,
-    )
 
-    # Matched No-RS counterfactual (metrics only — no viz needed). For the No-RS
-    # study itself, the treatment run *is* the baseline; reuse it.
-    if treatment == "No RS":
-        no_rs_sim = treat_sim
-    else:
-        no_rs_sim = _build_sim(cfg, seed, "No RS", network, poi_rows)
-        no_rs_sim.run_days(int(cfg["num_days"]), should_stop=should_stop)
+    def _on_day(day_index, sim_) -> None:
+        per_day.append(viz.build_timelines(sim_))
+        # Day-granular progress. With one simulation per task there is no other
+        # way for the parent to see inside a task, and tasks are long.
+        if progress_q is not None:
+            try:
+                progress_q.put({"seed": int(seed), "condition": condition,
+                                "day": int(day_index) + 1})
+            except Exception:
+                pass  # progress is advisory — never fail a run over it
 
-    t1_treatment = table1_metrics(treat_sim)
-    t1_no_rs = t1_treatment if treatment == "No RS" else table1_metrics(no_rs_sim)
-    t2 = None if treatment == "No RS" else table2_metrics(treat_sim, no_rs_sim)
+    sim = _build_sim(cfg, seed, condition, network, poi_rows)
+    sim.run_days(int(cfg["num_days"]), on_day_complete=_on_day, should_stop=should_stop)
 
     merged = viz.merge_day_timelines(per_day)
-    net = treat_sim.road_network
-    south, west, north, east = net.bounds
-    csouth, cwest, cnorth, ceast = net.core_bounds
-    pois = [
-        {"lon": round(p.location[1], 6), "lat": round(p.location[0], 6),
-         "category": p.category, "label": f"{p.name} · {p.category}"}
-        for p in treat_sim.place_catalog
-    ]
-    summ = treat_sim.summarize()
-
-    return {
+    summ = sim.summarize()
+    out = {
         "seed": int(seed),
-        "t1_treatment": t1_treatment,
-        "t1_no_rs": t1_no_rs,
-        "t2": t2,
+        "condition": condition,
+        "t1": table1_metrics(sim),
+        "utils": eval_day_leisure_utilities(sim.agents),
         "summary": {
             "recommendation_acceptance_rate": summ.get("recommendation_acceptance_rate", 0.0),
             "avg_travel_time_min": summ.get("avg_travel_time_min", 0.0),
@@ -344,20 +471,33 @@ def _run_one_seed(cfg: dict, seed: int, cancel_event=None) -> dict:
         "viz": {
             "merged": merged,
             "trip_index": viz.build_trip_index(merged),
-            "pois": pois,
             "time_span": viz.time_span(merged),
         },
-        "net": {
+    }
+
+    # The POI catalog and the network extent are identical across conditions at a
+    # given seed, and "No RS" always runs — so ship them back from that task
+    # alone instead of pickling the whole catalog once per condition.
+    if condition == "No RS":
+        net = sim.road_network
+        south, west, north, east = net.bounds
+        csouth, cwest, cnorth, ceast = net.core_bounds
+        out["pois"] = [
+            {"lon": round(p.location[1], 6), "lat": round(p.location[0], 6),
+             "category": p.category, "label": f"{p.name} · {p.category}"}
+            for p in sim.place_catalog
+        ]
+        out["net"] = {
             # Initial map frame: the principal city; agents commute in from
             # the wider metro bounds visible on zoom-out.
             "view": {"latitude": net.core_center[0], "longitude": net.core_center[1]},
             "bounds": {"south": south, "west": west, "north": north, "east": east},
             "core_bounds": {"south": csouth, "west": cwest, "north": cnorth, "east": ceast},
             "num_intersections": net.num_base_nodes,
-            "poi_count": len(treat_sim.place_catalog),
+            "poi_count": len(sim.place_catalog),
             "poi_source": "real dataset" if use_real_pois else "synthetic",
-        },
-    }
+        }
+    return out
 
 
 # ── Aggregation across seeds ─────────────────────────────────────────────────
@@ -376,9 +516,9 @@ def _agg_table1_row(condition: str, per_seed_rows: List[dict]) -> dict:
     }
 
 
-def _agg_table2(treatment: str, per_seed_t2: List[dict]) -> dict:
+def _agg_table2(condition: str, per_seed_t2: List[dict]) -> dict:
     return {
-        "condition": treatment,
+        "condition": condition,
         "harmed_pct": float(np.mean([t["harmed_pct"] for t in per_seed_t2])),
         "improved_pct": float(np.mean([t["improved_pct"] for t in per_seed_t2])),
         "mean_orc": float(np.mean([t["mean_orc"] for t in per_seed_t2])),
@@ -388,16 +528,30 @@ def _agg_table2(treatment: str, per_seed_t2: List[dict]) -> dict:
 
 # ── Run manager ──────────────────────────────────────────────────────────────
 
+class _InlineProgress:
+    """A ``.put()``-compatible progress sink for the single-task inline path,
+    where there is no process boundary and no Manager queue to route through."""
+
+    def __init__(self, tick):
+        self._tick = tick
+
+    def put(self, event) -> None:
+        self._tick(event)
+
+
 class RunManager:
     """Builds and caches studies; serialises study execution (one study at a
-    time), parallelising seeds within a study across processes."""
+    time), parallelising the whole (seed x condition) grid across processes."""
 
-    def __init__(self, max_runs: int = 12):
+    # Studies now retain map geometry for EVERY condition, not just one, so a
+    # cached study is several times larger than it used to be. Keep fewer.
+    def __init__(self, max_runs: int = 4):
         # One study at a time keeps memory bounded and avoids oversubscribing the
         # CPU (seeds already fan out across all cores inside a study).
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="study")
         self._runs: Dict[str, Run] = {}
         self._jobs: Dict[str, Job] = {}
+        self._access: Dict[str, float] = {}   # run_id -> last read, for LRU eviction
         self._lock = threading.Lock()
         self._max_runs = max_runs
 
@@ -405,7 +559,56 @@ class RunManager:
         return pois_available()
 
     def get_run(self, run_id: str) -> Optional[Run]:
-        return self._runs.get(run_id)
+        run = self._runs.get(run_id)
+        if run is not None:
+            # Touch on every read so an open tab keeps its study alive.
+            self._access[run_id] = time.time()
+        return run
+
+    def list_runs(self) -> List[dict]:
+        """Every run this process knows about, newest first — no geometry.
+
+        Union of jobs (which exist from submission, so a study still computing
+        appears immediately) and completed runs. ``available`` says whether the
+        result is still resident: a study can be 'done' yet evicted, in which
+        case it is listed but cannot be opened.
+        """
+        with self._lock:
+            jobs = dict(self._jobs)
+            resident = set(self._runs)
+            runs = dict(self._runs)
+
+        out: List[dict] = []
+        for run_id, job in jobs.items():
+            snap = job.snapshot()
+            cfg = job.config or (runs[run_id].config if run_id in runs else None)
+            out.append({
+                "run_id": run_id,
+                "available": run_id in resident,
+                "city": cfg.city if cfg else None,
+                "city_label": _CITY_LABELS.get(cfg.city, cfg.city) if cfg else None,
+                "conditions": list(cfg.all_conditions()) if cfg else [],
+                "num_agents": cfg.num_agents if cfg else None,
+                "num_days": cfg.num_days if cfg else None,
+                "num_seeds": cfg.num_seeds if cfg else None,
+                **snap,
+            })
+        # A run whose job was pruned would otherwise vanish from the list.
+        for run_id, run in runs.items():
+            if run_id in jobs:
+                continue
+            out.append({
+                "run_id": run_id, "available": True, "status": "done",
+                "city": run.config.city,
+                "city_label": _CITY_LABELS.get(run.config.city, run.config.city),
+                "conditions": list(run.conditions),
+                "num_agents": run.config.num_agents, "num_days": run.config.num_days,
+                "num_seeds": run.config.num_seeds,
+                "created_at": None, "finished_at": None, "error": None,
+                "progress": {"current": 0, "total": 0, "cond_total": 0, "per_condition": {}},
+            })
+        out.sort(key=lambda r: (r.get("created_at") or 0.0), reverse=True)
+        return out
 
     def get_job(self, run_id: str) -> Optional[Job]:
         return self._jobs.get(run_id)
@@ -427,7 +630,7 @@ class RunManager:
                 return run_id, "ready"
             if run_id in self._jobs and self._jobs[run_id].status == "running":
                 return run_id, "running"
-            job = Job(run_id=run_id, total=len(config.seeds()))
+            job = Job(run_id=run_id, total=len(config.seeds()), config=config)
             self._jobs[run_id] = job
         self._executor.submit(self._execute, run_id, config)
         return run_id, "running"
@@ -436,115 +639,208 @@ class RunManager:
         job = self._jobs[run_id]
         try:
             run = self._build_study(run_id, config, job)
+            run.created_at = job.created_at
+            run.duration_sec = time.time() - job.created_at
             with self._lock:
                 self._runs[run_id] = run
+                self._access[run_id] = time.time()
                 while len(self._runs) > self._max_runs:
-                    oldest = next(iter(self._runs))
-                    self._runs.pop(oldest)
-            job.status = "done"
+                    # Least-recently-ACCESSED, not oldest-inserted. Now that runs
+                    # are listable and linkable (?run=<id>), the oldest study is
+                    # quite likely the one someone left open in a tab; dropping it
+                    # from under them would 410 a view they are actively using.
+                    victim = min(self._runs, key=lambda r: self._access.get(r, 0.0))
+                    self._runs.pop(victim, None)
+                    self._access.pop(victim, None)
+            job.finish("done")
             job.publish({"type": "done", "run_id": run_id})
         except SimulationCancelled:
-            job.status = "cancelled"
+            job.finish("cancelled")
             job.publish({"type": "cancelled", "run_id": run_id})
         except Exception as exc:
-            job.status = "error"
             job.error = f"{type(exc).__name__}: {exc}"
+            job.finish("error")
             job.publish({"type": "error", "message": job.error})
 
     def _build_study(self, run_id: str, cfg: RunConfig, job: Job) -> Run:
         seeds = cfg.seeds()
-        job.total = len(seeds)
+        conditions = cfg.all_conditions()
+        # One task = one simulation = one (seed, condition) pair, No RS included.
+        tasks = [(s, c) for s in seeds for c in conditions]
+        num_days = max(1, int(cfg.num_days))
+        job.total = len(tasks) * num_days   # progress counted in simulated days
+        # Each condition runs once per seed, so every arm has the same
+        # denominator. Seeded at zero up front so the UI lists all the arms the
+        # moment the study starts, rather than having them pop in one by one.
+        cond_total = len(seeds) * num_days
+        job.cond_total = cond_total
+        job.per_condition = {c: 0 for c in conditions}
 
         # Pre-build the network once so worker processes only ever *load* the
         # disk caches (no concurrent Overpass download / warm-pickle race).
         build_network(cfg.city)
 
         cfg_dict = asdict(cfg)
-        results: Dict[int, dict] = {}
+        results: Dict[Tuple[int, str], dict] = {}
 
-        def _collect(res: dict) -> None:
-            results[res["seed"]] = res
-            job.current = len(results)
-            job.publish({"type": "progress", "current": job.current, "total": job.total})
+        # Ticks arrive from every worker at once, so the counter needs a lock.
+        # Publishing happens outside it to keep the SSE fan-out off the critical
+        # section.
+        tick_lock = threading.Lock()
 
-        if len(seeds) == 1:
+        def _tick(event: dict) -> None:
+            with tick_lock:
+                job.current = min(job.current + 1, job.total)
+                cond = event.get("condition")
+                if cond in job.per_condition:
+                    job.per_condition[cond] = min(job.per_condition[cond] + 1, cond_total)
+                # Snapshot under the lock; the publish below must not race a
+                # concurrent worker mutating the dict mid-serialisation.
+                cur, by_cond = job.current, dict(job.per_condition)
+            # Elapsed is computed server-side and advanced locally by the client,
+            # so the timer is immune to clock skew between browser and box.
+            job.publish({"type": "progress", "current": cur, "total": job.total,
+                         "cond_total": cond_total, "per_condition": by_cond,
+                         "elapsed_sec": time.time() - job.created_at})
+
+        if len(tasks) == 1:
             # Inline: the Job's threading.Event is visible to should_stop directly.
-            _collect(_run_one_seed(cfg_dict, seeds[0], cancel_event=job.cancel))
+            s, c = tasks[0]
+            res = _run_one(cfg_dict, s, c, cancel_event=job.cancel,
+                           progress_q=_InlineProgress(_tick))
+            results[(res["seed"], res["condition"])] = res
         else:
-            workers = min(len(seeds), os.cpu_count() or 1)
-            # 'spawn' (macOS default): fork-after-threads under uvicorn is unsafe.
+            workers = _worker_count(len(tasks))
+            # 'spawn': fork-after-threads under uvicorn is unsafe.
             ctx = mp.get_context("spawn")
-            # A Manager Event is shareable with spawned workers; setting it makes
-            # each worker's should_stop fire at its next day boundary.
+            # Manager-backed Event and Queue are shareable with spawned workers.
+            # Setting the Event makes each worker's should_stop fire at its next
+            # day boundary; the Queue carries day-level progress back.
             manager_proc = ctx.Manager()
             job.mp_cancel = manager_proc.Event()
+            progress_q = manager_proc.Queue()
             if job.cancel.is_set():  # cancel arrived during setup
                 job.mp_cancel.set()
+
+            stop_drain = threading.Event()
+
+            def _drain() -> None:
+                while not stop_drain.is_set():
+                    try:
+                        _tick(progress_q.get(timeout=0.2))
+                    except queue.Empty:
+                        continue
+                    except Exception:
+                        break  # manager torn down — expected at end of study
+
+            drain = threading.Thread(target=_drain, name="progress", daemon=True)
+            drain.start()
             try:
                 with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-                    futs = {pool.submit(_run_one_seed, cfg_dict, s, job.mp_cancel): s for s in seeds}
+                    futs = {
+                        pool.submit(_run_one, cfg_dict, s, c, job.mp_cancel, progress_q): (s, c)
+                        for s, c in tasks
+                    }
                     try:
                         for fut in as_completed(futs):
-                            _collect(fut.result())
+                            res = fut.result()
+                            results[(res["seed"], res["condition"])] = res
                     except SimulationCancelled:
                         for f in futs:
-                            f.cancel()  # drop seeds not yet started
+                            f.cancel()  # drop tasks not yet started
                         raise
             finally:
+                stop_drain.set()
+                drain.join(timeout=1.0)
                 job.mp_cancel = None
                 manager_proc.shutdown()
 
         return self._assemble(run_id, cfg, seeds, results)
 
     def _assemble(self, run_id: str, cfg: RunConfig, seeds: List[int],
-                  results: Dict[int, dict]) -> Run:
-        ordered = [results[s] for s in seeds if s in results]
+                  results: Dict[Tuple[int, str], dict]) -> Run:
+        conditions = cfg.all_conditions()
+        # Only seeds that produced *every* condition are usable: a seed missing
+        # its No-RS run has nothing to pair against, and one missing a
+        # recommender would silently drop that arm from a single row of the
+        # cross-seed average.
+        ok_seeds = [s for s in seeds if all((s, c) in results for c in conditions)]
+        if not ok_seeds:
+            raise RuntimeError("study produced no complete seed")
 
-        # Table 1: No RS row always; the treatment row when it isn't No RS.
-        table1 = [_agg_table1_row("No RS", [r["t1_no_rs"] for r in ordered])]
-        if cfg.treatment != "No RS":
-            table1.append(_agg_table1_row(cfg.treatment, [r["t1_treatment"] for r in ordered]))
+        # Table 1: one row per condition, No RS first (all_conditions order).
+        table1 = [
+            _agg_table1_row(c, [results[(s, c)]["t1"] for s in ok_seeds])
+            for c in conditions
+        ]
 
-        table2 = None
-        if cfg.treatment != "No RS":
-            table2 = _agg_table2(cfg.treatment, [r["t2"] for r in ordered])
+        # Table 2: each recommender paired against the SAME No-RS run, seed by
+        # seed, then averaged. The pairing lives here rather than in the worker
+        # because the two runs are now in different processes.
+        table2 = [
+            _agg_table2(c, [
+                table2_from_utilities(results[(s, c)]["utils"],
+                                      results[(s, "No RS")]["utils"])
+                for s in ok_seeds
+            ])
+            for c in conditions if c != "No RS"
+        ]
 
-        treat_row = table1[-1]  # treatment row, or No RS for the baseline study
-        headline = {
-            "mean_utility": treat_row["mean_utility"],
-            "sigma_u": treat_row["sigma_u"],
-            "neg_rate": treat_row["neg_rate"],
-            "harmed_pct": table2["harmed_pct"] if table2 else None,
-            "improved_pct": table2["improved_pct"] if table2 else None,
-            "mean_orc": table2["mean_orc"] if table2 else None,
-        }
+        t1_by_cond = {r["condition"]: r for r in table1}
+        t2_by_cond = {r["condition"]: r for r in table2}
+        # One headline per condition; the frontend shows whichever the map is on.
+        # The No-RS control has no Table-2 row (it is the baseline), so its
+        # over-recommendation fields are null rather than zero.
+        headlines = {}
+        for c in conditions:
+            t1r, t2r = t1_by_cond[c], t2_by_cond.get(c)
+            headlines[c] = {
+                "mean_utility": t1r["mean_utility"],
+                "sigma_u": t1r["sigma_u"],
+                "neg_rate": t1r["neg_rate"],
+                "harmed_pct": t2r["harmed_pct"] if t2r else None,
+                "improved_pct": t2r["improved_pct"] if t2r else None,
+                "mean_orc": t2r["mean_orc"] if t2r else None,
+            }
+
         aggregate = {
-            "acceptance_rate": float(np.mean(
-                [r["summary"]["recommendation_acceptance_rate"] for r in ordered])),
-            "avg_travel_time_min": float(np.mean(
-                [r["summary"]["avg_travel_time_min"] for r in ordered])),
+            c: {
+                "acceptance_rate": float(np.mean([
+                    results[(s, c)]["summary"]["recommendation_acceptance_rate"]
+                    for s in ok_seeds])),
+                "avg_travel_time_min": float(np.mean([
+                    results[(s, c)]["summary"]["avg_travel_time_min"]
+                    for s in ok_seeds])),
+            }
+            for c in conditions
         }
 
-        per_seed = {
-            r["seed"]: SeedViz(
-                seed=r["seed"],
-                merged={int(k): v for k, v in r["viz"]["merged"].items()},
-                trip_index=r["viz"]["trip_index"],
-                pois=r["viz"]["pois"],
-                time_span=r["viz"]["time_span"],
-            )
-            for r in ordered
+        per_condition = {
+            c: {
+                s: SeedViz(
+                    seed=s,
+                    merged={int(k): v for k, v in results[(s, c)]["viz"]["merged"].items()},
+                    trip_index=results[(s, c)]["viz"]["trip_index"],
+                    time_span=results[(s, c)]["viz"]["time_span"],
+                )
+                for s in ok_seeds
+            }
+            for c in conditions
         }
-        net0 = ordered[0]["net"]
+        # POIs and the network extent came back on the No-RS task only.
+        pois_by_seed = {s: results[(s, "No RS")].get("pois", []) for s in ok_seeds}
+        net0 = results[(ok_seeds[0], "No RS")]["net"]
 
         return Run(
             run_id=run_id,
             config=cfg,
-            seeds=seeds,
-            per_seed=per_seed,
+            seeds=ok_seeds,
+            conditions=conditions,
+            per_condition=per_condition,
+            pois_by_seed=pois_by_seed,
             table1=table1,
             table2=table2,
-            headline=headline,
+            headlines=headlines,
             aggregate=aggregate,
             view=net0["view"],
             bounds=net0["bounds"],

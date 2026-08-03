@@ -249,8 +249,12 @@ METRO_PARAMS: dict = {
 NYC_POI_CSV_PATH: str = os.path.join(GEO_PARAMS["cache_dir"], "pois", "nyc_leisure_pois.csv")
 
 POI_PARAMS: dict = {
-    # Cap POIs kept per category (random sample) so dense areas stay responsive.
-    "max_per_category": 600,
+    # Cap POIs kept per category (fixed-seed random sample). Historically 600,
+    # chosen so dense areas stayed responsive when every POI was a live routing
+    # target. The precomputed routing matrices remove that cost, so the cap is
+    # now a modelling choice rather than a performance one. See
+    # welfare_rs.poi_select for the (deterministic) sampling.
+    "max_per_category": 1000,
     # NAICS 6-digit code -> leisure category understood by the recommenders.
     "naics_to_category": {
         "722511": "restaurant",      # full-service restaurants

@@ -13,6 +13,7 @@ from pathlib import Path
 from . import params
 from .agent import Agent
 from .datastructures import Trip
+from .poi_select import select_catalog_rows
 from .utils import clamp, haversine_km, softmax
 from .recommender_systems import (
     Place,
@@ -572,11 +573,15 @@ class Simulation:
 
         POIs are restricted to the principal-city (core) polygon on two-layer
         metro networks — the sim's leisure supply lives only in the core — and
-        to the network's bounds otherwise. Capped per category for
-        responsiveness; rating/review/popularity are synthesised (the source
-        lacks them — see ``_synth_prominence``). Returns ``[]`` when no POI data
-        is available, so the simulation falls back to
-        ``_build_synthetic_osm_catalog``.
+        to the network's bounds otherwise. Capped per category; rating / review /
+        popularity are synthesised (the source lacks them — see
+        ``_synth_prominence``). Returns ``[]`` when no POI data is available, so
+        the simulation falls back to ``_build_synthetic_osm_catalog``.
+
+        Selection itself lives in :func:`welfare_rs.poi_select.select_catalog_rows`
+        because the warm-graph builder must make the *identical* choice — the
+        chosen POIs are inserted as graph nodes, and those node ids index the
+        precomputed routing matrices.
         """
         rows = poi_rows
         if rows is None:
@@ -588,54 +593,18 @@ class Simulation:
             with path.open(newline="", encoding="utf-8") as f:
                 rows = list(csv.DictReader(f))
 
-        south, west, north, east = self.road_network.bounds
-        candidates = []
-        seen_ids = set()
-        for row in rows:
-            try:
-                lat = float(row["latitude"])
-                lon = float(row["longitude"])
-            except (KeyError, ValueError, TypeError):
-                continue
-            if not (south <= lat <= north and west <= lon <= east):
-                continue
-            category = (row.get("category") or "").strip()
-            if category not in params.CATEGORY_KEYWORDS:
-                continue
-            place_id = row.get("place_id", "")
-            if place_id and place_id in seen_ids:
-                continue
-            seen_ids.add(place_id)
-            candidates.append((place_id, row.get("name", ""), category, lat, lon))
-
-        # Two-layer bound: POIs exist only in the principal city (no-op mask
-        # on unlayered networks, where the bbox check above is the bound).
-        if candidates and self.road_network.has_layers:
-            keep = self.road_network.in_core_mask(
-                [c[3] for c in candidates], [c[4] for c in candidates]
-            )
-            candidates = [c for c, k in zip(candidates, keep) if k]
-
-        cap = params.POI_PARAMS.get("max_per_category", 600)
-        by_category: dict = {}
-        for cand in candidates:
-            by_category.setdefault(cand[2], []).append(cand)
-
-        # Cap per category with a fixed seed (not the simulation seed) so the POI
-        # set is identical across treatments/seeds — keeping the network mutation
-        # idempotent and matched comparisons clean.
-        cap_rng = random.Random(20240608)
-        selected = []
-        for rows in by_category.values():
-            if cap and len(rows) > cap:
-                rows = cap_rng.sample(rows, cap)
-            selected.extend(rows)
+        selected = select_catalog_rows(self.road_network, rows)
 
         # Insert each POI as a mid-block graph node (at the projection of its real
         # coordinate onto the nearest street) so routing is granular within a
         # block. The POI keeps its EXACT (lat, lon) from the dataset as its
         # location — routing snaps that coordinate to its own inserted node, and
         # the map shows it at the true building position.
+        #
+        # On a warmed metro these nodes are already in the pickled graph, so this
+        # call is a no-op lookup (add_pois_as_nodes is idempotent per place id)
+        # and the routing matrices stay valid. It still does real work for
+        # unwarmed / legacy networks.
         self.road_network.add_pois_as_nodes(
             [(place_id, lat, lon) for (place_id, _n, _c, lat, lon) in selected]
         )

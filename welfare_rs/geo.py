@@ -47,6 +47,63 @@ DEFAULT_CACHE_DIR = os.environ.get(
 )
 
 
+def fastest_path_meters(tlen_keys, tlen_vals, seconds, preds):
+    """Metres along the fastest path from a Dijkstra source to **every** node.
+
+    Vectorised replacement for walking each target's predecessor chain
+    separately. Two observations make it work:
+
+    * ``preds`` is a tree rooted at the source, so every node's path length is
+      its parent's plus one edge. The per-target walks re-summed the same trunk
+      edges thousands of times over.
+    * Those chain sums can be built by path doubling: after ``i`` rounds each
+      node holds the sum over the ``2**i`` edges above it and points ``2**i``
+      steps further up. ``ceil(log2(depth))`` vectorised rounds replace one
+      Python walk per target.
+
+    ``tlen_keys`` / ``tlen_vals`` encode the time-weighted graph's edges as a
+    sorted ``row_u * n + row_v -> metres`` index (see
+    :meth:`RoadNetwork._ensure_time_edge_index`).
+
+    Values for unreachable nodes are meaningless — their ``seconds`` is inf — so
+    callers must mask on ``np.isfinite(seconds)``, exactly as the per-target
+    walk skipped them. Summation order differs from the walk, so results agree
+    to floating-point round-off (measured at ~1e-15 relative) rather than
+    bit-for-bit; see ``scripts/verify_retrace.py``.
+
+    Module-level rather than a method so the matrix precompute can call it with
+    a bare CSR kernel, without materialising a whole :class:`RoadNetwork`.
+    """
+    n = int(seconds.shape[0])
+    parent = np.asarray(preds, dtype=np.int64)
+    has_parent = parent >= 0
+
+    # Length of the edge (parent[r] -> r) for every node that has a parent.
+    edge_w = np.zeros(n, dtype=np.float64)
+    if has_parent.any() and tlen_keys.size:
+        child = np.nonzero(has_parent)[0]
+        query = parent[child] * n + child
+        idx = np.searchsorted(tlen_keys, query)
+        np.clip(idx, 0, tlen_keys.size - 1, out=idx)
+        found = tlen_keys[idx] == query
+        edge_w[child] = np.where(found, tlen_vals[idx], 0.0)
+
+    # Path doubling. Each round: add the ancestor's partial sum, then jump twice
+    # as far up. A node that has reached the root stops accumulating. log2(n)
+    # rounds always suffice for a tree of n nodes; the bound only guarantees
+    # termination were ``preds`` ever malformed.
+    total = edge_w.copy()
+    anc = np.where(has_parent, parent, -1)
+    for _ in range(int(n).bit_length() + 1):
+        active = anc >= 0
+        if not active.any():
+            break
+        safe = np.where(active, anc, 0)
+        total = total + np.where(active, total[safe], 0.0)
+        anc = np.where(active, anc[safe], -1)
+    return total
+
+
 class RoadNetwork:
     """A cached OSM street network with snapping and routing helpers.
 
@@ -140,6 +197,28 @@ class RoadNetwork:
         self._csr_nodes = None     # np.ndarray: CSR row -> node id
         self._csr_t = None
         self._time_edge_len: Optional[Dict[Tuple[int, int], float]] = None
+        # Vectorised form of _time_edge_len: edges encoded as
+        # ``row_u * n + row_v`` in a sorted int64 array, with lengths alongside.
+        # Lets the fastest-path km accumulation look up every predecessor edge
+        # in one searchsorted instead of a per-target Python walk.
+        self._tlen_keys = None
+        self._tlen_vals = None
+
+        # Precomputed routing matrices (welfare_rs.routing_matrix), attached
+        # after load when the metro has been warmed. None => lazy Dijkstra only.
+        self._mat_nodes = None      # sorted int64 node ids (the endpoint universe)
+        self._mat_dist_m = None     # (U, U) float64 memmap: shortest-path metres
+        self._mat_car_sec = None    # (U, U) float64 memmap: fastest-path seconds
+        self._mat_car_m = None      # (U, U) float64 memmap: metres along the fastest path
+        # Materialised matrix rows, keyed by (table tag, row). The planner scores
+        # many destinations from one origin, so pulling the whole row on first
+        # touch turns dozens of random page faults into one sequential read —
+        # which matters because the cache lives on spinning disk until the page
+        # cache has it. Bounded in _matrix_lookup; never pickled.
+        self._mat_rows: Dict[Tuple[str, int], object] = {}
+        # Dijkstra predecessor arrays keyed by CSR source row, for reconstructing
+        # route polylines. One entry serves every destination from that origin.
+        self._pred_cache: Dict[int, object] = {}
 
         # Original road (intersection) nodes — homes/work/organic locations sample
         # only these. POIs may be inserted as extra mid-block nodes (see
@@ -179,11 +258,35 @@ class RoadNetwork:
         are fetched per worker rather than baked into the graph cache."""
         state = self.__dict__.copy()
         for k in ("_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes",
-                  "_csr_t", "_time_edge_len",
+                  "_csr_t", "_time_edge_len", "_tlen_keys", "_tlen_vals",
+                  "_mat_nodes", "_mat_dist_m", "_mat_car_sec", "_mat_car_m",
                   "_commutes", "_commute_cum"):
             state[k] = None
+        state["_mat_rows"] = {}
+        state["_pred_cache"] = {}
         state["_commute_total"] = 0.0
         return state
+
+    # Attributes added after warm pickles were first written. Restoring them
+    # explicitly means an older cache still loads instead of raising
+    # AttributeError deep inside a routing call.
+    _LAZY_DEFAULTS = (
+        "_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes", "_csr_t",
+        "_time_edge_len", "_tlen_keys", "_tlen_vals",
+        "_mat_nodes", "_mat_dist_m", "_mat_car_sec", "_mat_car_m",
+        "_commutes", "_commute_cum",
+    )
+
+    def __setstate__(self, state: dict) -> None:
+        for key in self._LAZY_DEFAULTS:
+            state.setdefault(key, None)
+        state.setdefault("_commute_total", 0.0)
+        state.setdefault("_mat_rows", {})
+        if state.get("_mat_rows") is None:  # pickled before the row cache existed
+            state["_mat_rows"] = {}
+        if state.get("_pred_cache") is None:
+            state["_pred_cache"] = {}
+        self.__dict__.update(state)
 
     # ── construction ─────────────────────────────────────────────────────────
 
@@ -296,16 +399,24 @@ class RoadNetwork:
             return 0.0
         key = (orig, dest)
         dist = self._dist_cache.get(key)
-        if dist is None:
+        if dist is not None:
+            return dist
+
+        meters = self._matrix_lookup(self._mat_dist_m, orig, dest, "d")
+        if meters is None:
+            # Outside the precomputed universe (or no matrix): fall back to the
+            # lazy per-source tree, registering the destination as a target.
             if dest not in self._route_targets:
                 self._route_targets.add(dest)
                 self._targets_version += 1
             meters = self._single_source(orig).get(dest)
-            if meters is None:  # unreachable (shouldn't happen on the routable core)
-                dist = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
-            else:
-                dist = meters / 1000.0
-            self._dist_cache[key] = dist
+
+        if meters is None or not np.isfinite(meters):
+            # Unreachable (shouldn't happen on the routable core).
+            dist = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
+        else:
+            dist = meters / 1000.0
+        self._dist_cache[key] = dist
         return dist
 
     def route_length_km_latlon(self, a: LatLon, b: LatLon) -> float:
@@ -376,11 +487,72 @@ class RoadNetwork:
         added = False
         for lat, lon in latlons:
             node = self.nearest_node(lat, lon)
-            if node not in self._route_targets:
-                self._route_targets.add(node)
-                added = True
+            if node in self._route_targets:
+                continue
+            # Nodes the precomputed matrix already covers need no target entry —
+            # and skipping them is what stops one run's agent population from
+            # bumping _targets_version and invalidating every other run's cache.
+            if self._matrix_index(node) >= 0:
+                continue
+            self._route_targets.add(node)
+            added = True
         if added:
             self._targets_version += 1
+
+    # ── precomputed matrix lookups ───────────────────────────────────────────
+
+    def _matrix_index(self, node: int) -> int:
+        """Row/column of ``node`` in the precomputed matrices, or -1."""
+        nodes = self._mat_nodes
+        if nodes is None:
+            return -1
+        i = int(np.searchsorted(nodes, node))
+        if i < nodes.size and int(nodes[i]) == int(node):
+            return i
+        return -1
+
+    def _matrix_lookup(self, table, orig: int, dest: int,
+                       tag: str = "") -> Optional[float]:
+        """One cell of a precomputed table, or None when it cannot serve the pair.
+
+        None means "ask the lazy path" — either no matrix is attached or one of
+        the endpoints is outside the universe. An unreachable pair is *not* None:
+        it is a stored ``inf``, which the caller turns into the same haversine
+        fallback the lazy path uses.
+
+        The source row is materialised on first touch and reused, because that is
+        how the model asks: one origin against many candidate destinations.
+        """
+        if table is None:
+            return None
+        i = self._matrix_index(orig)
+        if i < 0:
+            return None
+        j = self._matrix_index(dest)
+        if j < 0:
+            return None
+
+        key = (tag, i)
+        row = self._mat_rows.get(key)
+        if row is None:
+            row = np.array(table[i, :])
+            # Bound the cache by bytes, not entries, so a big metro does not use
+            # proportionally more memory. Cleared wholesale rather than evicted
+            # one at a time: a run's working set moves together, and this keeps
+            # the hot path free of bookkeeping.
+            if len(self._mat_rows) >= self._mat_row_cap():
+                self._mat_rows.clear()
+            self._mat_rows[key] = row
+        return float(row[j])
+
+    def _mat_row_cap(self) -> int:
+        """Rows to keep cached — roughly 400 MB per table."""
+        u = self._mat_nodes.size if self._mat_nodes is not None else 1
+        return max(256, int(400_000_000 / max(u * 8, 1)))
+
+    @property
+    def has_routing_matrix(self) -> bool:
+        return self._mat_dist_m is not None
 
     def _single_source(self, src: int) -> Dict[int, float]:
         """Shortest-path lengths (metres) from ``src`` to every *registered
@@ -407,13 +579,38 @@ class RoadNetwork:
         self._ss_cache[src] = (self._targets_version, lengths)
         return lengths
 
+    def _ensure_time_edge_index(self) -> None:
+        """Build (once) the sorted ``row_u * n + row_v -> metres`` index over the
+        time-weighted graph's edges, so predecessor edges can be resolved for
+        every node in a single vectorised lookup."""
+        if self._tlen_keys is not None:
+            return
+        self._ensure_csr()
+        if self._time_edge_len is None:
+            self._tlen_keys = np.empty(0, dtype=np.int64)
+            self._tlen_vals = np.empty(0, dtype=np.float64)
+            return
+        n = len(self._csr_nodes)
+        items = self._time_edge_len
+        keys = np.fromiter((u * n + v for (u, v) in items),
+                           dtype=np.int64, count=len(items))
+        vals = np.fromiter(items.values(), dtype=np.float64, count=len(items))
+        order = np.argsort(keys, kind="stable")
+        self._tlen_keys = keys[order]
+        self._tlen_vals = vals[order]
+
+    def fastest_path_meters(self, src_row: int, seconds, preds):
+        """Metres along the fastest path from ``src_row`` to **every** node."""
+        self._ensure_time_edge_index()
+        return fastest_path_meters(self._tlen_keys, self._tlen_vals, seconds, preds)
+
     def _single_source_time(self, src: int) -> Optional[Dict[int, Tuple[float, float]]]:
         """Fastest-path ``(minutes, km)`` from ``src`` to every registered
         target, cached per source (None when edges carry no travel_time).
 
-        One time-weighted Dijkstra with predecessors; km is accumulated by
-        walking each target's predecessor chain, so it is the length of the
-        *driven* (fastest) path — a freeway detour counts its real km."""
+        One time-weighted Dijkstra with predecessors; km is the length of the
+        *driven* (fastest) path — a freeway detour counts its real km — recovered
+        for all nodes at once by :meth:`fastest_path_meters`."""
         entry = self._ss_time_cache.get(src)
         if entry is not None and entry[0] == self._targets_version:
             return entry[1]
@@ -426,22 +623,13 @@ class RoadNetwork:
         seconds, preds = dijkstra(
             self._csr_t, directed=True, indices=src_row, return_predecessors=True
         )
+        meters = self.fastest_path_meters(src_row, seconds, preds)
         out: Dict[int, Tuple[float, float]] = {src: (0.0, 0.0)}
-        edge_len = self._time_edge_len
         for target in self._route_targets:
             row = self._csr_row.get(target)
             if row is None or not np.isfinite(seconds[row]):
                 continue
-            meters, r = 0.0, row
-            while r != src_row:
-                p = int(preds[r])
-                if p < 0:
-                    meters = -1.0
-                    break
-                meters += edge_len[(p, r)]
-                r = p
-            if meters >= 0.0:
-                out[int(target)] = (float(seconds[row]) / 60.0, meters / 1000.0)
+            out[int(target)] = (float(seconds[row]) / 60.0, float(meters[row]) / 1000.0)
         self._ss_time_cache[src] = (self._targets_version, out)
         return out
 
@@ -458,20 +646,100 @@ class RoadNetwork:
         key = (orig, dest)
         cached = self._car_cache.get(key)
         if cached is None:
-            if dest not in self._route_targets:
-                self._route_targets.add(dest)
-                self._targets_version += 1
-            times = self._single_source_time(orig)
-            if times is None:
-                return None
-            cached = times.get(dest)
-            if cached is None:  # unreachable (shouldn't happen on the SCC core)
-                km = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
-                cached = (None, km)
+            seconds = self._matrix_lookup(self._mat_car_sec, orig, dest, "s")
+            if seconds is not None:
+                meters = self._matrix_lookup(self._mat_car_m, orig, dest, "m")
+                if np.isfinite(seconds) and meters is not None and np.isfinite(meters):
+                    cached = (seconds / 60.0, meters / 1000.0)
+                else:  # unreachable (shouldn't happen on the SCC core)
+                    cached = (None, haversine_km(self.node_latlon(orig),
+                                                 self.node_latlon(dest)))
+            else:
+                if dest not in self._route_targets:
+                    self._route_targets.add(dest)
+                    self._targets_version += 1
+                times = self._single_source_time(orig)
+                if times is None:  # graph carries no travel_time at all
+                    return None
+                cached = times.get(dest)
+                if cached is None:  # unreachable
+                    km = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
+                    cached = (None, km)
             self._car_cache[key] = cached
         if cached[0] is None:
             return None
         return cached
+
+    def _route_weight(self) -> str:
+        """The metric the model routes by: fastest path when edge times exist
+        (how car km/time are measured), shortest otherwise."""
+        return "travel_time" if getattr(self, "_has_edge_times", False) else "length"
+
+    def _route_nodes(self, orig: int, dest: int) -> Optional[List[int]]:
+        """Node sequence of the routed path, or None when unreachable.
+
+        Uses the same scipy CSR the distance queries use, rather than
+        ``osmnx.routing.shortest_path`` (networkx), which was ~411 ms per route
+        on a metro graph against ~15 ms for one scipy single-source pass. The
+        predecessor array is cached per origin, so every further destination
+        from the same origin costs only a pointer walk — which is exactly how
+        the day-planner asks.
+
+        A second benefit is consistency: the precomputed ``car_m`` table measures
+        km along *this* predecessor tree's path, so the polyline now depicts the
+        route whose distance the model actually charged. osmnx could previously
+        return a different equal-cost path.
+        """
+        self._ensure_csr()
+        csr = self._csr_t if self._csr_t is not None else self._csr
+        src_row = self._csr_row.get(orig)
+        dst_row = self._csr_row.get(dest)
+        if src_row is None or dst_row is None:
+            return None
+
+        preds = self._pred_cache.get(src_row)
+        if preds is None:
+            from scipy.sparse.csgraph import dijkstra
+
+            _dist, preds = dijkstra(csr, directed=True, indices=src_row,
+                                    return_predecessors=True)
+            # Bounded like the matrix row cache: an array per origin is n*4
+            # bytes, so a few hundred is tens of MB.
+            if len(self._pred_cache) >= 512:
+                self._pred_cache.clear()
+            self._pred_cache[src_row] = preds
+
+        rows = [dst_row]
+        r = dst_row
+        while r != src_row:
+            p = int(preds[r])
+            if p < 0:
+                return None  # unreachable
+            rows.append(p)
+            r = p
+        rows.reverse()
+        nodes = self._csr_nodes
+        return [int(nodes[i]) for i in rows]
+
+    def _edge_points(self, u: int, v: int, weight: str) -> List[LatLon]:
+        """Coordinates along the (u, v) edge the router would take.
+
+        Picks the minimum-weight parallel edge — the same one ``_ensure_csr``
+        collapsed into the CSR — and orients its geometry u -> v, since OSM ways
+        are not always digitised in the direction of travel.
+        """
+        data = min(self.G[u][v].values(), key=lambda d: float(d.get(weight, 1.0)))
+        geom = data.get("geometry")
+        if geom is None:
+            return [self.node_latlon(u), self.node_latlon(v)]
+        coords = [(round(y, 6), round(x, 6)) for x, y in geom.coords]
+        if len(coords) > 1:
+            u_ll = self.node_latlon(u)
+            head = (coords[0][0] - u_ll[0]) ** 2 + (coords[0][1] - u_ll[1]) ** 2
+            tail = (coords[-1][0] - u_ll[0]) ** 2 + (coords[-1][1] - u_ll[1]) ** 2
+            if tail < head:
+                coords.reverse()
+        return coords
 
     def route_geometry_latlon(self, a: LatLon, b: LatLon) -> List[LatLon]:
         """Return the route polyline as ``[(lat, lon), ...]`` for visualization."""
@@ -482,23 +750,21 @@ class RoadNetwork:
         cached = self._geom_cache.get((orig, dest))
         if cached is not None:
             return cached
-        # Match the metric the model routes by: fastest path when edge times
-        # exist (how car km/time are measured), shortest otherwise.
-        weight = "travel_time" if getattr(self, "_has_edge_times", False) else "length"
-        route = ox.routing.shortest_path(self.G, orig, dest, weight=weight)
+
+        weight = self._route_weight()
+        route = self._route_nodes(orig, dest)
         if not route or len(route) < 2:
             pts = [self.node_latlon(orig), self.node_latlon(dest)]
         else:
-            try:
-                gdf = ox.routing.route_to_gdf(self.G, route, weight=weight)
-                pts = []
-                for geom in gdf["geometry"]:
-                    for x, y in geom.coords:  # shapely stores coordinates as (lon, lat)
-                        latlon = (round(y, 6), round(x, 6))
-                        if not pts or pts[-1] != latlon:
-                            pts.append(latlon)
-            except Exception:
-                pts = [self.node_latlon(n) for n in route]
+            pts = []
+            for u, v in zip(route[:-1], route[1:]):
+                try:
+                    seg = self._edge_points(u, v, weight)
+                except (KeyError, ValueError):
+                    seg = [self.node_latlon(u), self.node_latlon(v)]
+                for latlon in seg:
+                    if not pts or pts[-1] != latlon:
+                        pts.append(latlon)
         pts = pts or [self.node_latlon(orig), self.node_latlon(dest)]
         self._geom_cache[(orig, dest)] = pts
         return pts
@@ -542,6 +808,14 @@ class RoadNetwork:
         self._csr_nodes = None
         self._csr_t = None
         self._time_edge_len = None
+        self._tlen_keys = None
+        self._tlen_vals = None
+        self._pred_cache = {}
+        # Node ids changed, so any precomputed matrix indexed by them is void.
+        self._mat_nodes = None
+        self._mat_dist_m = None
+        self._mat_car_sec = None
+        self._mat_car_m = None
 
     def _split_edge_through(self, a: int, b: int, k, poi_node_ids: List[int]) -> None:
         """Replace directed edge (a,b,k) with a chain a → … → b through the given

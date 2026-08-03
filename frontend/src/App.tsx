@@ -1,31 +1,65 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Controls, { type RunStatus } from "./components/Controls";
 import MapView from "./components/MapView";
 import Results from "./components/Results";
-import { cancelRun, createRun, getCities, getRun, subscribeProgress } from "./api";
-import type { CitiesResponse, RunConfig, RunMeta } from "./types";
+import RunList from "./components/RunList";
+import { cancelRun, createRun, fetchRun, getCities, getRun, subscribeProgress } from "./api";
+import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "./types";
+
+/** Read/write the ?run=<id> query param, so a run survives reload and can be
+ *  opened in another window by pasting the URL. */
+function urlRunId(): string | null {
+  return new URLSearchParams(window.location.search).get("run");
+}
+function setUrlRunId(runId: string | null) {
+  const url = new URL(window.location.href);
+  if (runId) url.searchParams.set("run", runId);
+  else url.searchParams.delete("run");
+  window.history.replaceState(null, "", url.toString());
+}
 
 export default function App() {
   const [cities, setCities] = useState<CitiesResponse | null>(null);
   const [config, setConfigState] = useState<RunConfig | null>(null);
   const [status, setStatus] = useState<RunStatus>("idle");
-  const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
+  const [progress, setProgress] = useState<RunProgress | null>(null);
   const [runMeta, setRunMeta] = useState<RunMeta | null>(null);
   const [committed, setCommitted] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [selectedSeed, setSelectedSeed] = useState<number | null>(null);
+  const [selectedCondition, setSelectedCondition] = useState<string | null>(null);
+  const [runsToken, setRunsToken] = useState(0);   // bump to refresh the run list
   const runningIdRef = useRef<string | null>(null);  // the in-flight study, for Stop
+  // Live SSE stream, if any. Held so switching runs can close the previous one:
+  // two open streams would both write progress/status and fight over the UI.
+  const unsubRef = useRef<(() => void) | null>(null);
+  const bumpRuns = () => setRunsToken((t) => t + 1);
 
-  // When a study finishes, point the map at its first seed.
+  const stopWatching = useCallback(() => {
+    unsubRef.current?.();
+    unsubRef.current = null;
+    runningIdRef.current = null;
+  }, []);
+
+  // Close the stream if the app unmounts mid-run.
+  useEffect(() => () => unsubRef.current?.(), []);
+
+  // When a study finishes, point the map at its first seed and first recommender.
   useEffect(() => {
-    if (runMeta) setSelectedSeed(runMeta.default_seed);
+    if (runMeta) {
+      setSelectedSeed(runMeta.default_seed);
+      setSelectedCondition(runMeta.default_condition);
+    }
   }, [runMeta]);
 
   useEffect(() => {
     getCities()
       .then((c) => {
         setCities(c);
-        setConfigState(c.defaults);
+        // `prev ?? defaults` because a ?run= attach may have already loaded that
+        // run's settings into the form; this fetch resolving later must not
+        // clobber them. Whichever lands first, the adopted run wins.
+        setConfigState((prev) => prev ?? c.defaults);
       })
       .catch((e) => setError(`Could not reach backend: ${e.message}`));
   }, []);
@@ -38,51 +72,134 @@ export default function App() {
     [config, committed]
   );
 
+  // Which condition the map and the headline metrics are showing. Validated
+  // against the current study rather than trusted: on the render between a new
+  // runMeta arriving and the reset effect firing, selectedCondition still holds
+  // the previous study's pick, which may not exist in this one.
+  const condition =
+    selectedCondition && runMeta?.conditions.includes(selectedCondition)
+      ? selectedCondition
+      : runMeta?.default_condition ?? "";
+
+  // Show a finished study: adopt its settings into the form so the sidebar
+  // describes what you are looking at, and name it in the URL. The concrete
+  // seed is dropped — keeping it would make the next Run silently replay this
+  // study instead of drawing a fresh sample.
+  const adoptRun = useCallback((meta: RunMeta) => {
+    const { seed: _seed, ...cfg } = meta.config;
+    const adopted = cfg as RunConfig;
+    setConfigState(adopted);
+    setCommitted(JSON.stringify(adopted));
+    setRunMeta(meta);
+    setStatus("ready");
+    setProgress(null);
+    setUrlRunId(meta.run_id);
+    bumpRuns();
+  }, []);
+
+  // Follow a study to completion. Used both for runs this tab started and for
+  // ones it attached to — Job.subscribe replays the current tick on connect, so
+  // an attaching tab gets a populated progress bar immediately.
+  const watchRun = useCallback(
+    (runId: string) => {
+      stopWatching(); // never leave a previous run's stream open
+      runningIdRef.current = runId;
+      setUrlRunId(runId);
+      unsubRef.current = subscribeProgress(runId, (e) => {
+        if (e.type === "progress") {
+          setProgress({
+            current: e.current,
+            total: e.total,
+            cond_total: e.cond_total,
+            per_condition: e.per_condition,
+            elapsed_sec: e.elapsed_sec,
+            observed_at: Date.now(),
+          });
+        } else if (e.type === "done") {
+          stopWatching();
+          getRun(e.run_id)
+            .then(adoptRun)
+            .catch((err) => {
+              setError(err.message ?? String(err));
+              setStatus("error");
+              setProgress(null);
+            });
+        } else if (e.type === "cancelled") {
+          // Clean stop: reset to a fresh, empty state (no partial viz shown).
+          stopWatching();
+          setStatus("idle");
+          setProgress(null);
+          setRunMeta(null);
+          setUrlRunId(null);
+          bumpRuns();
+        } else if (e.type === "error") {
+          stopWatching();
+          setError(e.message);
+          setStatus("error");
+          setProgress(null);
+          bumpRuns();
+        }
+      });
+    },
+    [adoptRun, stopWatching]
+  );
+
+  // Open a run this tab may not have started: a ?run= link, a reload, or a pick
+  // from the run list.
+  const attachTo = useCallback(
+    async (runId: string) => {
+      setError(null);
+      try {
+        const found = await fetchRun(runId);
+        if (found.state === "ready") {
+          stopWatching(); // leaving a run that was still streaming
+          adoptRun(found.meta);
+        } else if (found.state === "running") {
+          setRunMeta(null);
+          setStatus("running");
+          setProgress({ current: 0, total: 0, elapsed_sec: 0, observed_at: Date.now() });
+          watchRun(runId);
+        } else {
+          stopWatching();
+          setError(`That run can't be opened — ${found.reason}`);
+          setStatus("idle");
+          setRunMeta(null);
+          setUrlRunId(null);
+        }
+      } catch (e: any) {
+        setError(e.message ?? String(e));
+      }
+      bumpRuns();
+    },
+    [adoptRun, watchRun, stopWatching]
+  );
+
+  // On first load, open whatever run the URL names.
+  const bootedRef = useRef(false);
+  useEffect(() => {
+    if (bootedRef.current) return;
+    bootedRef.current = true;
+    const id = urlRunId();
+    if (id) void attachTo(id);
+  }, [attachTo]);
+
   async function onRun() {
     if (!config) return;
     setError(null);
     setStatus("running");
-    setProgress({ current: 0, total: config.num_seeds });
+    // Placeholder until the first real tick; the server owns the true total
+    // (simulated days across the whole seed x condition grid).
+    setProgress({ current: 0, total: 0, elapsed_sec: 0, observed_at: Date.now() });
     try {
       const resp = await createRun(config);
-      const finalize = async (runId: string) => {
-        const meta = await getRun(runId);
-        setRunMeta(meta);
-        setCommitted(JSON.stringify(config));
-        setStatus("ready");
-        setProgress(null);
-      };
+      bumpRuns();
       if (resp.status === "ready") {
-        if (resp.meta) {
-          setRunMeta(resp.meta);
-          setCommitted(JSON.stringify(config));
-          setStatus("ready");
-          setProgress(null);
-        } else {
-          await finalize(resp.run_id);
-        }
+        // Cache hit — identical config already computed.
+        if (resp.meta) adoptRun(resp.meta);
+        else await attachTo(resp.run_id);
         return;
       }
-      runningIdRef.current = resp.run_id;
-      subscribeProgress(resp.run_id, (e) => {
-        if (e.type === "progress") {
-          setProgress({ current: e.current, total: e.total });
-        } else if (e.type === "done") {
-          runningIdRef.current = null;
-          void finalize(e.run_id);
-        } else if (e.type === "cancelled") {
-          // Clean stop: reset to a fresh, empty state (no partial viz shown).
-          runningIdRef.current = null;
-          setStatus("idle");
-          setProgress(null);
-          setRunMeta(null);
-        } else if (e.type === "error") {
-          runningIdRef.current = null;
-          setError(e.message);
-          setStatus("error");
-          setProgress(null);
-        }
-      });
+      watchRun(resp.run_id);
     } catch (e: any) {
       setError(e.message ?? String(e));
       setStatus("error");
@@ -116,7 +233,13 @@ export default function App() {
         runMeta={runMeta}
         error={error}
         dirty={dirty}
-      />
+      >
+        <RunList
+          activeRunId={runMeta?.run_id ?? runningIdRef.current}
+          onOpen={(id) => void attachTo(id)}
+          refreshToken={runsToken}
+        />
+      </Controls>
       <main className="content">
         {status === "idle" && (
           <div className="placeholder">
@@ -128,33 +251,56 @@ export default function App() {
             <section>
               <div className="section-head">
                 <h3>
-                  Activity-travel over the day · {runMeta.city_label} · {runMeta.config.treatment}
+                  Activity-travel over the day · {runMeta.city_label} ·{" "}
+                  {condition}
                 </h3>
-                {runMeta.seeds.length > 1 && (
-                  <label className="seed-picker">
-                    Seed
-                    <select
-                      value={selectedSeed ?? runMeta.default_seed}
-                      onChange={(e) => setSelectedSeed(parseInt(e.target.value, 10))}
-                    >
-                      {runMeta.seeds.map((s, i) => (
-                        <option key={s} value={s}>
-                          {s}
-                          {i === 0 ? " (base)" : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
+                <div className="viz-pickers">
+                  {runMeta.conditions.length > 1 && (
+                    <label className="seed-picker">
+                      Showing
+                      <select
+                        value={condition}
+                        onChange={(e) => setSelectedCondition(e.target.value)}
+                      >
+                        {runMeta.conditions.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                            {c === "No RS" ? " (control)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {runMeta.seeds.length > 1 && (
+                    <label className="seed-picker">
+                      Seed
+                      <select
+                        value={selectedSeed ?? runMeta.default_seed}
+                        onChange={(e) => setSelectedSeed(parseInt(e.target.value, 10))}
+                      >
+                        {runMeta.seeds.map((s, i) => (
+                          <option key={s} value={s}>
+                            {s}
+                            {i === 0 ? " (base)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </div>
               </div>
-              <MapView run={runMeta} seed={selectedSeed ?? runMeta.default_seed} />
+              <MapView
+                run={runMeta}
+                seed={selectedSeed ?? runMeta.default_seed}
+                condition={condition}
+              />
               <p className="legend">
                 <b>Dots = agents:</b> <Dot c="#e65038" /> in transit · <Dot c="#50aa5a" /> home ·{" "}
                 <Dot c="#f0961e" /> work · <Dot c="#a05ad2" /> leisure · <Dot c="#6e6e78" /> POIs ·{" "}
                 hover a dot for details, <b>click an in-transit dot</b> to trace its street route.
               </p>
             </section>
-            <Results run={runMeta} />
+            <Results run={runMeta} condition={condition} />
           </>
         )}
       </main>

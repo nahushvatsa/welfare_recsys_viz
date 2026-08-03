@@ -1,5 +1,5 @@
-import { useState } from "react";
-import type { CitiesResponse, RunConfig, RunMeta } from "../types";
+import { useEffect, useState } from "react";
+import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "../types";
 
 export type RunStatus = "idle" | "running" | "ready" | "error";
 
@@ -10,10 +10,12 @@ interface ControlsProps {
   onRun: () => void;
   onStop: () => void;
   status: RunStatus;
-  progress: { current: number; total: number } | null;
+  progress: RunProgress | null;
   runMeta: RunMeta | null;
   error: string | null;
   dirty: boolean;
+  /** Rendered at the foot of the sidebar (the run list). */
+  children?: React.ReactNode;
 }
 
 export default function Controls({
@@ -27,10 +29,25 @@ export default function Controls({
   runMeta,
   error,
   dirty,
+  children,
 }: ControlsProps) {
-  const showPup = config.treatment === "PUP" || config.treatment === "PUP+RM";
-  const showRm = config.treatment === "RM" || config.treatment === "PUP+RM";
+  // "No RS" is the control: always run, never a choice, so it is pinned rather
+  // than listed. Everything else is togglable.
+  const recommenders = cities.treatments.filter((t) => t !== "No RS");
+  const selected = config.conditions ?? [];
+  const showPup = selected.some((t) => t === "PUP" || t === "PUP+RM");
+  const showRm = selected.some((t) => t === "RM" || t === "PUP+RM");
   const running = status === "running";
+
+  function toggleCondition(name: string, on: boolean) {
+    const next = new Set(selected);
+    if (on) next.add(name);
+    else next.delete(name);
+    // Emit in the server's canonical order, so ticking A-then-B produces the
+    // same array as B-then-A. Otherwise the parent's JSON.stringify dirty check
+    // would report a change when nothing actually changed.
+    setConfig({ conditions: recommenders.filter((t) => next.has(t)) });
+  }
 
   // Numeric fields are edited as raw text so they can be fully erased/retyped
   // (a controlled number coerced empty -> 1, causing "type 5, get 15"). The
@@ -43,6 +60,11 @@ export default function Controls({
   const days = validateInt(daysText, 1, 60);
   const seeds = validateInt(seedsText, 1, 12);
   const inputError = agents.error ?? days.error ?? seeds.error;
+
+  // Study size, for the cost hint below. Falls back to the committed seed count
+  // so the number doesn't blank out while the field is mid-edit.
+  const nSeeds = seeds.value ?? config.num_seeds;
+  const nConditions = selected.length + 1; // + the No-RS control
 
   const poisAvailable = cities.pois_available[config.city] ?? false;
 
@@ -120,20 +142,6 @@ export default function Controls({
         />
         {seeds.error && <span className="field-error">{seeds.error}</span>}
       </label>
-      <label>
-        Recommender
-        <select
-          value={config.treatment}
-          onChange={(e) => setConfig({ treatment: e.target.value })}
-        >
-          {cities.treatments.map((t) => (
-            <option key={t} value={t}>
-              {t}
-            </option>
-          ))}
-        </select>
-      </label>
-
       <label className="toggle">
         <input
           type="checkbox"
@@ -151,6 +159,35 @@ export default function Controls({
         />
         Real POIs {poisAvailable ? "" : "(no dataset for this city — synthetic)"}
       </label>
+
+      <h2>Recommenders</h2>
+      <p className="muted">
+        Pick any number. Each one runs as its own simulation, in parallel,
+        against the same No-RS control — then you can compare their metrics and
+        switch the map between them.
+      </p>
+      <label
+        className="toggle"
+        title="The baseline every comparison is paired against. Always run."
+      >
+        <input type="checkbox" checked disabled readOnly />
+        No RS <span className="muted">(control)</span>
+      </label>
+      {recommenders.map((t) => (
+        <label className="toggle" key={t}>
+          <input
+            type="checkbox"
+            checked={selected.includes(t)}
+            onChange={(e) => toggleCondition(t, e.target.checked)}
+          />
+          {t}
+        </label>
+      ))}
+      <p className="run-cost">
+        {nConditions} condition{nConditions === 1 ? "" : "s"} × {nSeeds} seed
+        {nSeeds === 1 ? "" : "s"} = <b>{nConditions * nSeeds} simulations</b>
+        {nConditions * nSeeds > 1 ? ", run in parallel" : ""}
+      </p>
       {showPup && (
         <label>
           PUP α (min P[U≥0]): {config.pup_alpha.toFixed(2)}
@@ -194,16 +231,47 @@ export default function Controls({
       )}
 
       {running && progress && (
-        <div className="progress">
-          <div
-            className="progress-bar"
-            style={{ width: `${progress.total ? (progress.current / progress.total) * 100 : 5}%` }}
-          />
-          <span className="progress-text">
-            {progress.current === 0
-              ? "Preparing study (building network)…"
-              : `Completed ${progress.current} of ${progress.total} seed${progress.total > 1 ? "s" : ""}…`}
-          </span>
+        <div className="progress-panel">
+          <div className="progress">
+            <div
+              className="progress-bar"
+              style={{ width: `${progress.total ? (progress.current / progress.total) * 100 : 5}%` }}
+            />
+          </div>
+          <p className="progress-text">
+            <span>
+              {progress.current === 0
+                ? "Preparing study (loading network)…"
+                : `${progress.current} of ${progress.total} simulated days`}
+            </span>
+            <span className="elapsed">
+              <LiveTimer
+                baseSec={progress.elapsed_sec ?? 0}
+                observedAt={progress.observed_at ?? Date.now()}
+              />
+            </span>
+          </p>
+          {/* Every condition runs at the same time, on its own cores. One row
+              each, so you can watch them advance together — an overall figure
+              alone reads as if the study were sequential. */}
+          {progress.per_condition && progress.cond_total ? (
+            <ul className="cond-progress">
+              {Object.entries(progress.per_condition).map(([name, done]) => (
+                <li key={name}>
+                  <span className="cond-name">{name}</span>
+                  <span className="cond-track">
+                    <span
+                      className="cond-fill"
+                      style={{ width: `${(done / progress.cond_total!) * 100}%` }}
+                    />
+                  </span>
+                  <span className="cond-count">
+                    {done}/{progress.cond_total}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </div>
       )}
 
@@ -214,14 +282,49 @@ export default function Controls({
 
       {runMeta && status === "ready" && (
         <div className="captions">
+          {runMeta.duration_sec != null && (
+            <p className="took">
+              ⏱ Ran in <b>{fmtDuration(runMeta.duration_sec)}</b>
+            </p>
+          )}
           <p>Network: {runMeta.num_intersections.toLocaleString()} road intersections</p>
           <p>
             POIs: {runMeta.poi_count.toLocaleString()} ({runMeta.poi_source})
           </p>
         </div>
       )}
+
+      {children}
     </aside>
   );
+}
+
+/** "2m 14s" / "1h 03m 20s" — compact, no leading zero units. */
+export function fmtDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m ${String(r).padStart(2, "0")}s`;
+  if (m) return `${m}m ${String(r).padStart(2, "0")}s`;
+  return `${r}s`;
+}
+
+/**
+ * Ticking elapsed time for a study in flight.
+ *
+ * Anchored on the server's `elapsed_sec` and advanced with the local clock's
+ * *delta* since that value arrived — never with absolute local time, which may
+ * disagree with the server's by minutes and would show a nonsense duration on
+ * an attached run.
+ */
+function LiveTimer({ baseSec, observedAt }: { baseSec: number; observedAt: number }) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => tick((n) => n + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  return <>{fmtDuration(baseSec + (Date.now() - observedAt) / 1000)}</>;
 }
 
 function validateInt(

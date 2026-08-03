@@ -20,6 +20,7 @@ const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json
 interface MapViewProps {
   run: RunMeta;
   seed: number;
+  condition: string;
 }
 
 interface Marker {
@@ -36,8 +37,18 @@ interface Want {
   key: string;
 }
 
-function keyOf(day: number, bbox: BBox | undefined, seed: number): string {
-  return `${seed}|${day}|${bbox ? bbox.map((n) => n.toFixed(3)).join(",") : ""}`;
+function keyOf(
+  day: number,
+  bbox: BBox | undefined,
+  seed: number,
+  condition: string
+): string {
+  return `${condition}|${seed}|${day}|${bbox ? bbox.map((n) => n.toFixed(3)).join(",") : ""}`;
+}
+
+/** Time span for one (condition, seed), falling back to the study's full length. */
+function spanOf(run: RunMeta, condition: string, seed: number): number {
+  return run.time_spans?.[condition]?.[String(seed)] ?? run.num_days * DAY;
 }
 
 // Piecewise-linear position along a downsampled trip at minute t -> [lon, lat].
@@ -63,7 +74,7 @@ function fmtClock(t: number): string {
   return `Day ${day} · ${hh}:${mm}`;
 }
 
-export default function MapView({ run, seed }: MapViewProps) {
+export default function MapView({ run, seed, condition }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlayRef = useRef<MapboxOverlay | null>(null);
@@ -86,12 +97,13 @@ export default function MapView({ run, seed }: MapViewProps) {
   const wantRef = useRef<Want>({ day: 0, bbox: undefined, key: "" });
   const loadedKeyRef = useRef<string>("");
 
-  // Which seed's trips are being shown, and that seed's time span. Held in refs so
+  // Which (condition, seed) is being shown, and its time span. Held in refs so
   // the rAF loop and pump (defined once per map init) always read the live value,
-  // and a separate [seed] effect can swap data without re-creating the map.
+  // and a separate effect can swap data without re-creating the map.
   const seedRef = useRef(seed);
-  const shownSeedRef = useRef(seed); // last seed the [seed] effect acted on
-  const timeSpanRef = useRef(run.time_spans?.[String(seed)] ?? run.num_days * DAY);
+  const conditionRef = useRef(condition);
+  const shownRef = useRef(`${condition}|${seed}`); // last pair the swap effect acted on
+  const timeSpanRef = useRef(spanOf(run, condition, seed));
   const pumpRef = useRef<(() => void) | null>(null);
 
   const clockRef = useRef<HTMLSpanElement | null>(null);
@@ -103,7 +115,7 @@ export default function MapView({ run, seed }: MapViewProps) {
   const [inspected, setInspected] = useState<string | null>(null);
 
   const runId = run.run_id;
-  const timeSpan = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
+  const timeSpan = spanOf(run, condition, seed);
 
   function currentBBox(): BBox | undefined {
     const map = mapRef.current;
@@ -214,8 +226,9 @@ export default function MapView({ run, seed }: MapViewProps) {
     loadedKeyRef.current = "";
     wantRef.current = { day: 0, bbox: undefined, key: "" };
     seedRef.current = seed;
-    shownSeedRef.current = seed;
-    timeSpanRef.current = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
+    conditionRef.current = condition;
+    shownRef.current = `${condition}|${seed}`;
+    timeSpanRef.current = spanOf(run, condition, seed);
 
     // Open framed on the principal city (where POIs and leisure live); the
     // full metro — suburban homes, commutes — is one zoom-out away.
@@ -261,11 +274,13 @@ export default function MapView({ run, seed }: MapViewProps) {
       loadingRef.current = true;
       setLoading(true);
       const sd = seedRef.current;
+      const cond = conditionRef.current;
       const t0 = want.day * DAY;
       const t1 = Math.min(timeSpanRef.current, t0 + DAY);
       try {
         const [timeline, pois] = await Promise.all([
-          getTimeline(runId, t0, t1, want.bbox, sd),
+          getTimeline(runId, t0, t1, want.bbox, sd, cond),
+          // POIs are condition-independent — keyed by seed only.
           getPois(runId, want.bbox, sd),
         ]);
         const tba = new Map<number, Trip[]>();
@@ -308,7 +323,11 @@ export default function MapView({ run, seed }: MapViewProps) {
       // Want the day-window for the current clock position; pump reconciles.
       const dayIndex = Math.floor(t / DAY);
       if (dayIndex !== wantRef.current.day) {
-        wantRef.current = { ...wantRef.current, day: dayIndex, key: keyOf(dayIndex, wantRef.current.bbox, seedRef.current) };
+        wantRef.current = {
+          ...wantRef.current,
+          day: dayIndex,
+          key: keyOf(dayIndex, wantRef.current.bbox, seedRef.current, conditionRef.current),
+        };
       }
       void pump();
       overlay.setProps({ layers: buildLayers(t) });
@@ -327,7 +346,7 @@ export default function MapView({ run, seed }: MapViewProps) {
     const onLoad = () => {
       map.addControl(overlay as unknown as maplibregl.IControl);
       const bbox = currentBBox();
-      wantRef.current = { day: 0, bbox, key: keyOf(0, bbox, seedRef.current) };
+      wantRef.current = { day: 0, bbox, key: keyOf(0, bbox, seedRef.current, conditionRef.current) };
       void pump();
       frame = requestAnimationFrame(loop);
     };
@@ -339,7 +358,11 @@ export default function MapView({ run, seed }: MapViewProps) {
       window.clearTimeout(moveTimer);
       moveTimer = window.setTimeout(() => {
         const bbox = currentBBox();
-        wantRef.current = { ...wantRef.current, bbox, key: keyOf(wantRef.current.day, bbox, seedRef.current) };
+        wantRef.current = {
+          ...wantRef.current,
+          bbox,
+          key: keyOf(wantRef.current.day, bbox, seedRef.current, conditionRef.current),
+        };
         void pump();
       }, 250);
     };
@@ -349,7 +372,7 @@ export default function MapView({ run, seed }: MapViewProps) {
     overlay.setProps({
       onClick: ({ object }: any) => {
         if (object && object.tripId) {
-          void getTripGeometry(runId, object.tripId, seedRef.current).then((g) => {
+          void getTripGeometry(runId, object.tripId, seedRef.current, conditionRef.current).then((g) => {
             selectedTripRef.current = g;
             setInspected(object.tripId);
           });
@@ -370,14 +393,20 @@ export default function MapView({ run, seed }: MapViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
 
-  // ── Seed switch (swap data only; the map itself stays put) ───────────────────
+  // ── Condition / seed switch (swap data only; the map itself stays put) ───────
+  //
+  // Deliberately NOT part of the map-init effect above, which is keyed on runId
+  // alone: rebuilding the map here would refit the viewport and throw away the
+  // user's pan/zoom every time they compared two recommenders.
   useEffect(() => {
-    if (shownSeedRef.current === seed) return; // initial render handled by map init
-    shownSeedRef.current = seed;
+    const pair = `${condition}|${seed}`;
+    if (shownRef.current === pair) return; // initial render handled by map init
+    shownRef.current = pair;
     seedRef.current = seed;
-    timeSpanRef.current = run.time_spans?.[String(seed)] ?? run.num_days * DAY;
-    // Drop the old seed's geometry so its dots/paths clear immediately, then force
-    // the single-flight pump to refetch this seed's window.
+    conditionRef.current = condition;
+    timeSpanRef.current = spanOf(run, condition, seed);
+    // Drop the old run's geometry so its dots/paths clear immediately, then force
+    // the single-flight pump to refetch this (condition, seed) window.
     tripsByAgent.current = new Map();
     staysByAgent.current = new Map();
     selectedTripRef.current = null;
@@ -386,11 +415,11 @@ export default function MapView({ run, seed }: MapViewProps) {
     loadedKeyRef.current = "";
     wantRef.current = {
       ...wantRef.current,
-      key: keyOf(wantRef.current.day, wantRef.current.bbox, seed),
+      key: keyOf(wantRef.current.day, wantRef.current.bbox, seed, condition),
     };
     pumpRef.current?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [seed]);
+  }, [seed, condition]);
 
   // ── Controls ───────────────────────────────────────────────────────────────
   function togglePlay() {

@@ -4,15 +4,19 @@ Endpoints (all under ``/api``) let the browser stream only what it needs:
 
 * ``GET  /api/cities``                         — areas, treatments, defaults
 * ``POST /api/runs``                           — start (or hit cached) run
+* ``GET  /api/runs``                           — list all known runs (no geometry)
 * ``GET  /api/runs/{id}``                      — run summary + view/bounds
 * ``GET  /api/runs/{id}/events``               — SSE per-day progress
-* ``GET  /api/runs/{id}/timeline?seed&t0&t1&bbox``  — windowed trip/stay keyframes
-* ``GET  /api/runs/{id}/positions?seed&t&bbox``     — exact-instant positions
-* ``GET  /api/runs/{id}/trips/{trip_id}/geometry?seed`` — full route (on demand)
+* ``GET  /api/runs/{id}/timeline?condition&seed&t0&t1&bbox`` — windowed keyframes
+* ``GET  /api/runs/{id}/positions?condition&seed&t&bbox``    — exact-instant positions
+* ``GET  /api/runs/{id}/trips/{trip_id}/geometry?condition&seed`` — full route
 * ``GET  /api/runs/{id}/pois?seed&bbox``            — viewport POIs
 
-A "run" is a multi-seed *study*; the geometry endpoints take an optional ``seed``
-to pick which seed's trips the map shows (defaults to the study's first seed).
+A "run" is a *study*: several recommender conditions (always including the No-RS
+control) swept across several seeds. The geometry endpoints take an optional
+``condition`` and ``seed`` to pick which run's trips the map shows; each defaults
+to the study's first recommender and first seed. POIs depend on the seed but not
+on the condition, so ``/pois`` takes only ``seed``.
 
 The built React frontend (``frontend/dist``) is mounted at ``/`` when present.
 
@@ -39,7 +43,8 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import CITIES, TREATMENTS, RunConfig, manager, warmed_cities
+from service import (CITIES, TREATMENTS, RunConfig, manager, precomputed_cities,
+                     warmed_cities)
 
 app = FastAPI(title="welfare-rs", version="0.1.0")
 
@@ -66,6 +71,12 @@ def _parse_bbox(bbox: Optional[str]) -> Optional[_BBOX]:
 
 
 def _require_run(run_id: str):
+    """Resolve a run, or raise a status the client can act on.
+
+    The distinction matters for the run list: a study can legitimately be 'done'
+    and yet no longer be openable, because only the last few results are kept in
+    memory. 410 tells the UI to show it as expired rather than as a broken link.
+    """
     run = manager.get_run(run_id)
     if run is not None:
         return run
@@ -74,6 +85,13 @@ def _require_run(run_id: str):
         raise HTTPException(status_code=202, detail="run still computing")
     if job is not None and job.status == "error":
         raise HTTPException(status_code=500, detail=job.error or "run failed")
+    if job is not None and job.status == "cancelled":
+        raise HTTPException(status_code=410, detail="run was cancelled")
+    if job is not None and job.status == "done":
+        raise HTTPException(
+            status_code=410,
+            detail="this run's results are no longer held in memory (newer runs replaced it)",
+        )
     raise HTTPException(status_code=404, detail="unknown run id")
 
 
@@ -93,7 +111,12 @@ def cities() -> dict:
         # Advisory: every city above can be selected, but an unwarmed one
         # downloads its network on demand instead of loading it from disk.
         "warmed": warmed_cities(),                   # per-city: {key: bool}
-        "defaults": RunRequest().model_dump(),
+        # Per-city: routing matrices precomputed. A warm-but-not-precomputed
+        # metro still runs; it just pays for Dijkstra trees on every run.
+        "precomputed": precomputed_cities(),
+        # `treatment` is excluded: it is a deprecated inbound alias, and seeding
+        # the UI's config object with it would put a dead key in every POST.
+        "defaults": RunRequest().model_dump(exclude={"treatment"}),
     }
 
 
@@ -108,6 +131,13 @@ def create_run(req: RunRequest) -> dict:
         if run is not None:
             body["meta"] = run.meta()
     return body
+
+
+@app.get("/api/runs")
+def list_runs() -> dict:
+    """Every run this process knows about — so a browser that did not start a
+    study (a second tab, a reload, a shared link) can still find and open it."""
+    return {"runs": manager.list_runs()}
 
 
 @app.get("/api/runs/{run_id}")
@@ -154,26 +184,35 @@ def run_events(run_id: str) -> StreamingResponse:
 
 # ── Geometry / positions (the streamed, viewport-culled payloads) ─────────────
 
-def _require_seed_viz(run_id: str, seed: Optional[int]):
+def _require_seed_viz(run_id: str, condition: Optional[str], seed: Optional[int]):
+    """Geometry for one (condition, seed) of a study. Unknown or omitted values
+    fall back to the study's defaults rather than 404ing, so a stale bookmark
+    still renders something."""
     run = _require_run(run_id)
-    sv = run.viz(seed)
+    sv = run.viz(condition, seed)
     if sv is None:
         raise HTTPException(status_code=404, detail="no geometry for this study")
-    return sv
+    return run, sv
+
+
+def _resolved_condition(run, condition: Optional[str]) -> str:
+    return condition if condition in run.per_condition else run.default_condition()
 
 
 @app.get("/api/runs/{run_id}/timeline")
 def timeline(
     run_id: str,
+    condition: Optional[str] = Query(None),
     seed: Optional[int] = Query(None),
     t0: float = Query(0.0),
     t1: Optional[float] = Query(None),
     bbox: Optional[str] = Query(None),
 ) -> dict:
-    sv = _require_seed_viz(run_id, seed)
+    run, sv = _require_seed_viz(run_id, condition, seed)
     hi = sv.time_span if t1 is None else t1
     box = _parse_bbox(bbox)
     return {
+        "condition": _resolved_condition(run, condition),
         "seed": sv.seed,
         "t0": t0,
         "t1": hi,
@@ -185,17 +224,28 @@ def timeline(
 @app.get("/api/runs/{run_id}/positions")
 def positions(
     run_id: str,
+    condition: Optional[str] = Query(None),
     seed: Optional[int] = Query(None),
     t: float = Query(0.0),
     bbox: Optional[str] = Query(None),
 ) -> dict:
-    sv = _require_seed_viz(run_id, seed)
-    return {"seed": sv.seed, "t": t, "positions": viz.positions_at(sv.merged, t, _parse_bbox(bbox))}
+    run, sv = _require_seed_viz(run_id, condition, seed)
+    return {
+        "condition": _resolved_condition(run, condition),
+        "seed": sv.seed,
+        "t": t,
+        "positions": viz.positions_at(sv.merged, t, _parse_bbox(bbox)),
+    }
 
 
 @app.get("/api/runs/{run_id}/trips/{trip_id}/geometry")
-def trip_geometry(run_id: str, trip_id: str, seed: Optional[int] = Query(None)) -> dict:
-    sv = _require_seed_viz(run_id, seed)
+def trip_geometry(
+    run_id: str,
+    trip_id: str,
+    condition: Optional[str] = Query(None),
+    seed: Optional[int] = Query(None),
+) -> dict:
+    _run, sv = _require_seed_viz(run_id, condition, seed)
     mv = sv.trip_index.get(trip_id)
     if mv is None:
         raise HTTPException(status_code=404, detail="unknown trip id")
@@ -209,8 +259,9 @@ def pois(
     bbox: Optional[str] = Query(None),
     limit: int = Query(4000),
 ) -> dict:
-    sv = _require_seed_viz(run_id, seed)
-    return {"pois": viz.pois_in_bbox(sv.pois, _parse_bbox(bbox), limit=limit)}
+    # The POI catalog is condition-independent, so this one is keyed by seed only.
+    run = _require_run(run_id)
+    return {"pois": viz.pois_in_bbox(run.pois_for(seed), _parse_bbox(bbox), limit=limit)}
 
 
 # ── Static frontend (built React app), mounted last so /api wins ──────────────

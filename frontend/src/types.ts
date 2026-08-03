@@ -8,7 +8,9 @@ export interface RunConfig {
   // so the backend draws a fresh one per run; send it only to replay a study.
   seed?: number;
   num_seeds: number;
-  treatment: string;
+  // Recommenders to run. The No-RS control is always added server-side, so an
+  // empty array is a valid "control only" study.
+  conditions: string[];
   multimodal: boolean;
   use_real_pois: boolean;
   pup_alpha: number;
@@ -51,8 +53,10 @@ export interface City {
 
 export interface CitiesResponse {
   cities: City[];
-  treatments: string[];
+  treatments: string[]; // includes "No RS"; the UI pins it as the control
   pois_available: Record<string, boolean>; // per city key
+  warmed?: Record<string, boolean>; // road network cached on disk
+  precomputed?: Record<string, boolean>; // routing matrices precomputed
   defaults: RunConfig;
 }
 
@@ -61,11 +65,14 @@ export interface RunMeta {
   config: RunConfig;
   seeds: number[];
   default_seed: number;
-  time_spans: Record<string, number>; // per-seed time span (keyed by seed string)
-  table1: Table1Row[];
-  table2: Table2Row | null;
-  headline: Headline;
-  aggregate: Record<string, number>;
+  conditions: string[]; // "No RS" first, then the recommenders that ran
+  default_condition: string; // first recommender, else "No RS"
+  // {condition: {seed: time span}} — the scrubber's extent depends on both.
+  time_spans: Record<string, Record<string, number>>;
+  table1: Table1Row[]; // one row per condition
+  table2: Table2Row[]; // one row per recommender (the control has none)
+  headlines: Record<string, Headline>; // per condition
+  aggregate: Record<string, Record<string, number>>; // per condition
   view: { latitude: number; longitude: number };
   bounds: { south: number; west: number; north: number; east: number }; // full metro
   core_bounds: { south: number; west: number; north: number; east: number }; // principal city
@@ -74,6 +81,26 @@ export interface RunMeta {
   poi_count: number;
   poi_source: string;
   city_label: string;
+  created_at: number | null; // epoch seconds, when the study was submitted
+  duration_sec: number | null; // wall-clock time the study took
+}
+
+/** One row of GET /api/runs — enough to list and open a run, no geometry. */
+export interface RunSummary {
+  run_id: string;
+  status: "running" | "done" | "error" | "cancelled";
+  /** False when a finished run's results have been evicted from memory. */
+  available: boolean;
+  city: string | null;
+  city_label: string | null;
+  conditions: string[];
+  num_agents: number | null;
+  num_days: number | null;
+  num_seeds: number | null;
+  created_at: number | null; // epoch seconds
+  finished_at: number | null;
+  error: string | null;
+  progress: RunProgress;
 }
 
 export interface CreateRunResponse {
@@ -104,6 +131,8 @@ export interface Stay {
 }
 
 export interface TimelineResponse {
+  condition: string; // which condition the server actually resolved to
+  seed: number;
   t0: number;
   t1: number;
   trips: Trip[];
@@ -129,8 +158,26 @@ export interface Poi {
 
 export type BBox = [number, number, number, number]; // south, west, north, east
 
+/**
+ * Study progress, counted in simulated days. `current`/`total` cover the whole
+ * (seed x condition) grid; `per_condition` breaks it down per arm — all of them
+ * run at once, so a single figure would hide that.
+ */
+export interface RunProgress {
+  current: number;
+  total: number;
+  cond_total?: number; // per-arm denominator (seeds x days)
+  per_condition?: Record<string, number>; // condition -> sim-days done
+  /** Seconds since the study was submitted, measured on the SERVER. */
+  elapsed_sec?: number;
+  /** Client-side only: Date.now() when elapsed_sec was received, so the UI can
+   *  advance the timer between ticks without trusting the browser clock to
+   *  agree with the server's. */
+  observed_at?: number;
+}
+
 export type ProgressEvent =
-  | { type: "progress"; current: number; total: number }
+  | ({ type: "progress" } & RunProgress)
   | { type: "done"; run_id: string }
   | { type: "error"; message: string }
   | { type: "cancelled"; run_id: string };
