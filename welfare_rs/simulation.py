@@ -223,6 +223,40 @@ class Simulation:
         """Map a persona's real (lat, lon) to the nearest network node."""
         return self.road_network.snap_latlon(lat, lon)
 
+    def _sample_home_work(self, persona=None):
+        """Return ``(home, work)`` for one agent.
+
+        Preference order:
+
+        1. A **real LODES commute pair** when the network carries them — one
+           draw ∝ that pair's job count gives a home and a workplace that
+           actually go together, so commute lengths follow the published
+           distribution instead of two independent uniform draws.
+        2. Otherwise the provisional split: a county-weighted home (or the
+           persona's own coordinates on an unlayered network) plus a uniform
+           workplace inside the core.
+        """
+        net = self.road_network
+        drawn = net.sample_commute(self._loc_rng) if net.has_commutes else None
+        if drawn is not None:
+            return drawn
+
+        if net.has_layers or persona is None:
+            # Two-layer metro: personas supply behaviour only (their stored
+            # coordinates belong to another city).
+            home = net.sample_home_latlon(self._loc_rng)
+        else:
+            try:
+                home = self._home_from_latlon(
+                    float(persona.get("start_latitude", "")),
+                    float(persona.get("start_longitude", "")),
+                )
+            except ValueError:
+                home = net.sample_node_latlon(self._loc_rng)
+        # Fallback samplers return graph nodes directly, so there is no snap
+        # gap to charge.
+        return home, net.sample_core_latlon(self._loc_rng), 0.0, 0.0
+
     @staticmethod
     def _coerce_unit_interval(value):
         if value is None:
@@ -378,9 +412,9 @@ class Simulation:
             car_ownership = self.rng.random() < ad["car_ownership_prob_low_income"]
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
-        home = self.road_network.sample_home_latlon(self._loc_rng)
-        work = self.road_network.sample_core_latlon(self._loc_rng)
+        home, work, h_acc, w_acc = self._sample_home_work()
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
+        agent.home_access_km, agent.work_access_km = h_acc, w_acc
         agent.car_access_type = "own car" if car_ownership else "no car"
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
         return agent
@@ -426,21 +460,10 @@ class Simulation:
             car_ownership = False
             car_access_penalty = pm["no_car_penalty"]
 
-        if self.road_network.has_layers:
-            # Two-layer metro: personas supply behaviour only. Homes follow the
-            # county commuter weights (the persona's stored coordinates belong
-            # to another city); work is always inside the principal city.
-            home = self.road_network.sample_home_latlon(self._loc_rng)
-        else:
-            try:
-                lat = float(persona.get("start_latitude", ""))
-                lon = float(persona.get("start_longitude", ""))
-                home = self._home_from_latlon(lat, lon)
-            except ValueError:
-                home = self.road_network.sample_node_latlon(self._loc_rng)
-        work = self.road_network.sample_core_latlon(self._loc_rng)
+        home, work, h_acc, w_acc = self._sample_home_work(persona)
 
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
+        agent.home_access_km, agent.work_access_km = h_acc, w_acc
 
         agent.persona_id = str(persona.get("PersonaID", f"P{i:04d}"))
         agent.car_access_type = car_access
@@ -786,7 +809,7 @@ class Simulation:
         return 0.0
 
     def _base_mode_utility(self, agent, mode, distance_km, road_factor, transit_factor,
-                           car_route=None):
+                           car_route=None, access_km=0.0):
         uw = params.UTILITY_WEIGHTS
         spec = self.modes[mode]
         if mode == "car" and car_route is not None:
@@ -804,6 +827,18 @@ class Simulation:
                 in_vehicle *= road_factor
         if mode == "transit":
             in_vehicle *= transit_factor
+
+        # Access leg: the un-networked hop between the real block point and the
+        # graph node it snapped to. It is off-graph by construction, so it is
+        # charged straight-line at local-street speed (or the mode's own speed
+        # when access_speed_kmh is None) and its km accrue cost and emissions
+        # like any other. No congestion factor — local streets, not arterials.
+        if access_km > 0.0:
+            access_speed = params.CITY_PARAMS.get("access_speed_kmh") or spec["speed_kmh"]
+            access_speed *= max(1e-3, self._weather_speed_factor(mode))
+            in_vehicle += (access_km / max(1e-3, access_speed)) * 60
+            distance_km += access_km
+
         wait = spec["wait_min"]
         travel_time = in_vehicle + wait
 
@@ -829,11 +864,12 @@ class Simulation:
         return params.LEISURE_MODE_TASTE_SHIFTS.get(next_activity.subtype, {}).get(mode, 0.0)
 
     def _mode_outcome(self, agent, mode, distance_km, road_factor, transit_factor, peer_status,
-                      next_activity, car_route=None):
+                      next_activity, car_route=None, access_km=0.0):
         """Utility/cost outcome for a single mode (shared by evaluation + fallback)."""
         uw = params.UTILITY_WEIGHTS
         utility, travel_time, monetary_cost, emissions, gen_cost = self._base_mode_utility(
-            agent, mode, distance_km, road_factor, transit_factor, car_route=car_route
+            agent, mode, distance_km, road_factor, transit_factor, car_route=car_route,
+            access_km=access_km,
         )
 
         if next_activity.is_mandatory:
@@ -876,12 +912,17 @@ class Simulation:
             "cost": monetary_cost,
             "emissions": emissions,
             "gen_cost": gen_cost,
-            "distance_km": (car_route[1] if (mode == "car" and car_route is not None)
-                            else distance_km),
+            "distance_km": access_km + (car_route[1] if (mode == "car" and car_route is not None)
+                                        else distance_km),
         }
 
     def _evaluate_modes(self, agent, origin, destination, current_activity, next_activity):
         distance_km = self.distance_km(origin, destination)
+        # Un-networked access at BOTH ends: leaving the real home/work point to
+        # reach the graph, and again on arrival. Leisure destinations are POIs
+        # inserted into the graph as mid-block nodes, so they contribute 0.
+        access_km = (agent.access_km(current_activity.type)
+                     + agent.access_km(next_activity.type))
         # Car rides the fastest network path: (free-flow minutes, km) along it,
         # or None on graphs without edge travel times (flat-speed fallback).
         car_route = None
@@ -897,7 +938,7 @@ class Simulation:
                 continue
             outcomes[mode] = self._mode_outcome(
                 agent, mode, distance_km, road_factor, transit_factor, peer_status,
-                next_activity, car_route=car_route
+                next_activity, car_route=car_route, access_km=access_km
             )
 
         if not outcomes:
@@ -907,7 +948,7 @@ class Simulation:
             fallback = "walk" if "walk" in self.modes else next(iter(self.modes))
             outcomes[fallback] = self._mode_outcome(
                 agent, fallback, distance_km, road_factor, transit_factor, peer_status,
-                next_activity, car_route=car_route
+                next_activity, car_route=car_route, access_km=access_km
             )
 
         return outcomes

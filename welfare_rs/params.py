@@ -84,6 +84,67 @@ GEO_PARAMS: dict = {
         "WELFARE_RS_CACHE",
         os.path.join(_REPO_ROOT, ".cache"),
     ),
+    # Overpass endpoints for the one-off metro downloads, PROBED AT RUN TIME
+    # and ordered fastest-first (see welfare_rs.netfix.pick_overpass_url).
+    #
+    # Public Overpass instances fail and recover on their own schedule, and a
+    # failure aborts a metro build tens of minutes in (metro.py sets
+    # use_cache=False, so nothing is retained). Hardcoding one endpoint just
+    # moves the outage around: overpass-api.de was serving 504s and connect
+    # timeouts, so this was pinned to kumi.systems — which then turned out to
+    # be ~35x slower (71 s vs 2 s on the same query) and stalled a download
+    # outright, by which time overpass-api.de had recovered. So: measure, don't
+    # guess.
+    #
+    # Only FULL-PLANET instances belong here. A regional one such as
+    # overpass.osm.ch answers HTTP 200 with ZERO elements outside its region,
+    # which would silently produce an empty graph rather than an error.
+    #
+    # FORMAT: BASE url, with NO trailing "/interpreter" — osmnx appends that
+    # itself (its own default is "https://overpass-api.de/api"). Including it
+    # here produces ".../api/interpreter/interpreter", which does not resolve
+    # and surfaces as a *connect timeout* rather than a 404, so it looks
+    # exactly like the upstream outage it is not.
+    #
+    # ORDER: unmetered mirrors first. overpass-api.de advertises "Rate limit: 2"
+    # — two slots per client IP — and a metro build issues far more queries than
+    # that over an hour. On 2026-07-31 it warmed Miami fine and then stopped
+    # answering our SYNs entirely, on BOTH backend IPs at once, for the whole DC
+    # build: that is an IP-level block, not an outage, and it presents as a
+    # connect timeout with no 429 to warn you. kumi.systems advertises
+    # "Rate limit: 0" (no per-client slot accounting) and kept answering in
+    # 0.5 s throughout, so bulk warming belongs there. It is the slower mirror
+    # per query, which is the right trade for an unattended overnight job.
+    #
+    # By 2026-07-31 evening BOTH of those were unusable from this host:
+    # overpass-api.de blocked (SYNs dropped on both backends) and kumi timing
+    # out on real queries while still accepting TCP. The OSM France and mail.ru
+    # instances were verified serving identical, correct US data from here —
+    # 71,037 ways for the same Manhattan box on both — so they lead now.
+    #
+    # NOT in this list, deliberately:
+    #   overpass.osm.ch          Switzerland only. Answers US queries with
+    #                            HTTP 200 and a count of ZERO — it looks
+    #                            healthy and yields empty graphs.
+    #   overpass.openstreetmap.fr  Whitelist-only. A small probe query
+    #                            succeeds, then the real download is refused:
+    #                            "403 Forbidden This service is only available
+    #                            to white-listed usages". We are not
+    #                            whitelisted, so it is not ours to use.
+    #   overpass.private.coffee  Resolves to kumi's IP — same box, so listing
+    #                            it adds no redundancy.
+    # netfix._probe rejects zero-count responses, so a regional mirror cannot be
+    # selected even if one is re-added here by mistake. It cannot detect the
+    # whitelist case, because the probe is exactly the kind of small query such
+    # instances still allow.
+    #
+    # $WELFARE_RS_OVERPASS_URL pins one explicitly and skips probing.
+    "overpass_urls": (
+        "https://maps.mail.ru/osm/tools/overpass/api",
+        "https://overpass.kumi.systems/api",
+        "https://overpass-api.de/api",
+    ),
+    "overpass_url": os.environ.get("WELFARE_RS_OVERPASS_URL") or None,
     "default_city": "nyc_manhattan",
     "default_network_type": "drive",
     "cities": {
@@ -128,14 +189,42 @@ METRO_PARAMS: dict = {
         "nyc": {"label": "New York (Manhattan)",
                 "core_places": ["Manhattan, New York, USA"]},
         "seattle": {"label": "Seattle",
-                    "core_places": ["Seattle, Washington, USA"]},
+                    "core_places": ["Seattle, Washington, USA"],
+                    # Clark County (Vancouver WA, on the Portland border) ranks
+                    # 5th by inbound volume so ``county_coverage`` pulls it in,
+                    # but it is ~270 km south with Thurston/Lewis/Cowlitz —
+                    # none of them selected — in between. Its roads download as
+                    # an island, the strongly-connected-component cut deletes
+                    # them, and its 8,074 "commuters" then snap ~120 km north
+                    # into Pierce County and get charged the trip. They are a
+                    # LODES reporting artifact anyway: employers book remote and
+                    # multi-site staff to a headquarters block, so nobody is
+                    # really driving Vancouver->Seattle daily.
+                    "exclude_counties": ("53011",)},
         "sf_bay": {"label": "SF Bay Area (SF + Oakland)",
                    "core_places": ["San Francisco, California, USA",
-                                   "Oakland, California, USA"]},
+                                   "Oakland, California, USA"],
+                   # Los Angeles (550 km) and San Diego (750 km) counties, with
+                   # the entire Central Valley and Central Coast unselected in
+                   # between. Same island defect as Seattle's Clark County
+                   # below. 46,585 workers, 5.8% of inbound. Sacramento /
+                   # San Joaquin / Sonoma are KEPT: each chains to the core
+                   # through a selected neighbour (Solano, Contra Costa, Marin).
+                   "exclude_counties": ("06037", "06073")},
         "chicago": {"label": "Chicago",
                     "core_places": ["Chicago, Illinois, USA"]},
         "houston": {"label": "Houston",
-                    "core_places": ["Houston, Texas, USA"]},
+                    "core_places": ["Houston, Texas, USA"],
+                    # The other four Texas metros: San Antonio (Bexar, 300 km),
+                    # Austin (Travis + Williamson, 265 km), Dallas (Dallas +
+                    # Collin, 380 km) and Fort Worth (Tarrant, 430 km), none of
+                    # them adjacent to anything else selected. Beyond the island
+                    # defect this is what made the shell polygon span most of
+                    # Texas — 57x osmnx's max query area, so ~57 back-to-back
+                    # sub-queries, which is the burst that got this host blocked
+                    # by overpass-api.de. 80,475 workers, 5.8% of inbound.
+                    "exclude_counties": ("48029", "48453", "48113",
+                                         "48439", "48491", "48085")},
         "dc": {"label": "Washington, DC",
                "core_places": ["Washington, District of Columbia, USA"]},
         "miami": {"label": "Miami",
@@ -218,6 +307,18 @@ CITY_PARAMS: dict = {
         "car": -0.02,
         "ai_shuttle": 0.02,
     },
+    # Un-networked access leg. Agent homes/workplaces are real Census block
+    # points snapped to the nearest graph node; outside the core the graph is
+    # arterials only, so that snap can move a suburban home 1-3 km. Charging
+    # the trip only from the arterial would make every such commute free for
+    # its first kilometres. The residual straight-line distance is instead
+    # billed as an access leg at local-street speed (it is genuinely off-graph,
+    # so there is no route to measure — a haversine approximation is the honest
+    # ceiling on what can be known).
+    #
+    # Set "access_speed_kmh" to None to charge it at the chosen mode's own
+    # speed instead of one flat local-street speed.
+    "access_speed_kmh": 25.0,
     "default_context": {
         "ai_intervention": "none",
         "social_norms": "standard",

@@ -54,9 +54,27 @@ TREATMENTS = ["No RS", "Standard RS", "PUP", "RM", "PUP+RM"]
 _WELFARE_MODE = {"PUP": "pup", "RM": "rm", "PUP+RM": "pup_rm"}
 
 # (metro key, friendly label) — the two-layer metros surfaced to the frontend.
+#
+# ALL metros are offered, warmed or not. Picking an unwarmed one makes the run
+# build its network on demand, which goes to Overpass from inside the web
+# worker — slow at best, and while this host is blocked by overpass-api.de it
+# hangs on a 180 s connect timeout per sub-query before failing. That is a
+# deliberate development-time choice: the operator knows which metros are warm.
+# ``warmed`` in the /api/cities payload says which are ready without having to
+# guess. Warming itself stays an offline step (scripts/warm_metros.py).
 CITIES = [(key, spec["label"]) for key, spec in params.METRO_PARAMS["metros"].items()]
 _CITY_LABELS = dict(CITIES)
 DEFAULT_CITY = params.METRO_PARAMS["default_metro"]
+
+
+def warmed_cities() -> dict:
+    """``{metro key: warm pickle exists}`` — advisory, read fresh each call so
+    a metro warmed while the service is up shows up without a restart."""
+    cache_dir = params.GEO_PARAMS["cache_dir"]
+    return {
+        key: os.path.exists(os.path.join(cache_dir, "warmed", f"{key}_metro.pkl"))
+        for key, _ in CITIES
+    }
 
 MAX_SEEDS = 12
 

@@ -39,7 +39,7 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import CITIES, TREATMENTS, RunConfig, manager
+from service import CITIES, TREATMENTS, RunConfig, manager, warmed_cities
 
 app = FastAPI(title="welfare-rs", version="0.1.0")
 
@@ -90,6 +90,9 @@ def cities() -> dict:
         "cities": [{"key": k, "label": label} for k, label in CITIES],
         "treatments": TREATMENTS,
         "pois_available": manager.pois_available(),  # per-city: {key: bool}
+        # Advisory: every city above can be selected, but an unwarmed one
+        # downloads its network on demand instead of loading it from disk.
+        "warmed": warmed_cities(),                   # per-city: {key: bool}
         "defaults": RunRequest().model_dump(),
     }
 

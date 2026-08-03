@@ -76,13 +76,55 @@ def geocode_polygon(query: str, cache_dir: Optional[str] = None):
     return geom
 
 
-def _union(geoms):
+def _union(geoms, weld_m: float = 0.0):
+    """Union of polygons, optionally welded across hairline gaps.
+
+    Counties are geocoded one at a time, so two that share a real border can
+    come back as polygons that merely *touch* — Nominatim's Cook County IL and
+    Lake County IN meet at a single POINT, with 0.000 km of shared edge.
+    ``unary_union`` then returns a MultiPolygon, osmnx downloads the parts as
+    disconnected pieces, and ``largest_component(strongly=True)`` deletes the
+    smaller one. That is how every road in Lake County Indiana disappeared from
+    the Chicago graph, leaving its 19,576 commuters to snap up to 30 km west
+    into Illinois — the same failure as Seattle's Clark County, reached through
+    geometry rather than distance.
+
+    Buffering each polygon by a few tens of metres before the union closes
+    those gaps. It also makes the download area marginally larger than the
+    county union, which is harmless and mildly useful: arterials at the rim are
+    truncated a little further out, so fewer of them become dead-end stubs that
+    the strongly-connected cut discards.
+    """
     from shapely.ops import unary_union
 
-    return unary_union(list(geoms))
+    geoms = list(geoms)
+    if weld_m:
+        deg = weld_m / 111_000.0  # metres -> degrees, near enough at these lats
+        geoms = [g.buffer(deg) for g in geoms]
+    return unary_union(geoms)
+
+
+# Wide enough to close geocoder seams, far too small to pull in a neighbouring
+# town. Chicago's union goes from 2 parts to 1 at 10 m; 50 m is margin.
+_WELD_M = 50.0
 
 
 # ── Metro network assembly ───────────────────────────────────────────────────
+
+def excluded_counties(metro: str) -> set:
+    """County FIPS the coverage rule selects but the graph cannot serve.
+
+    ``select_counties`` ranks purely by inbound worker volume and never asks
+    whether a county is anywhere near the metro, so a high-volume outlier can
+    be selected while the counties between it and the core are not. Its roads
+    then form an island that the strongly-connected-component cut deletes,
+    leaving its homes to snap tens of kilometres to the nearest survivor and be
+    charged the distance as travel time. Listing such a county here removes it
+    from both the download and the commute pairs.
+    """
+    meta = params.METRO_PARAMS["metros"].get(metro, {})
+    return set(meta.get("exclude_counties", ()))
+
 
 def _warm_path(cache_dir: str, metro: str) -> str:
     path = os.path.join(cache_dir, "warmed")
@@ -94,6 +136,19 @@ def _compose_metro_graph(core_polygon, metro_polygon, graphml_path: str):
     """Download core (full drive) + shell (arterials), weld, simplify, SCC."""
     if os.path.exists(graphml_path):
         return ox.load_graphml(graphml_path)
+
+    # Endpoint is measured, not assumed — down to the backend IP — and osmnx's
+    # rate limiter is enabled only if the endpoint actually meters. See
+    # welfare_rs.netfix for the three separate failures this covers.
+    # refresh=True: re-probe for THIS metro rather than trusting a choice made
+    # before the previous metro, which may have gone dead since.
+    from .netfix import configure_overpass
+
+    overpass_url = configure_overpass(refresh=True)
+    if overpass_url:
+        print(f"  overpass endpoint: {overpass_url} "
+              f"(rate limiter {'on' if ox.settings.overpass_rate_limit else 'off'})",
+              flush=True)
 
     ox.settings.use_cache = False
     # Unsimplified downloads share raw OSM node ids wherever the same road
@@ -143,10 +198,16 @@ def build_metro_network(
         with open(warm, "rb") as f:
             net = pickle.load(f)
         net.cache_dir = cache_dir
+        # Commute pairs are deliberately not pickled (millions of rows); each
+        # process re-attaches them, restricted to the counties this graph
+        # actually covers — county_meta is exactly that set.
+        _attach_commutes(net, metro, datasource, list(net.county_meta or {}))
         return net
 
     ds = datasource or get_datasource()
-    counties = select_counties(ds.county_flows(metro))
+    drop = excluded_counties(metro)
+    counties = [c for c in select_counties(ds.county_flows(metro))
+                if c.fips not in drop]
 
     core_polygon = _union(
         geocode_polygon(q, cache_dir) for q in metros[metro]["core_places"]
@@ -154,7 +215,11 @@ def build_metro_network(
     county_polygons: Dict[str, object] = {
         c.fips: geocode_polygon(c.geocode, cache_dir) for c in counties
     }
-    metro_polygon = _union([core_polygon, *county_polygons.values()])
+    # Welded: see _union. Genuine offshore islands (Catalina, the Farallones,
+    # the Channel Islands) stay separate at this buffer and are meant to — the
+    # strongly-connected cut drops them because you cannot drive there.
+    metro_polygon = _union([core_polygon, *county_polygons.values()],
+                           weld_m=_WELD_M)
 
     graphml_path = os.path.join(cache_dir, "networks", f"{metro}_metro.graphml")
     graph = _compose_metro_graph(core_polygon, metro_polygon, graphml_path)
@@ -168,7 +233,31 @@ def build_metro_network(
     )
     with open(warm, "wb") as f:
         pickle.dump(net, f, protocol=_PICKLE_PROTOCOL)
+    _attach_commutes(net, metro, ds, [c.fips for c in counties])
     return net
+
+
+def _attach_commutes(net: RoadNetwork, metro: str,
+                     datasource: Optional[DataSource], counties) -> None:
+    """Attach real block-level commutes, if the datasource has them.
+
+    Restricted to ``counties`` — the ones built into this graph — because a
+    home block outside the graph would snap to whatever node happens to sit on
+    the graph's boundary. Failure is non-fatal: without pairs the network keeps
+    its county-weighted home sampler and a uniform workplace in the core.
+    """
+    ds = datasource or get_datasource()
+    # Filtered here as well as at selection time so an ALREADY-WARMED pickle is
+    # corrected on load: county_meta was baked in before the exclusion existed,
+    # and re-downloading a metro graph to drop a county it never usefully
+    # contained would be a waste.
+    drop = excluded_counties(metro)
+    counties = [c for c in counties if c not in drop]
+    try:
+        pairs = ds.commute_pairs(metro, counties)
+    except Exception:
+        pairs = None
+    net.attach_commutes(pairs)
 
 
 def is_metro(city_key: str) -> bool:

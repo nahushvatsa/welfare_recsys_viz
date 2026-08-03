@@ -4,7 +4,9 @@ export interface RunConfig {
   city: string;
   num_agents: number;
   num_days: number;
-  seed: number; // base seed; the study sweeps seed .. seed + num_seeds - 1
+  // Base seed for the sweep (seed .. seed + num_seeds - 1). Omitted by the UI
+  // so the backend draws a fresh one per run; send it only to replay a study.
+  seed?: number;
   num_seeds: number;
   treatment: string;
   multimodal: boolean;

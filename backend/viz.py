@@ -4,14 +4,13 @@ The backend owns the full simulation run; the browser only ever pulls what it
 needs to draw the current time window inside the current map viewport. These
 pure functions turn a completed :class:`welfare_rs.Simulation` day into:
 
-* **timelines** — per-agent moving (trip) and stationary (activity) segments,
-  retaining the *full* street-route polyline so positions can be interpolated at
-  any instant with full fidelity (the MATSim/SUMO look).
-* **windowed trips / stays** — compact, *downsampled* position keyframes for the
-  trips/stays that fall in a requested time window and map bounding box. This is
-  the small default payload the client animates client-side.
-* **on-demand geometry** — the full street polyline for a single trip, fetched
-  only when a dot is inspected.
+* **timelines** — per-agent moving (trip) and stationary (activity) segments.
+  Each route is simplified to a ~11 m tolerance and held as a float32 array, so
+  an animated dot still tracks the real street geometry while the run stays
+  bounded in memory (routes dominate it: they scale as agents x days x seeds).
+* **windowed trips / stays** — the trips/stays falling in a requested time
+  window and map bounding box. The client animates along these keyframes.
+* **on-demand geometry** — one trip's polyline, fetched when a dot is inspected.
 
 Locations are ``(lat, lon)``; deck.gl wants ``[lon, lat]`` so the windowed
 outputs emit that order. No web/visualization framework is imported here — these
@@ -20,7 +19,10 @@ are plain data transforms reused by the API layer.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from welfare_rs.geo import haversine_km
 
@@ -43,41 +45,73 @@ STATE_COLOR = {
     "in_transit": [230, 80, 60],
 }
 
-MAX_PATH_POINTS = 12  # downsample route polylines to bound the windowed payload
+# Douglas-Peucker tolerance for stored routes, in degrees (~1e-4 deg ~ 11 m).
+#
+# Routes are simplified by METRIC TOLERANCE rather than to a fixed point count.
+# That distinction is the whole point: a fixed count (this module used to send
+# 12 evenly-spaced points) makes a dot visibly cut corners, because a 25 km
+# commute becomes 11 straight hops. A tolerance keeps every corner and curve
+# while collapsing a straight freeway run to its two endpoints, so the dot
+# tracks the real road at any usable zoom — and the result is ~100x smaller
+# than the raw polyline it replaces.
+PATH_TOL_DEG = float(os.environ.get("WELFARE_RS_PATH_TOL_DEG", "1e-4"))
+
+_EARTH_RADIUS_KM = 6371.0088
 
 
 # ── Geometry math ─────────────────────────────────────────────────────────────
 
-def _cumulative_km(path: List[LatLon]) -> List[float]:
-    """Cumulative great-circle distance (km) along a polyline."""
-    cum = [0.0]
-    for i in range(1, len(path)):
-        cum.append(cum[-1] + haversine_km(path[i - 1], path[i]))
-    return cum
+def _simplify_path(path: Sequence[LatLon]) -> np.ndarray:
+    """Simplify a (lat, lon) polyline and return it as a float32 (N, 2) array.
+
+    float32 gives ~1 m positional resolution at these latitudes — far finer
+    than the simplification tolerance — at 8 bytes per point instead of the
+    ~100 a Python tuple of floats costs.
+    """
+    if len(path) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if len(path) < 3:
+        return np.asarray(path, dtype=np.float32).reshape(-1, 2)
+    from shapely.geometry import LineString
+
+    line = LineString([(lon, lat) for lat, lon in path])
+    simple = line.simplify(PATH_TOL_DEG, preserve_topology=False)
+    return np.array([(y, x) for x, y in simple.coords], dtype=np.float32)
 
 
-def _position_at(path: List[LatLon], cum: List[float], frac: float) -> LatLon:
+def _cumulative_km(path) -> np.ndarray:
+    """Cumulative great-circle distance (km) along a polyline, as float32."""
+    p = np.asarray(path, dtype=np.float64).reshape(-1, 2)
+    if len(p) < 2:
+        return np.zeros(len(p), dtype=np.float32)
+    lat1, lon1 = np.radians(p[:-1, 0]), np.radians(p[:-1, 1])
+    lat2, lon2 = np.radians(p[1:, 0]), np.radians(p[1:, 1])
+    h = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
+    seg = 2.0 * _EARTH_RADIUS_KM * np.arcsin(np.sqrt(h))
+    out = np.zeros(len(p), dtype=np.float64)
+    np.cumsum(seg, out=out[1:])
+    return out.astype(np.float32)
+
+
+def _position_at(path, cum, frac: float) -> LatLon:
     """Interpolate a position along ``path`` at distance fraction ``frac``."""
-    if len(path) == 1:
-        return path[0]
-    target = max(0.0, min(1.0, frac)) * cum[-1]
-    for i in range(1, len(path)):
-        if cum[i] >= target:
-            seg = cum[i] - cum[i - 1]
-            f = 0.0 if seg <= 0 else (target - cum[i - 1]) / seg
-            lat = path[i - 1][0] + (path[i][0] - path[i - 1][0]) * f
-            lon = path[i - 1][1] + (path[i][1] - path[i - 1][1]) * f
-            return (lat, lon)
-    return path[-1]
-
-
-def _downsample(path: List[LatLon], k: int) -> List[LatLon]:
-    """Keep ~k evenly-spaced points (including both endpoints) from a polyline."""
     n = len(path)
-    if n <= k:
-        return path
-    step = (n - 1) / (k - 1)
-    return [path[round(i * step)] for i in range(k)]
+    if n == 0:
+        return (0.0, 0.0)
+    if n == 1:
+        return (float(path[0][0]), float(path[0][1]))
+    target = max(0.0, min(1.0, frac)) * float(cum[-1])
+    i = int(np.searchsorted(cum, target, side="left"))
+    if i <= 0:
+        return (float(path[0][0]), float(path[0][1]))
+    if i >= n:
+        return (float(path[-1][0]), float(path[-1][1]))
+    a, b = float(cum[i - 1]), float(cum[i])
+    f = 0.0 if b <= a else (target - a) / (b - a)
+    lat = float(path[i - 1][0]) + (float(path[i][0]) - float(path[i - 1][0])) * f
+    lon = float(path[i - 1][1]) + (float(path[i][1]) - float(path[i - 1][1])) * f
+    return (lat, lon)
 
 
 # ── Timelines (per simulated day) ──────────────────────────────────────────────
@@ -88,8 +122,8 @@ def build_timelines(sim) -> Dict[int, dict]:
 
     Reconstructs each agent's day from its realised trips: between trips the
     agent waits at the previous destination, with the state there being the
-    purpose of the trip that brought it (home/work/leisure). The full route
-    polyline (``path``) and its cumulative distances (``cum``) are retained.
+    purpose of the trip that brought it (home/work/leisure). ``path`` is the
+    simplified route (float32 lat/lon) and ``cum`` its cumulative distances.
     """
     net = sim.road_network
     timelines: Dict[int, dict] = {}
@@ -103,7 +137,7 @@ def build_timelines(sim) -> Dict[int, dict]:
         for tr in trips:
             if tr.depart_time > prev_end:
                 stays.append((prev_end, tr.depart_time, prev_loc, prev_state))
-            path = net.route_geometry_latlon(tr.origin, tr.destination)
+            path = _simplify_path(net.route_geometry_latlon(tr.origin, tr.destination))
             moves.append(
                 {
                     "t0": tr.depart_time,
@@ -174,15 +208,16 @@ def _in_bbox(lat: float, lon: float, bbox: BBox) -> bool:
     return south <= lat <= north and west <= lon <= east
 
 
-def _bbox_overlap(path: List[LatLon], bbox: BBox) -> bool:
+def _bbox_overlap(path, bbox: BBox) -> bool:
     """True if the polyline's extent intersects the viewport bbox (so a trip
     passing through the view is kept even when its endpoints are off-screen)."""
     south, west, north, east = bbox
-    lats = [p[0] for p in path]
-    lons = [p[1] for p in path]
-    if max(lats) < south or min(lats) > north:
+    p = np.asarray(path, dtype=np.float64).reshape(-1, 2)
+    if p.size == 0:
         return False
-    if max(lons) < west or min(lons) > east:
+    if p[:, 0].max() < south or p[:, 0].min() > north:
+        return False
+    if p[:, 1].max() < west or p[:, 1].min() > east:
         return False
     return True
 
@@ -191,15 +226,14 @@ def _bbox_overlap(path: List[LatLon], bbox: BBox) -> bool:
 
 def _trip_record(mv: dict) -> dict:
     """Compact, downsampled position keyframes for one move (deck.gl order)."""
-    path = _downsample(mv["path"], MAX_PATH_POINTS)
-    cum = _cumulative_km(path)
-    total = cum[-1] or 1.0
+    path, cum = mv["path"], mv["cum"]
+    total = float(cum[-1]) or 1.0
     t0, t1 = mv["t0"], mv["t1"]
-    timestamps = [round(t0 + (t1 - t0) * (c / total), 1) for c in cum]
+    timestamps = [round(t0 + (t1 - t0) * (float(c) / total), 1) for c in cum]
     return {
         "agent_id": int(mv["trip_id"].split("-")[0]),
         "trip_id": mv["trip_id"],
-        "path": [[round(lon, 5), round(lat, 5)] for (lat, lon) in path],
+        "path": [[round(float(lon), 5), round(float(lat), 5)] for lat, lon in path],
         "timestamps": timestamps,
         "mode": mv["mode"],
         "color": MODE_COLOR.get(mv["mode"], [200, 200, 200]),
@@ -260,7 +294,7 @@ def trip_geometry(mv: dict) -> dict:
     return {
         "trip_id": mv["trip_id"],
         "agent_id": int(mv["trip_id"].split("-")[0]),
-        "path": [[round(lon, 6), round(lat, 6)] for (lat, lon) in mv["path"]],
+        "path": [[round(float(lon), 6), round(float(lat), 6)] for lat, lon in mv["path"]],
         "timestamps": [round(t0 + (t1 - t0) * (c / total), 1) for c in cum],
         "mode": mv["mode"],
         "purpose": mv["purpose"],

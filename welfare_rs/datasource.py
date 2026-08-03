@@ -35,9 +35,29 @@ Expected Postgres schema (mirrors the local file schemas)::
         PRIMARY KEY (metro, place_id)
     );
 
-``metro_county_flows`` is the materialised form of the LODES query "workers by
-home county whose work block falls inside the core city polygon"; the baked
-JSON carries provisional hand estimates until that query can run for real.
+    CREATE TABLE metro_od_pairs (
+        metro    text     NOT NULL,
+        h_geoid  char(15) NOT NULL,  -- 2020 Census block of the home
+        w_geoid  char(15) NOT NULL,  -- 2020 Census block of the workplace
+        h_county char(5)  NOT NULL,  -- left(h_geoid,5); filters to graph counties
+        jobs     integer  NOT NULL,  -- LODES S000 on this pair = the draw weight
+        sa01..sa03 integer,          -- worker age      <=29 / 30-54 / 55+
+        se01..se03 integer,          -- monthly earnings <=1250 / 1251-3333 / >3333
+        h_lat, h_lon, w_lat, w_lon double precision NOT NULL,
+        PRIMARY KEY (metro, h_geoid, w_geoid)
+    );
+
+Both commute tables are derived from ONE filtered rowset — the LODES8 OD rows
+whose *work* block falls inside the core polygon — at two levels of
+aggregation. ``metro_county_flows`` is that set grouped by home county, and it
+must exist first because the county list decides which counties are downloaded
+into the road graph; a home outside the graph has no node to snap to.
+``metro_od_pairs`` keeps the individual pairs and is what actually places
+agents. See ``db/07_commute_tables.sql``.
+
+A row of ``metro_od_pairs`` is NOT an agent: it says "this many jobs exist on
+this home->work pair". A run draws ``num_agents`` samples from it weighted by
+``jobs``, so population size stays a run parameter, independent of table size.
 """
 
 from __future__ import annotations
@@ -46,7 +66,9 @@ import csv
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
+
+import numpy as np
 
 from . import params
 
@@ -60,6 +82,48 @@ class CountyFlow:
     geocode: str
     workers: int
     core_share: float  # share of these workers whose home is inside the core
+
+
+@dataclass(frozen=True)
+class CommutePairs:
+    """Block-level home->work commute pairs for one metro, as parallel arrays.
+
+    Columnar rather than row-dicts because a metro can carry millions of pairs
+    and only ``num_agents`` of them are ever drawn: arrays keep the memory flat
+    and make the weighted draw a ``searchsorted`` over a prefix sum.
+
+    ``jobs`` is the draw weight (LODES S000). ``age`` and ``earn`` are (n, 3)
+    segment counts carried for a later ACS build, which will condition agent
+    income and age on the commute instead of drawing them independently.
+    """
+
+    h_lat: np.ndarray
+    h_lon: np.ndarray
+    w_lat: np.ndarray
+    w_lon: np.ndarray
+    jobs: np.ndarray
+    age: np.ndarray   # (n, 3): <=29 / 30-54 / 55+
+    earn: np.ndarray  # (n, 3): <=$1250 / $1251-3333 / >$3333
+
+    def __len__(self) -> int:
+        return int(self.jobs.shape[0])
+
+
+def _commute_pairs_from_rows(rows: Sequence[Sequence]) -> Optional[CommutePairs]:
+    """Build :class:`CommutePairs` from ``(h_lat,h_lon,w_lat,w_lon,jobs,
+    sa01..sa03,se01..se03)`` tuples. Returns None for an empty input."""
+    if not rows:
+        return None
+    arr = np.asarray(rows, dtype=np.float64)
+    return CommutePairs(
+        h_lat=arr[:, 0].copy(),
+        h_lon=arr[:, 1].copy(),
+        w_lat=arr[:, 2].copy(),
+        w_lon=arr[:, 3].copy(),
+        jobs=arr[:, 4].astype(np.int64),
+        age=arr[:, 5:8].astype(np.int32),
+        earn=arr[:, 8:11].astype(np.int32),
+    )
 
 
 def select_counties(flows: List[CountyFlow], coverage: Optional[float] = None) -> List[CountyFlow]:
@@ -102,6 +166,18 @@ class DataSource:
 
     def has_pois(self, metro: str) -> bool:
         raise NotImplementedError
+
+    def commute_pairs(self, metro: str,
+                      counties: Optional[Sequence[str]] = None) -> Optional[CommutePairs]:
+        """Real block-level home->work pairs for a metro, or None when the
+        source has none (callers fall back to county-weighted home sampling
+        plus a uniform workplace in the core).
+
+        ``counties`` restricts homes to those 5-digit county FIPS — pass the
+        counties actually built into the road graph, because a home outside it
+        would snap to whatever node sits on the graph boundary.
+        """
+        return None
 
 
 # ── Local disk (default) ─────────────────────────────────────────────────────
@@ -180,6 +256,32 @@ class LocalDataSource(DataSource):
         path = params.NYC_PERSONA_CSV_PATH
         return path if os.path.exists(path) else None
 
+    def _od_csv_path(self, metro: str) -> Optional[str]:
+        path = os.path.join(self._cache_dir, "od", f"{metro}_od_pairs.csv")
+        return path if os.path.exists(path) else None
+
+    def commute_pairs(self, metro: str,
+                      counties: Optional[Sequence[str]] = None) -> Optional[CommutePairs]:
+        """Local mirror of ``metro_od_pairs`` — same columns, one CSV per metro
+        under ``<cache>/od/``. Absent on most machines, which is fine: the
+        caller falls back to the county-weighted sampler."""
+        path = self._od_csv_path(metro)
+        if path is None:
+            return None
+        keep = set(counties) if counties else None
+        rows = []
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                if keep is not None and r["h_county"] not in keep:
+                    continue
+                rows.append((
+                    float(r["h_lat"]), float(r["h_lon"]),
+                    float(r["w_lat"]), float(r["w_lon"]), int(r["jobs"]),
+                    int(r["sa01"]), int(r["sa02"]), int(r["sa03"]),
+                    int(r["se01"]), int(r["se02"]), int(r["se03"]),
+                ))
+        return _commute_pairs_from_rows(rows)
+
 
 # ── Postgres (the lab server) ────────────────────────────────────────────────
 
@@ -238,6 +340,78 @@ class PostgresDataSource(DataSource):
     def has_pois(self, metro: str) -> bool:
         rows = self._query("SELECT 1 FROM metro_pois WHERE metro = %s LIMIT 1", (metro,))
         return bool(rows)
+
+    # Streamed in batches this size, into arrays preallocated from COUNT(*).
+    _OD_BATCH = 100_000
+
+    def commute_pairs(self, metro: str,
+                      counties: Optional[Sequence[str]] = None) -> Optional[CommutePairs]:
+        """Stream the metro's pairs into preallocated arrays.
+
+        A big metro carries millions of pairs and every seed worker loads its
+        own copy inside one 24 GiB service cgroup, so this deliberately avoids
+        ``fetchall()``: materialising millions of Python tuples costs several
+        times what the finished arrays do. A server-side (named) cursor keeps
+        peak memory at ``final arrays + one batch``.
+        """
+        import psycopg
+
+        cols = ("h_lat, h_lon, w_lat, w_lon, jobs, "
+                "sa01, sa02, sa03, se01, se02, se03")
+        where = "metro = %s"
+        args: tuple = (metro,)
+        if counties:
+            where += " AND h_county = ANY(%s)"
+            args = (metro, list(counties))
+
+        with psycopg.connect(self._dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT count(*) FROM metro_od_pairs WHERE {where}", args)
+                n = int(cur.fetchone()[0])
+            if n == 0:
+                return None
+
+            h_lat = np.empty(n, dtype=np.float64)
+            h_lon = np.empty(n, dtype=np.float64)
+            w_lat = np.empty(n, dtype=np.float64)
+            w_lon = np.empty(n, dtype=np.float64)
+            jobs = np.empty(n, dtype=np.int64)
+            age = np.empty((n, 3), dtype=np.int32)
+            earn = np.empty((n, 3), dtype=np.int32)
+
+            i = 0
+            # Named cursor => the server holds the result set and ships batches.
+            with conn.cursor(name=f"od_{metro}") as cur:
+                cur.itersize = self._OD_BATCH
+                cur.execute(f"SELECT {cols} FROM metro_od_pairs WHERE {where}", args)
+                while True:
+                    batch = cur.fetchmany(self._OD_BATCH)
+                    if not batch:
+                        break
+                    a = np.asarray(batch, dtype=np.float64)
+                    k = a.shape[0]
+                    if i + k > n:  # table grew mid-read; keep what fits
+                        k = n - i
+                        a = a[:k]
+                        if k == 0:
+                            break
+                    h_lat[i:i + k] = a[:, 0]
+                    h_lon[i:i + k] = a[:, 1]
+                    w_lat[i:i + k] = a[:, 2]
+                    w_lon[i:i + k] = a[:, 3]
+                    jobs[i:i + k] = a[:, 4]
+                    age[i:i + k] = a[:, 5:8]
+                    earn[i:i + k] = a[:, 8:11]
+                    i += k
+
+        if i == 0:
+            return None
+        if i < n:  # rows vanished between the count and the read
+            h_lat, h_lon = h_lat[:i], h_lon[:i]
+            w_lat, w_lon = w_lat[:i], w_lon[:i]
+            jobs, age, earn = jobs[:i], age[:i], earn[:i]
+        return CommutePairs(h_lat=h_lat, h_lon=h_lon, w_lat=w_lat, w_lon=w_lon,
+                            jobs=jobs, age=age, earn=earn)
 
     def persona_csv_path(self) -> Optional[str]:
         # Personas stay file-based until the ACS-driven population lands.

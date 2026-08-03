@@ -161,6 +161,12 @@ class Agent:
 
         self.home = home
         self.work = work
+        # Straight-line distance the block point moved when snapped to the
+        # graph (see RoadNetwork.sample_commute). Charged as an access leg on
+        # trips starting or ending here; 0.0 when locations are graph nodes to
+        # begin with, which is the case for every fallback sampler.
+        self.home_access_km = 0.0
+        self.work_access_km = 0.0
         self.schedule = []
         self.current_activity_index = 0
         self.activity_end_time = 0
@@ -178,6 +184,18 @@ class Agent:
         self._base_loss_aversion = self.loss_aversion
         self._base_satisficing_threshold = self.satisficing_threshold
         self._refresh_behavior_from_survey()
+
+    def access_km(self, activity_type: str) -> float:
+        """Un-networked access distance for an activity anchored at this agent.
+
+        Leisure destinations are catalog POIs inserted into the graph as
+        mid-block nodes, so they carry no access gap.
+        """
+        if activity_type == "home":
+            return self.home_access_km
+        if activity_type == "work":
+            return self.work_access_km
+        return 0.0
 
     # ── Survey trait mapping ─────────────────────────────────────────────────
 

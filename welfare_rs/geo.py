@@ -160,15 +160,29 @@ class RoadNetwork:
         self._core_bounds: Optional[BBox] = None
         self._core_center: Optional[LatLon] = None
 
+        # Real block-level commutes (attach_commutes). When present these
+        # replace both provisional samplers: homes stop being uniform-within-
+        # county and workplaces stop being uniform-within-core.
+        self._commutes = None
+        self._commute_cum = None      # prefix sum of job weights
+        self._commute_total = 0.0
+
     def __getstate__(self) -> dict:
         """Exclude the lazily-rebuilt acceleration structures from pickling (so
         the disk cache stays small and isn't coupled to sklearn/scipy pickle
         versions); they rebuild on first use after a load. The graph + routing
-        caches (the expensive, reusable parts) are persisted."""
+        caches (the expensive, reusable parts) are persisted.
+
+        Commute pairs are dropped too — a metro can carry millions of them, and
+        every worker process re-attaches them from the datasource after loading
+        the warm pickle (see metro.build_metro_network), the same way POI rows
+        are fetched per worker rather than baked into the graph cache."""
         state = self.__dict__.copy()
         for k in ("_kdtree", "_kdtree_nodes", "_csr", "_csr_row", "_csr_nodes",
-                  "_csr_t", "_time_edge_len"):
+                  "_csr_t", "_time_edge_len",
+                  "_commutes", "_commute_cum"):
             state[k] = None
+        state["_commute_total"] = 0.0
         return state
 
     # ── construction ─────────────────────────────────────────────────────────
@@ -738,9 +752,10 @@ class RoadNetwork:
         """Random home: county drawn ∝ inbound workers, then core vs rest of
         county by that county's ``core_share``. Any intersection unlayered.
 
-        Provisional placement — the county weights say *where commuters live*;
-        within a pool nodes are uniform until ACS block-level homes replace
-        this via the datasource.
+        FALLBACK ONLY. This is the coarse placement used when no real commute
+        data is attached — the county weights say *where commuters live*, but
+        within a pool nodes are uniform. :meth:`sample_commute` supersedes it
+        whenever ``metro_od_pairs`` is available.
         """
         if not self.has_layers:
             return self.sample_node_latlon(rng)
@@ -751,6 +766,70 @@ class RoadNetwork:
         if not nodes:
             nodes = pool["core"] or pool["shell"]
         return self.node_latlon(rng.choice(nodes))
+
+    # ── real commutes (LODES block pairs) ────────────────────────────────────
+
+    def attach_commutes(self, pairs) -> None:
+        """Attach block-level home->work pairs as the placement distribution.
+
+        ``pairs`` is a :class:`welfare_rs.datasource.CommutePairs` (or None to
+        clear). Nothing is snapped here: a metro can hold millions of pairs and
+        a run draws at most a few thousand, so snapping is deferred to
+        :meth:`sample_commute` and served by the existing BallTree + snap cache.
+        """
+        if pairs is None or len(pairs) == 0:
+            self._commutes = None
+            self._commute_cum = None
+            self._commute_total = 0.0
+            return
+        weights = np.asarray(pairs.jobs, dtype=np.float64)
+        cum = np.cumsum(weights)
+        total = float(cum[-1])
+        if total <= 0:
+            self._commutes = None
+            self._commute_cum = None
+            self._commute_total = 0.0
+            return
+        self._commutes = pairs
+        self._commute_cum = cum
+        self._commute_total = total
+
+    @property
+    def has_commutes(self) -> bool:
+        return self._commutes is not None
+
+    @property
+    def num_commute_pairs(self) -> int:
+        return 0 if self._commutes is None else len(self._commutes)
+
+    def sample_commute(self, rng: random.Random):
+        """Draw one real commute, or None when no pairs are attached.
+
+        A pair is drawn with probability ∝ its LODES job count, so the commute
+        length distribution — and the home/work correlation that produces it —
+        matches the published data rather than two independent uniform draws.
+
+        Returns ``(home, work, home_access_km, work_access_km)``. The two
+        locations are the block internal points **snapped to the graph**; the
+        access distances are how far each snap moved, straight-line. That gap
+        is not noise to be discarded: outside the core the graph is arterials
+        only, so a suburban home can snap 1–3 km to the nearest arterial. The
+        caller charges that distance as an un-networked access leg
+        (:meth:`welfare_rs.Simulation._evaluate_modes`) instead of letting the
+        commute silently start from the arterial.
+        """
+        if self._commutes is None:
+            return None
+        x = rng.random() * self._commute_total
+        i = int(np.searchsorted(self._commute_cum, x, side="right"))
+        i = min(i, len(self._commute_cum) - 1)
+        c = self._commutes
+
+        h_true = (float(c.h_lat[i]), float(c.h_lon[i]))
+        w_true = (float(c.w_lat[i]), float(c.w_lon[i]))
+        home = self.snap_latlon(*h_true)
+        work = self.snap_latlon(*w_true)
+        return home, work, haversine_km(h_true, home), haversine_km(w_true, work)
 
     # ── stats ────────────────────────────────────────────────────────────────
 

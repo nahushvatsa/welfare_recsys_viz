@@ -221,9 +221,23 @@ frontend/.vite/
 data/metro/
 data/pois/
 data/poi_children_merged_by_wkt.csv
+# Census downloads (LODES OD .csv.gz, TIGER .zip) — staged into the census
+# schema, then only the derived serving tables matter. Re-downloadable.
+data/census/
 
 # ── Server DB schema + ETL (kept off the public repo by request) ──
 # Contains no credentials (passwords come from .env via psql -v / libpq env
 # vars), so this is a distribution choice, not a security one. Note the only
 # copy now lives on the server — back it up outside git.
 db/
+
+# ── Operator-only scripts (this host, not the model) ──
+# Wrappers that source .env, build a Postgres DSN and setsid/nohup themselves
+# so a warm survives an SSH drop. They encode one machine's layout and are
+# useless to anyone cloning; scripts/warm_metros.py is the portable entry point
+# they call. HANDOFF_MAC_WARM.md documents a resolved Overpass outage and names
+# the server, so it stays local too.
+scripts/warm_all.sh
+scripts/warm_until_done.sh
+scripts/verify_watcher.sh
+HANDOFF_MAC_WARM.md

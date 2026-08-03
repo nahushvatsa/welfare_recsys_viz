@@ -36,9 +36,11 @@ def main() -> None:
             print(f"  FAILED: {exc}", flush=True)
             continue
         core = len(net._core_nodes or [])
+        commutes = (f" · {net.num_commute_pairs:,} commute pairs"
+                    if net.has_commutes else " · NO commute pairs (fallback sampling)")
         print(
             f"  {net.num_base_nodes:,} intersections ({core:,} in core) · "
-            f"{net.num_edges:,} edges · {time.time() - t0:.0f}s",
+            f"{net.num_edges:,} edges{commutes} · {time.time() - t0:.0f}s",
             flush=True,
         )
 

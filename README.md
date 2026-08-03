@@ -20,23 +20,32 @@ DC, Miami, LA). Each is ONE road network thought of as two layers:
   Area), downloaded at full drive detail. Leisure **POIs and work locations
   exist only here**; leisure routing is street-level.
 * **Shell** — the surrounding counties that together send **90% of the
-  commuters** into the core (LODES-style flows), reduced to the arterial
-  skeleton (motorway/trunk/primary/secondary). Agent **homes** are sampled
-  here (and in the core), weighted by each county's commuter count. Dropping
-  residential capillaries outside the core is the standard MPO travel-model
-  abstraction and keeps metro graphs tractable.
+  commuters** into the core, reduced to the arterial skeleton
+  (motorway/trunk/primary/secondary). Dropping residential capillaries outside
+  the core is the standard MPO travel-model abstraction and keeps metro graphs
+  tractable.
+
+Agent **homes and workplaces come from real LODES8 commutes** (2023, JT01
+primary jobs). Each agent is one draw from `metro_od_pairs` — a
+`(home census block → work census block)` pair weighted by its job count — with
+both block internal points snapped onto the graph. Because the pair is drawn
+whole, home and work stay correlated and commute lengths follow the published
+distribution rather than two independent uniform draws. The county set that
+defines the shell is the same data grouped by home county, so the graph always
+covers the homes it needs to place. See `db/07_commute_tables.sql`.
 
 Cars route on **fastest network paths** (per-edge OSM speeds), so freeway
 commutes behave like freeway commutes; congestion and weather scale that time.
 
-**Data policy: all data lives on disk (or, later, the lab server's Postgres) —
-never in git.** The county-flow registry (`data/metro/metro_counties.json`,
-provisional hand-baked estimates), filtered POI CSVs, boundary polygons, and
-network caches are all local artifacts. `welfare_rs/datasource.py` is the one
-place that knows where data comes from: `LocalDataSource` (default) reads those
-files; `PostgresDataSource` serves identical shapes from the server DB — set
-`WELFARE_RS_DATASOURCE=postgres` and `WELFARE_RS_PG_DSN=postgresql://…` (table
-schemas are documented in that module).
+**Data policy: all data lives on disk (or the lab server's Postgres) — never in
+git.** The county-flow registry, filtered POI CSVs, commute pairs, boundary
+polygons, and network caches are all local artifacts.
+`welfare_rs/datasource.py` is the one place that knows where data comes from:
+`LocalDataSource` (default) reads those files; `PostgresDataSource` serves
+identical shapes from the server DB — set `WELFARE_RS_DATASOURCE=postgres` and
+`WELFARE_RS_PG_DSN=postgresql://…` (table schemas are documented in that
+module). Without commute data the engine falls back to its earlier provisional
+placement: a county-weighted home plus a uniform workplace inside the core.
 
 A metro's first-ever build geocodes boundaries (Nominatim) and downloads the
 graph (Overpass) — minutes to tens of minutes per metro. Prefetch everything

@@ -39,7 +39,7 @@ export default function Controls({
   const [agentsText, setAgentsText] = useState(String(config.num_agents));
   const [daysText, setDaysText] = useState(String(config.num_days));
   const [seedsText, setSeedsText] = useState(String(config.num_seeds));
-  const agents = validateInt(agentsText, 1, 5000);
+  const agents = validateInt(agentsText, 1, 100000);
   const days = validateInt(daysText, 1, 60);
   const seeds = validateInt(seedsText, 1, 12);
   const inputError = agents.error ?? days.error ?? seeds.error;
@@ -77,12 +77,12 @@ export default function Controls({
         <input
           type="number"
           min={1}
-          max={5000}
+          max={100000}
           value={agentsText}
           aria-invalid={agents.error ? true : undefined}
           onChange={(e) => {
             setAgentsText(e.target.value);
-            const v = validateInt(e.target.value, 1, 5000).value;
+            const v = validateInt(e.target.value, 1, 100000).value;
             if (v !== null) setConfig({ num_agents: v });
           }}
         />
@@ -104,15 +104,7 @@ export default function Controls({
         />
         {days.error && <span className="field-error">{days.error}</span>}
       </label>
-      <label>
-        Base random seed
-        <input
-          type="number"
-          value={config.seed}
-          onChange={(e) => setConfig({ seed: parseInt(e.target.value || "0", 10) })}
-        />
-      </label>
-      <label title="Number of random seeds to sweep. The study runs all of them (in parallel), reports Table 1 with σ_U = std across seeds, and lets you switch which seed the map shows. Seeds are base .. base+N−1.">
+      <label title="Number of random seeds to sweep. The study runs all of them (in parallel), reports Table 1 with σ_U = std across seeds, and lets you switch which seed the map shows. The base seed is drawn fresh on every run — the seeds used are listed with the results, so a study can be replayed by posting them to the API.">
         Seeds (run in parallel)
         <input
           type="number"
