@@ -10,6 +10,7 @@ into agent decision logic later.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -51,7 +52,19 @@ class Place:
     name: str
     category: str
     location: Coordinate
+    # Category tokens, shared by every POI of the same category. These feed the
+    # *relevance* term, which Jaccards them against the subtype's generic query
+    # tokens — so relevance measures category fit and is near-constant within a
+    # subtype. It carries no agent-specific information, by design.
     keywords: Tuple[str, ...] = field(default_factory=tuple)
+    # Taste tags recovered from the business name (welfare_rs.tastes): "pizza",
+    # "yoga", "jazz". Deliberately NOT in ``keywords``: relevance compares
+    # keywords against tokens that are *identical* to the category keywords, so
+    # a restaurant scores a perfect 1.0 today and appending "thai" would grow
+    # the union without growing the intersection — a 25% relevance penalty for
+    # being well-labelled. These drive the agent's own utility and the
+    # personalization the platform learns, never relevance.
+    taste_tags: Tuple[str, ...] = field(default_factory=tuple)
     rating: float = 0.0
     review_count: int = 0
     popularity: float = 0.0
@@ -196,13 +209,34 @@ def _token_overlap_score(tokens_a: Iterable[str], tokens_b: Iterable[str]) -> fl
 class RecommenderSystem(ABC):
     """Base interface for recommenders."""
 
-    def __init__(self, name: str, catalog: Sequence[Place], dynamics: Optional[PlaceDynamics] = None):
+    def __init__(
+        self,
+        name: str,
+        catalog: Sequence[Place],
+        dynamics: Optional[PlaceDynamics] = None,
+        learning_rate: Optional[float] = None,
+        keyword_discount: Optional[float] = None,
+    ):
+        from . import params
+
+        fp = params.FEEDBACK_PARAMS
         self.name = name
         self.catalog = list(catalog)
         self.place_by_id = {p.place_id: p for p in self.catalog}
         # Shared live rating/review/popularity state; None falls back to the
         # static values baked into each Place.
         self.dynamics = dynamics
+        # How fast feedback moves the user model. Read from FEEDBACK_PARAMS
+        # rather than hardcoded at the call site, so it is one of the knobs a
+        # builder-defined recommender can actually set.
+        self.learning_rate = (
+            fp["rs_learning_rate"] if learning_rate is None else float(learning_rate)
+        )
+        self.keyword_discount = (
+            fp["keyword_affinity_discount"]
+            if keyword_discount is None
+            else float(keyword_discount)
+        )
         self.user_place_affinity: Dict[int, Dict[str, float]] = {}
         self.user_keyword_affinity: Dict[int, Dict[str, float]] = {}
 
@@ -233,11 +267,19 @@ class RecommenderSystem(ABC):
         return [p for p in self.catalog if p.category in allowed]
 
     def _personalization_score(self, user_id: int, place: Place) -> float:
-        """Return personalized score in [0, 1] from learned user affinities."""
+        """Return personalized score in [0, 1] from learned user affinities.
+
+        Two learned signals: affinity for this exact POI, and affinity for the
+        *kinds* of place it is (its taste tags). The second is what lets the
+        platform generalise — having liked two Thai restaurants it can favour a
+        third it has never sent anyone to. Tags, not ``keywords``: category
+        keywords are identical for every candidate in a subtype, so learning
+        them would only ever add a constant.
+        """
         place_affinity = self.user_place_affinity.get(user_id, {}).get(place.place_id, 0.0)
         kw_aff = self.user_keyword_affinity.get(user_id, {})
-        if place.keywords:
-            kw_vals = [kw_aff.get(k.lower(), 0.0) for k in place.keywords]
+        if place.taste_tags:
+            kw_vals = [kw_aff.get(k.lower(), 0.0) for k in place.taste_tags]
             kw_affinity = sum(kw_vals) / len(kw_vals)
         else:
             kw_affinity = 0.0
@@ -251,13 +293,18 @@ class RecommenderSystem(ABC):
         place_id: str,
         liked: bool,
         feedback_strength: float = 1.0,
-        learning_rate: float = 0.12,
+        learning_rate: Optional[float] = None,
     ) -> None:
-        """Update user personalization state from feedback."""
+        """Update user personalization state from feedback.
+
+        ``learning_rate`` defaults to this recommender's own configured rate, so
+        a builder-defined recommender that learns fast or slow actually does.
+        """
         place = self.place_by_id.get(place_id)
         if place is None:
             return
-        delta = learning_rate * max(0.2, min(2.0, feedback_strength))
+        rate = self.learning_rate if learning_rate is None else learning_rate
+        delta = rate * max(0.2, min(2.0, feedback_strength))
         if not liked:
             delta *= -1.0
 
@@ -266,10 +313,10 @@ class RecommenderSystem(ABC):
         up[place_id] = max(-1.0, min(1.0, old_place + delta))
 
         uk = self.user_keyword_affinity.setdefault(user_id, {})
-        for keyword in place.keywords:
+        for keyword in place.taste_tags:
             k = keyword.lower()
             old_kw = uk.get(k, 0.0)
-            uk[k] = max(-1.0, min(1.0, old_kw + 0.7 * delta))
+            uk[k] = max(-1.0, min(1.0, old_kw + self.keyword_discount * delta))
 
 
 class GoogleMapsReplica(RecommenderSystem):
@@ -431,6 +478,328 @@ class PopularityRecommender(RecommenderSystem):
             )
         scored.sort(key=lambda r: r.score, reverse=True)
         return scored[: max(1, top_k)]
+
+
+#: Review count treated as "as prominent as it gets". Fixed rather than
+#: min-maxed over the candidate set, so the reviews component means the same
+#: thing in every call and in every condition — see ConfigurableRecommender.
+REVIEW_REFERENCE = 5000.0
+
+
+@dataclass(frozen=True)
+class RecommenderConfig:
+    """A recommender the user built: six component weights and two shapes.
+
+    Weights are renormalized to sum to 1 at construction, and every component is
+    bounded in [0, 1], so the resulting score is in [0, 1] **for every
+    configuration**. That is what makes scores comparable — see the class
+    docstring of :class:`ConfigurableRecommender` for why the previous design
+    was not.
+    """
+
+    label: str = "Custom RS"
+    w_rating: float = 0.20
+    w_reviews: float = 0.15
+    w_relevance: float = 0.10
+    w_proximity: float = 0.25
+    w_popularity: float = 0.20
+    w_personalization: float = 0.10
+    #: Proximity decays as exp(-d / distance_scale_km).
+    distance_scale_km: float = 5.0
+    #: Exponent on relative footfall. 0 ignores popularity entirely (the term
+    #: becomes a constant), 1 is linear in relative footfall, >1 concentrates
+    #: demand on whatever is already winning. This is the dial on the
+    #: rich-get-richer loop.
+    popularity_gamma: float = 1.0
+    #: Feedback -> user-model step size, and the discount applied to tag
+    #: affinity relative to place affinity.
+    learning_rate: float = 0.12
+    keyword_discount: float = 0.70
+    #: Uniform-random ranking, ignoring every weight above. The control arm.
+    random_ranking: bool = False
+
+
+#: Named starting points for the builder. Each is a set of values for the SAME
+#: knobs — the platforms differ by which weights are zero, not by having
+#: different machinery. "Google Maps" is proximity-led with no footfall term;
+#: "OpenTable" is footfall-led with no proximity term. That is exactly the
+#: design difference the two original classes encoded.
+RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
+    "Google Maps": {
+        "w_rating": 0.25, "w_reviews": 0.20, "w_relevance": 0.10,
+        "w_proximity": 0.35, "w_popularity": 0.00, "w_personalization": 0.10,
+        "distance_scale_km": 5.0, "popularity_gamma": 1.0,
+    },
+    "OpenTable": {
+        "w_rating": 0.20, "w_reviews": 0.25, "w_relevance": 0.10,
+        "w_proximity": 0.00, "w_popularity": 0.35, "w_personalization": 0.10,
+        "distance_scale_km": 5.0, "popularity_gamma": 1.0,
+    },
+    "Balanced hybrid": {
+        "w_rating": 0.18, "w_reviews": 0.14, "w_relevance": 0.10,
+        "w_proximity": 0.25, "w_popularity": 0.18, "w_personalization": 0.15,
+        "distance_scale_km": 5.0, "popularity_gamma": 1.0,
+    },
+    "Personalized": {
+        "w_rating": 0.15, "w_reviews": 0.10, "w_relevance": 0.10,
+        "w_proximity": 0.20, "w_popularity": 0.10, "w_personalization": 0.35,
+        "distance_scale_km": 5.0, "popularity_gamma": 1.0,
+    },
+    "Viral": {
+        "w_rating": 0.10, "w_reviews": 0.10, "w_relevance": 0.05,
+        "w_proximity": 0.10, "w_popularity": 0.60, "w_personalization": 0.05,
+        "distance_scale_km": 5.0, "popularity_gamma": 2.0,
+    },
+    "Random": {"random_ranking": True},
+}
+
+
+class ConfigurableRecommender(RecommenderSystem):
+    """One scorer with six weighted components, each bounded in [0, 1].
+
+    ``score = Σ wᵢ · cᵢ`` with ``Σ wᵢ = 1``, so the score is itself in [0, 1] no
+    matter how it is configured.
+
+    That bound is the point. The two recommenders this replaces were not
+    comparable: ``PopularityRecommender`` min-max normalized its output, so its
+    top candidate always scored ~1.0, while ``GoogleMapsReplica`` emitted a raw
+    weighted sum topping out near 0.75. Since the agent takes a raw ``max`` over
+    every platform's output, the popularity platform structurally won every
+    contest it entered — a scale artifact, not a behavioural result. It also
+    leaked into acceptance, because eta reads ``score - 0.5``.
+
+    Components:
+
+    ``rating``          effective stars / 5 — moves as agents like and dislike.
+    ``reviews``         ``log1p(n) / log1p(REVIEW_REFERENCE)``, capped at 1.
+    ``relevance``       category fit; near-constant within a subtype by design.
+    ``proximity``       ``exp(-d / distance_scale_km)``, straight-line.
+    ``popularity``      relative footfall ``(v / v_max) ** popularity_gamma``.
+    ``personalization`` learned per-agent affinity, the only personal channel.
+    """
+
+    def __init__(
+        self,
+        catalog: Sequence[Place],
+        config: Optional[RecommenderConfig] = None,
+        dynamics: Optional[PlaceDynamics] = None,
+        coord_distance_km=haversine_km,
+    ):
+        cfg = config or RecommenderConfig()
+        super().__init__(
+            name=cfg.label,
+            catalog=catalog,
+            dynamics=dynamics,
+            learning_rate=cfg.learning_rate,
+            keyword_discount=cfg.keyword_discount,
+        )
+        self.config = cfg
+        raw = {
+            "rating": max(0.0, cfg.w_rating),
+            "reviews": max(0.0, cfg.w_reviews),
+            "relevance": max(0.0, cfg.w_relevance),
+            "proximity": max(0.0, cfg.w_proximity),
+            "popularity": max(0.0, cfg.w_popularity),
+            "personalization": max(0.0, cfg.w_personalization),
+        }
+        total = sum(raw.values())
+        # An all-zero weight vector would make every candidate score 0 and the
+        # ranking an artifact of catalog order; fall back to uniform.
+        self.weights = (
+            {k: v / total for k, v in raw.items()}
+            if total > 0
+            else {k: 1.0 / len(raw) for k in raw}
+        )
+        self.distance_scale_km = max(0.1, cfg.distance_scale_km)
+        self.popularity_gamma = max(0.0, cfg.popularity_gamma)
+        self.random_ranking = bool(cfg.random_ranking)
+        self.coord_distance_km = coord_distance_km
+        self._place_tokens: Dict[str, frozenset] = {
+            p.place_id: _normalize_tokens(p.keywords) for p in self.catalog
+        }
+
+    # ── Components (each returns a value in [0, 1]) ──────────────────────────
+
+    def _rating_component(self, place: Place) -> float:
+        return max(0.0, min(5.0, self._rating(place))) / 5.0
+
+    def _reviews_component(self, place: Place) -> float:
+        n = max(0, self._review_count(place))
+        return min(1.0, math.log1p(n) / math.log1p(REVIEW_REFERENCE))
+
+    def _relevance_component(
+        self, place: Place, query_set: frozenset, interest_set: frozenset
+    ) -> float:
+        tokens = self._place_tokens.get(place.place_id) or _normalize_tokens(place.keywords)
+        return 0.75 * _jaccard(tokens, query_set) + 0.25 * _jaccard(tokens, interest_set)
+
+    def _proximity_component(self, place: Place, user: UserContext) -> float:
+        dist_km = self.coord_distance_km(user.location, place.location)
+        return math.exp(-dist_km / self.distance_scale_km)
+
+    def _popularity_components(
+        self, places: Sequence[Place]
+    ) -> Optional[Dict[str, float]]:
+        """Relative footfall raised to gamma, or ``None`` when uninformative.
+
+        Relative to the busiest candidate rather than to an absolute scale, so
+        the term keeps discriminating as footfall accumulates over a run.
+
+        Before anyone has been anywhere, every candidate has zero footfall and
+        the signal does not exist yet. Returning ``None`` rather than a column of
+        zeros matters: a zero would be *averaged in* as though the platform had
+        looked and found nothing to like, capping a recommender that puts 60% of
+        its weight on popularity at a score of 0.40 on day one. Because eta reads
+        ``score - 0.5``, that would depress its acceptance rate for the whole
+        cold-start period — a weight-allocation artifact masquerading as a
+        behavioural difference between arms. The caller instead drops the term
+        and renormalizes over the components that do exist.
+        """
+        raw = [max(0.0, self._popularity(p)) for p in places]
+        peak = max(raw) if raw else 0.0
+        if peak <= 0.0:
+            return None
+        return {
+            places[i].place_id: (raw[i] / peak) ** self.popularity_gamma
+            for i in range(len(places))
+        }
+
+    def _query_interest_sets(self, user: UserContext, leisure_subtype: str):
+        query_tokens = list(user.query_keywords) or list(
+            LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS.get(leisure_subtype, ())
+        )
+        return _normalize_tokens(query_tokens), _normalize_tokens(user.interest_keywords)
+
+    def _random_score(self, user_id: int, place_id: str) -> float:
+        """Stable pseudo-random score for the control arm.
+
+        Hashed rather than drawn from an RNG so it does not consume the
+        simulation's random stream — a control condition must not shift every
+        downstream draw and thereby change the agents' behaviour it is meant to
+        be a baseline for.
+        """
+        digest = hashlib.md5(f"{user_id}|{place_id}".encode("utf-8")).hexdigest()[:8]
+        return int(digest, 16) / 0xFFFFFFFF
+
+    def recommend(
+        self, user: UserContext, leisure_subtype: str, top_k: int = 5
+    ) -> List[Recommendation]:
+        candidates = self._filter_by_subtype(leisure_subtype)
+        if not candidates:
+            return []
+
+        if self.random_ranking:
+            scored = [
+                Recommendation(
+                    source=self.name,
+                    place=p,
+                    score=self._random_score(user.user_id, p.place_id),
+                    components={"random": 1.0},
+                )
+                for p in candidates
+            ]
+            scored.sort(key=lambda r: (-r.score, r.place.place_id))
+            return scored[: max(1, top_k)]
+
+        popularity_by_id = self._popularity_components(candidates)
+        query_set, interest_set = self._query_interest_sets(user, leisure_subtype)
+
+        # Score over the components that carry signal. On a cold start the
+        # popularity column does not exist yet, so its weight is redistributed
+        # across the rest rather than counted as a zero — keeping the score on
+        # the same [0, 1] scale for every configuration, which is what the
+        # cross-arm comparison and eta's quality term both depend on.
+        w = dict(self.weights)
+        cold_start_blind = False
+        if popularity_by_id is None:
+            popularity_weight = w.pop("popularity", 0.0)
+            remaining = sum(w.values())
+            if remaining > 0:
+                w = {k: v / remaining for k, v in w.items()}
+            elif popularity_weight > 0:
+                # A pure-popularity recommender before anyone has been anywhere
+                # has nothing whatsoever to rank on. Scoring every candidate
+                # equally is correct, but it cannot be left there: the sort
+                # below breaks ties on place_id, so every agent would be handed
+                # the same alphabetically-first POI, that POI would take the
+                # whole first day's footfall, and it would then lead the
+                # popularity term forever. The run would show massive
+                # concentration produced entirely by a tie-break. Fall back to
+                # the per-user random order until footfall exists.
+                cold_start_blind = True
+
+        scored: List[Recommendation] = []
+        for place in candidates:
+            components = {
+                "rating": self._rating_component(place),
+                "reviews": self._reviews_component(place),
+                "relevance": self._relevance_component(place, query_set, interest_set),
+                "proximity": self._proximity_component(place, user),
+                "popularity": (
+                    popularity_by_id.get(place.place_id, 0.0)
+                    if popularity_by_id is not None
+                    else 0.0
+                ),
+                "personalization": self._personalization_score(user.user_id, place),
+            }
+            score = (
+                self._random_score(user.user_id, place.place_id)
+                if cold_start_blind
+                else sum(weight * components[k] for k, weight in w.items())
+            )
+            scored.append(
+                Recommendation(
+                    source=self.name, place=place, score=score, components=components
+                )
+            )
+        # Tie-break on place_id: ties are common (identical synthetic ratings,
+        # zero footfall on day 1) and Python's sort is stable, so without this
+        # the winner would be decided by catalog order.
+        scored.sort(key=lambda r: (-r.score, r.place.place_id))
+        return scored[: max(1, top_k)]
+
+
+class SingleRecommenderOrchestrator:
+    """Adapts one :class:`ConfigurableRecommender` to the orchestrator interface.
+
+    The four "platforms" of :class:`LeisureRSOrchestrator` were two algorithms
+    wearing four badges — ``opentable``, ``spotify_ticketmaster`` and
+    ``classpass`` were the same class with the same config, differing only in
+    which subtype routed to them. A study arm is now one algorithm serving every
+    subtype, which is what makes a row of the results table mean one thing.
+    """
+
+    def __init__(self, recommender: ConfigurableRecommender):
+        self.recommender = recommender
+
+    @property
+    def name(self) -> str:
+        return self.recommender.name
+
+    def recommend(
+        self, user: UserContext, leisure_subtype: str, top_k_per_system: int = 5
+    ) -> Dict[str, List[Recommendation]]:
+        return {
+            self.recommender.name: self.recommender.recommend(
+                user, leisure_subtype, top_k=top_k_per_system
+            )
+        }
+
+    def record_feedback(
+        self,
+        user_id: int,
+        source: str,
+        place_id: str,
+        liked: bool,
+        feedback_strength: float = 1.0,
+    ) -> None:
+        del source  # single recommender: the source is always this one
+        self.recommender.record_feedback(
+            user_id=user_id,
+            place_id=place_id,
+            liked=liked,
+            feedback_strength=feedback_strength,
+        )
 
 
 class LeisureRSOrchestrator:

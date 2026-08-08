@@ -43,17 +43,49 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import (CITIES, TREATMENTS, RunConfig, manager, precomputed_cities,
-                     warmed_cities)
+from service import (CITIES, CONTROL, MAX_RECOMMENDERS, TREATMENTS, RunConfig,
+                     manager, precomputed_cities, warmed_cities)
+from welfare_rs.recommender_systems import RECOMMENDER_PRESETS
 
-app = FastAPI(title="welfare-rs", version="0.1.0")
+# Interactive docs are opt-in. The OpenAPI schema is a machine-readable manual
+# for this API — including the exact ceilings on POST /api/runs, the one
+# endpoint that costs real CPU — so a public deployment does not advertise it.
+# Set WELFARE_RS_DOCS=1 (dev, or a temporary debugging session) to get it back.
+_DOCS = os.environ.get("WELFARE_RS_DOCS", "").strip().lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="welfare-rs",
+    version="0.1.0",
+    docs_url="/docs" if _DOCS else None,
+    redoc_url="/redoc" if _DOCS else None,
+    openapi_url="/openapi.json" if _DOCS else None,
+)
+
+# Which *other websites* may drive this API from a visitor's browser. In
+# production the SPA is served from the same origin as /api, so it needs no
+# grant at all and only the dev-server ports below do anything.
+#
+# This is not access control: the API stays reachable by curl or any script
+# regardless, and CORS is enforced by browsers alone. What it stops is the
+# specific trick of a third-party page firing POST /api/runs from every visitor
+# it gets — which the previous "*" (plus allow_methods="*") explicitly
+# permitted, since the preflight for a JSON POST was answered with yes.
+# Override with a comma-separated WELFARE_RS_CORS_ORIGINS.
+_DEFAULT_ORIGINS = (
+    "https://airecsim.cusp.nyu.edu,http://localhost:5173,http://127.0.0.1:5173"
+)
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("WELFARE_RS_CORS_ORIGINS", _DEFAULT_ORIGINS).split(",")
+    if o.strip()
+]
 
 app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev: Vite serves the frontend from another origin
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["content-type"],
 )
 
 _BBOX = tuple[float, float, float, float]
@@ -106,6 +138,16 @@ def health() -> dict:
 def cities() -> dict:
     return {
         "cities": [{"key": k, "label": label} for k, label in CITIES],
+        # Starting points for the recommender builder. Each is a set of values
+        # for the SAME knobs — a "platform" differs by which weights it zeroes,
+        # not by having different machinery — so the UI can seed its sliders
+        # from one and let the user take it anywhere from there.
+        "presets": [
+            {"name": name, **values} for name, values in RECOMMENDER_PRESETS.items()
+        ],
+        "control": CONTROL,
+        "max_recommenders": MAX_RECOMMENDERS,
+        # Deprecated fixed vocabulary, still accepted on POST /api/runs.
         "treatments": TREATMENTS,
         "pois_available": manager.pois_available(),  # per-city: {key: bool}
         # Advisory: every city above can be selected, but an unwarmed one
@@ -266,9 +308,34 @@ def pois(
 
 # ── Static frontend (built React app), mounted last so /api wins ──────────────
 
+class _CachedStaticFiles(StaticFiles):
+    """StaticFiles with cache headers that match how Vite names its output.
+
+    Starlette sends only ETag and Last-Modified, no ``Cache-Control``. A browser
+    facing a response with no ``Cache-Control`` is free to apply *heuristic*
+    caching — typically a fraction of the time since Last-Modified — and reuse it
+    without revalidating. For the hashed assets that is harmless; for
+    ``index.html`` it is not, because index.html is the only thing that names
+    which bundle to load. A stale copy keeps pointing at the previous build, so a
+    deploy silently does nothing until the user happens to hard-refresh.
+
+    So: assets are content-hashed and safe to keep forever, while any HTML must
+    be revalidated on every load. ``no-cache`` does not mean "do not store" — the
+    ETag still makes it a cheap 304 when nothing has changed.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.startswith("assets/") and "." in path.rsplit("/", 1)[-1]:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 _FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend", "dist")
 if os.path.isdir(_FRONTEND_DIST):
-    app.mount("/", StaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
+    app.mount("/", _CachedStaticFiles(directory=_FRONTEND_DIST, html=True), name="frontend")
 else:
     @app.get("/")
     def _no_frontend() -> dict:

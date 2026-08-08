@@ -132,11 +132,61 @@ Legacy single-area presets (`build_road_network("nyc_manhattan")`, …) still
 work for engine-level experiments; the app itself only surfaces the 8 metros.
 
 
-## 5. HTTP API (under `/api`)
+## 5. Recommenders: one scorer, many configurations
+
+A study is the **No-RS control** plus up to five recommenders the user builds in
+the sidebar. Every recommender is the *same* scorer with different knob values —
+the presets ("Google Maps", "OpenTable", "Viral", …) differ by which weights they
+zero out, not by having different machinery:
+
+| Knob | Meaning |
+|---|---|
+| `w_rating` / `w_reviews` | POI prominence; both move as agents leave feedback |
+| `w_relevance` | category fit — near-constant within a subtype, and impersonal by design |
+| `w_proximity` | `exp(-d / distance_scale_km)`, straight-line |
+| `w_popularity` | live footfall relative to the busiest candidate — the feedback loop |
+| `w_personalization` | learned per-agent affinity; the only personal channel |
+| `popularity_gamma` | exponent on relative footfall: <1 flattens, >1 concentrates |
+| `learning_rate` | how fast feedback moves the user model |
+| `welfare_gate` | optional PUP / RM filter on top of the ranking |
+
+Weights are renormalized to sum to 1 and every component is bounded in [0, 1], so
+**scores are comparable across configurations**. That matters: the previous
+design had `PopularityRecommender` min-max normalizing (top candidate always
+~1.0) while `GoogleMapsReplica` emitted a raw weighted sum topping out near 0.75,
+so the popularity platform structurally won every cross-platform comparison and
+inflated acceptance (eta reads `score - 0.5`) for reasons that were pure scale.
+
+On a cold start the popularity column does not exist yet; its weight is
+redistributed over the remaining components rather than counted as a zero, which
+would otherwise cap a popularity-heavy recommender at a low score for the whole
+warm-up.
+
+### Latent tastes
+
+Each POI carries taste tags recovered from its business name ("Joe's Pizza" →
+`pizza`); each agent holds a latent favourite per family (`dining`, `cafe`,
+`fitness`, `outdoor`, `culture`, `music`), drawn from the catalog's own supply mix
+with a tempering exponent `beta` (`welfare_rs/tastes.py`).
+
+The recommenders **cannot see** the taste. It moves the agent's realised activity
+utility, that utility drives like/dislike feedback, and personalization infers the
+taste from there — so taste discovery is a genuine learning problem rather than a
+lookup. Two caveats worth knowing:
+
+* Only ~50% of real POIs name their type, and *which* ones do is biased (pizza and
+  thai self-label; korean and new-american almost never). Unlabelled venues are
+  **imputed** a tag from the observed distribution for their family, keyed on a
+  hash of the place id, rather than being scored as "definitely not thai" —
+  which would have been a systematic penalty on half the catalog.
+* Tastes are sampled from name-identifiable venue frequency, which is a proxy for
+  cuisine demand, not a measurement of it.
+
+## 6. HTTP API (under `/api`)
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET  | `/api/cities` | the 8 metros, treatments, per-city POI availability, default config |
+| GET  | `/api/cities` | the 8 metros, recommender presets, per-city POI availability, default config |
 | POST | `/api/runs` | start (or hit cached) run → `run_id` |
 | GET  | `/api/runs/{id}` | run summary + view/bounds/metrics |
 | GET  | `/api/runs/{id}/events` | SSE per-day progress |
@@ -147,7 +197,7 @@ work for engine-level experiments; the app itself only surfaces the 8 metros.
 
 Interactive docs at `/docs` (FastAPI/Swagger). `bbox` is `south,west,north,east`.
 
-## 6. POI data
+## 7. POI data
 
 Real POIs come from small per-metro CSVs
 (`<cache>/pois/<metro>_leisure_pois.csv`), each produced by one streaming pass

@@ -592,6 +592,33 @@ CATALOG_PARAMS: dict = {
     "osm_places_per_category": (6, 14),
 }
 
+# ── Latent tastes (welfare_rs.tastes) ────────────────────────────────────────
+#
+# Each POI carries taste tags recovered from its business name ("Joe's Pizza" ->
+# pizza); each agent holds a latent favourite per taste family. The tag is NOT
+# visible to the recommenders — it moves the agent's own realised activity
+# utility, and the platform can only infer it from the like/dislike feedback
+# that utility produces. That makes personalization a genuine discovery problem
+# rather than a lookup.
+
+TASTE_PARAMS: dict = {
+    # Extra activity utility when the visited POI matches a taste in its family.
+    # Sized against LEISURE_SEGMENTS' activity_utility (0.35-0.70), so a match is
+    # worth roughly a quarter of a typical outing's benefit: enough to move
+    # feedback and welfare, not enough to swamp the travel-cost trade-off that
+    # the spatial metrics measure.
+    "match_bonus": 0.15,
+    # Tempering exponent on the supply-derived taste distribution. Weights go as
+    # ``share ** beta``: 1.0 tracks the observed venue mix exactly, 0.0 is
+    # uniform. Below 1 flattens the head, correcting the two biases that inflate
+    # it (self-labelling venues are over-counted; small-format types need more
+    # premises per unit demand) and ensuring some agents want something locally
+    # scarce — without that, taste never moves anyone anywhere.
+    "beta": 0.7,
+    # Favourites per family; 0 = scale to the family's variety (~1 per 8 types).
+    "per_family": 0,
+}
+
 # ── Dynamic POI prominence (PlaceDynamics) ───────────────────────────────────
 #
 # Live per-POI state accumulated during a run: every leisure visit (recommended

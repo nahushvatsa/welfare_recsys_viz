@@ -3,6 +3,7 @@ import Controls, { type RunStatus } from "./components/Controls";
 import MapView from "./components/MapView";
 import Results from "./components/Results";
 import RunList from "./components/RunList";
+import { BLANK_SPEC } from "./components/RecommenderBuilder";
 import { cancelRun, createRun, fetchRun, getCities, getRun, subscribeProgress } from "./api";
 import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "./types";
 
@@ -59,7 +60,19 @@ export default function App() {
         // `prev ?? defaults` because a ?run= attach may have already loaded that
         // run's settings into the form; this fetch resolving later must not
         // clobber them. Whichever lands first, the adopted run wins.
-        setConfigState((prev) => prev ?? c.defaults);
+        //
+        // The server's default recommender list is empty (a control-only study
+        // is valid), but an empty builder is a poor first screen — seed it with
+        // the first preset so there is something to run and something to edit.
+        setConfigState((prev) => {
+          if (prev) return prev;
+          const seeded = c.presets[0]
+            ? [{ ...BLANK_SPEC, ...c.presets[0], label: c.presets[0].name }]
+            : [];
+          return { ...c.defaults, recommenders: c.defaults.recommenders?.length
+            ? c.defaults.recommenders
+            : seeded };
+        });
       })
       .catch((e) => setError(`Could not reach backend: ${e.message}`));
   }, []);

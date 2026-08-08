@@ -167,3 +167,104 @@ body { background: var(--bg); color: var(--ink); }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .chart-grid { grid-template-columns: 1fr; }
 }
+
+/* ── Recommender builder ──────────────────────────────────────────────────── */
+/* Chart tokens live on :root so the SVG charts can reference them the same way
+   the rest of the app does, instead of hardcoding hexes in TSX. */
+:root {
+  --fg: var(--ink);
+  --chart-axis: #9aa1ae;
+  --chart-grid: #e7e9ee;
+  --chart-tooltip-bg: #ffffff;
+}
+
+.builder { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.rec-card { border: 1px solid var(--border); border-radius: 7px; background: #fff; padding: 7px 9px; }
+.rec-card.open { border-color: var(--accent); }
+.rec-card.control { background: #fafbfc; }
+.rec-card-head { display: flex; align-items: center; gap: 6px; }
+.rec-toggle {
+  flex: 1; display: flex; align-items: center; gap: 6px; background: none; border: 0;
+  padding: 0; cursor: pointer; font-size: 13px; color: var(--ink); text-align: left;
+}
+.rec-toggle .chev { color: var(--muted); font-size: 10px; width: 10px; }
+.rec-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rec-remove {
+  background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 13px;
+  padding: 0 2px; line-height: 1;
+}
+.rec-remove:hover { color: #dc2626; }
+.rec-remove:disabled { opacity: .4; cursor: default; }
+.rec-chips { font-size: 11px; color: var(--muted); margin-top: 3px; padding-left: 16px; }
+
+.rec-body { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.rec-body h5 { margin: 12px 0 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+.rec-field { display: block; font-size: 12px; margin: 8px 0; }
+.rec-field input[type="text"], .rec-field select {
+  width: 100%; margin-top: 4px; padding: 5px 7px;
+  border: 1px solid var(--border); border-radius: 5px; font-size: 13px; background: #fff;
+}
+.rec-weight { display: block; margin: 6px 0; font-size: 12px; }
+.rec-weight-head { display: flex; justify-content: space-between; align-items: baseline; }
+.rec-weight-head b { font-variant-numeric: tabular-nums; color: var(--accent); }
+.rec-weight input[type="range"] { width: 100%; margin-top: 2px; }
+
+.add-rec { margin-top: 4px; }
+.add-rec > summary {
+  cursor: pointer; font-size: 13px; font-weight: 600; color: var(--accent);
+  padding: 7px 9px; border: 1px dashed var(--border); border-radius: 7px; list-style: none;
+}
+.add-rec > summary::-webkit-details-marker { display: none; }
+.add-rec > summary:hover { border-color: var(--accent); background: rgba(59,130,246,.05); }
+.preset-list { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.preset-btn {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  text-align: left; padding: 7px 9px; border: 1px solid var(--border);
+  border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; width: 100%;
+}
+.preset-btn:hover { border-color: var(--accent); background: rgba(59,130,246,.05); }
+
+/* ── Results dashboard ────────────────────────────────────────────────────── */
+.results-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+.tabs { display: flex; gap: 2px; background: #eef0f3; padding: 3px; border-radius: 8px; }
+.tab {
+  border: 0; background: none; padding: 6px 13px; border-radius: 6px;
+  font-size: 12.5px; color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.tab:hover { color: var(--ink); }
+.tab.active { background: #fff; color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.07); }
+
+.panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 4px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 14px 8px; min-width: 0; }
+.panel.wide { grid-column: 1 / -1; }
+.panel h4 { margin: 0 0 4px; font-size: 13px; }
+.panel-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+
+.table-scroll { overflow-x: auto; }
+.metrics-table .row-control td { color: var(--muted); }
+.swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+.inline-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.inline-picker select { padding: 3px 6px; font-size: 12px; border: 1px solid var(--border); border-radius: 5px; background: #fff; }
+
+/* Heatmap: a CSS grid, not a chart — every cell prints its own number, which is
+   both more readable than a colour key and reachable by a screen reader. */
+.heatmap-scroll { overflow-x: auto; padding-bottom: 4px; }
+.heatmap { display: grid; gap: 2px; font-size: 11px; font-variant-numeric: tabular-nums; min-width: 420px; }
+.hm-corner, .hm-colhead, .hm-rowhead { color: var(--muted); font-size: 10.5px; padding: 4px 6px; }
+.hm-colhead { text-align: center; font-weight: 600; }
+.hm-rowhead { text-align: right; font-weight: 600; white-space: nowrap; }
+.hm-cell { padding: 7px 6px; text-align: center; border-radius: 3px; }
+
+/* Spatial welfare map */
+.welfare-map-controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.welfare-map-canvas { height: 420px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+.welfare-legend { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.legend-ramp {
+  flex: 1; max-width: 220px; height: 9px; border-radius: 5px;
+  background: linear-gradient(90deg, #b44e0c, #d6823e, #ebbe96, #aac3e6, #568ad2, #1c52ac);
+}
+.legend-range { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 1100px) {
+  .panel-grid { grid-template-columns: 1fr; }
+}

@@ -34,6 +34,7 @@ the **last (evaluation) day's** leisure trips per run, then aggregated across se
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import sys
 
@@ -52,6 +53,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from welfare_rs import metrics as sim_metrics
 from welfare_rs import params, routing_matrix
 from welfare_rs.datasource import get_datasource
 from welfare_rs.experiment_harness import (
@@ -61,14 +63,30 @@ from welfare_rs.experiment_harness import (
 )
 from welfare_rs.geo import haversine_km
 from welfare_rs.metro import build_network
+from welfare_rs.recommender_systems import RECOMMENDER_PRESETS, RecommenderConfig
 from welfare_rs.simulation import Simulation, SimulationCancelled
 
 import viz
 
-# ── Treatments / cities ──────────────────────────────────────────────────────
+# ── Recommenders / cities ────────────────────────────────────────────────────
 
+#: The No-RS control. Always run, never a choice: it is the baseline every
+#: paired comparison is defined against.
+CONTROL = "No RS"
+
+#: Welfare gates a built recommender may wear on top of its ranking.
+WELFARE_GATES = ("pup", "rm", "pup_rm")
+
+#: Ceiling on user-built recommenders in one study (the control is extra).
+#: Cost and retained map geometry both scale linearly in arms.
+MAX_RECOMMENDERS = 5
+
+#: Ceiling on points in the spatial welfare map. Well past what a hexbin can
+#: resolve, and it keeps the run payload bounded regardless of population.
+WELFARE_MAP_MAX_POINTS = 20000
+
+#: Deprecated fixed vocabulary, kept so saved API calls still resolve.
 TREATMENTS = ["No RS", "Standard RS", "PUP", "RM", "PUP+RM"]
-_WELFARE_MODE = {"PUP": "pup", "RM": "rm", "PUP+RM": "pup_rm"}
 
 # (metro key, friendly label) — the two-layer metros surfaced to the frontend.
 #
@@ -126,42 +144,112 @@ def _worker_count(n_tasks: int) -> int:
 # ── Config / run records ─────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
+class RecommenderSpec:
+    """One study arm: a full configuration of the single unified scorer.
+
+    Frozen and built only of scalars, so it is hashable (the run id folds it in)
+    and picklable (it crosses into the pool workers as-is).
+    """
+
+    label: str = "Custom RS"
+    w_rating: float = 0.20
+    w_reviews: float = 0.15
+    w_relevance: float = 0.10
+    w_proximity: float = 0.25
+    w_popularity: float = 0.20
+    w_personalization: float = 0.10
+    distance_scale_km: float = 5.0
+    popularity_gamma: float = 1.0
+    learning_rate: float = 0.12
+    welfare_gate: str = ""          # "" | "pup" | "rm" | "pup_rm"
+    pup_alpha: float = 0.6
+    rm_epsilon: float = 0.3
+    random_ranking: bool = False
+
+    def to_engine_config(self) -> RecommenderConfig:
+        return RecommenderConfig(
+            label=self.label,
+            w_rating=self.w_rating, w_reviews=self.w_reviews,
+            w_relevance=self.w_relevance, w_proximity=self.w_proximity,
+            w_popularity=self.w_popularity,
+            w_personalization=self.w_personalization,
+            distance_scale_km=self.distance_scale_km,
+            popularity_gamma=self.popularity_gamma,
+            learning_rate=self.learning_rate,
+            random_ranking=self.random_ranking,
+        )
+
+    def identity(self) -> tuple:
+        """Everything that changes behaviour, for the run-id hash.
+
+        The label is included: two arms differing only by name are two rows in
+        the results, so they must not collapse to one cached study.
+        """
+        return (
+            self.label,
+            round(self.w_rating, 4), round(self.w_reviews, 4),
+            round(self.w_relevance, 4), round(self.w_proximity, 4),
+            round(self.w_popularity, 4), round(self.w_personalization, 4),
+            round(self.distance_scale_km, 4), round(self.popularity_gamma, 4),
+            round(self.learning_rate, 4), self.welfare_gate,
+            round(self.pup_alpha, 4), round(self.rm_epsilon, 4),
+            bool(self.random_ranking),
+        )
+
+
+def spec_from_legacy_name(
+    name: str, pup_alpha: float, rm_epsilon: float
+) -> Optional[RecommenderSpec]:
+    """Map a pre-builder treatment name onto the equivalent spec.
+
+    "Standard RS" was the four-platform stack with default weights; the
+    balanced preset is its closest single-scorer equivalent. The gated
+    treatments are that same ranking with the welfare filter switched on, which
+    is exactly what they always were.
+    """
+    if name == CONTROL:
+        return None
+    gate = {"PUP": "pup", "RM": "rm", "PUP+RM": "pup_rm"}.get(name, "")
+    base = dict(RECOMMENDER_PRESETS["Balanced hybrid"])
+    return RecommenderSpec(
+        label=name, **base,
+        welfare_gate=gate, pup_alpha=pup_alpha, rm_epsilon=rm_epsilon,
+    )
+
+
+@dataclass(frozen=True)
 class RunConfig:
     city: str = DEFAULT_CITY
     num_agents: int = 80
-    num_days: int = 3
+    num_days: int = 30
     seed: int = 42          # base seed; the study sweeps seed .. seed+num_seeds-1
     num_seeds: int = 3
     # Recommenders to run *besides* the No-RS control, which is always included.
     # A tuple, not a list, so the frozen dataclass stays hashable.
-    conditions: Tuple[str, ...] = ("Standard RS",)
+    recommenders: Tuple[RecommenderSpec, ...] = ()
     multimodal: bool = False
     use_real_pois: bool = True
-    pup_alpha: float = 0.6
-    rm_epsilon: float = 0.3
 
     def seeds(self) -> List[int]:
         n = max(1, min(int(self.num_seeds), MAX_SEEDS))
         return [int(self.seed) + i for i in range(n)]
 
     def all_conditions(self) -> List[str]:
-        """``["No RS", *selected recommenders]`` in canonical TREATMENTS order.
+        """``[CONTROL, *built recommenders]`` in the order the user built them.
 
-        No RS is always present and always first: every Table-2 row is defined
-        relative to it. Deduplicating and canonically ordering here (rather than
-        trusting the request) is what makes ticking PUP-then-Standard resolve to
-        the same ``run_id`` — and therefore the same cached study — as
-        Standard-then-PUP.
+        The control is always present and always first: every Table-2 row is
+        defined relative to it. Order is the user's, not canonical — with
+        free-form labels there is no canonical order to impose, and the run id
+        folds in the sequence so a reordered study is a different (correctly
+        re-run) study rather than a stale cache hit.
         """
-        picked = {c for c in self.conditions if c in TREATMENTS}
-        return [t for t in TREATMENTS if t == "No RS" or t in picked]
+        return [CONTROL] + [s.label for s in self.recommenders]
 
     def run_id(self) -> str:
         key = (
             self.city, int(self.num_agents), int(self.num_days), int(self.seed),
-            int(self.num_seeds), tuple(self.all_conditions()), bool(self.multimodal),
-            bool(self.use_real_pois), round(float(self.pup_alpha), 4),
-            round(float(self.rm_epsilon), 4),
+            int(self.num_seeds), tuple(s.identity() for s in self.recommenders),
+            bool(self.multimodal), bool(self.use_real_pois),
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 
@@ -192,6 +280,8 @@ class Run:
     table2: List[dict]            # one row per recommender, paired vs No RS
     headlines: Dict[str, dict]    # condition -> headline metrics
     aggregate: Dict[str, dict]    # condition -> acceptance / travel-time summary
+    metrics: Dict[str, dict]      # condition -> dashboard panels
+    welfare_map: List[dict]       # per-agent home + per-condition utility delta
     view: dict
     bounds: dict                  # full metro network extent
     core_bounds: dict             # principal-city extent (initial map frame)
@@ -206,9 +296,9 @@ class Run:
     def default_condition(self) -> str:
         """What the map opens on: the first recommender, else the No-RS control."""
         for c in self.conditions:
-            if c != "No RS":
+            if c != CONTROL:
                 return c
-        return "No RS"
+        return CONTROL
 
     def meta(self) -> dict:
         """Aggregated metrics + per-condition/seed index (no geometry)."""
@@ -228,6 +318,10 @@ class Run:
             "table2": self.table2,
             "headlines": self.headlines,
             "aggregate": self.aggregate,
+            "metrics": self.metrics,
+            "welfare_map": self.welfare_map,
+            "income_bands": sim_metrics.income_band_order(),
+            "trust_groups": sim_metrics.trust_group_labels(),
             "view": self.view,
             "bounds": self.bounds,
             "core_bounds": self.core_bounds,
@@ -347,14 +441,19 @@ class Job:
 
 # ── Recommender wiring (welfare gate) ────────────────────────────────────────
 
-def _make_recommender_factory(condition: str, pup_alpha: float, rm_epsilon: float):
-    """Return a recommender_factory wiring the welfare gate, or None for the
-    pass-through Standard RS / No RS conditions."""
-    if condition not in _WELFARE_MODE:
+def _make_recommender_factory(spec: Optional[RecommenderSpec]):
+    """Wrap the built recommender in its welfare gate, if it has one.
+
+    Returns None when the spec is ungated (or absent), which leaves the
+    simulation's own configurable recommender in place unwrapped.
+    """
+    if spec is None or spec.welfare_gate not in WELFARE_GATES:
         return None
     from welfare_rs import TravelCostEstimator, WelfareAwareOrchestrator
 
-    mode = _WELFARE_MODE[condition]
+    mode = spec.welfare_gate
+    pup_alpha = spec.pup_alpha
+    rm_epsilon = spec.rm_epsilon
 
     def factory(_sim, base_stack):
         return WelfareAwareOrchestrator(
@@ -392,6 +491,21 @@ def pois_available() -> Dict[str, bool]:
 _WORKER_NET_CACHE: Dict[tuple, object] = {}
 
 
+def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
+    """The spec driving ``condition``, or None for the control.
+
+    Specs travel into the worker as plain dicts (``asdict`` on the config), so
+    they are rebuilt here rather than unpickled as dataclasses — keeping the
+    task payload to primitives.
+    """
+    if condition == CONTROL:
+        return None
+    for raw in cfg.get("recommenders", ()):
+        if raw.get("label") == condition:
+            return RecommenderSpec(**raw)
+    return None
+
+
 def _worker_network(city: str, use_real_pois: bool):
     key = (city, bool(use_real_pois))
     net = _WORKER_NET_CACHE.get(key)
@@ -401,19 +515,22 @@ def _worker_network(city: str, use_real_pois: bool):
     return net
 
 
-def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows):
+def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows,
+               spec: Optional[RecommenderSpec]):
     ds = get_datasource()
     return Simulation(
         num_agents=int(cfg["num_agents"]),
         seed=int(seed),
-        use_recommenders=(condition != "No RS"),
+        use_recommenders=(condition != CONTROL),
         persona_csv_path=ds.persona_csv_path() or params.NYC_PERSONA_CSV_PATH,
         road_network=network,
         poi_rows=poi_rows,
         disabled_modes=("transit",),
-        recommender_factory=_make_recommender_factory(
-            condition, cfg["pup_alpha"], cfg["rm_epsilon"]
-        ),
+        # The control still builds a recommender it never consults, so that the
+        # catalog, tastes and RNG streams are identical to the treated arms;
+        # `use_recommenders=False` is what actually withholds it from agents.
+        recommender_config=(spec.to_engine_config() if spec is not None else None),
+        recommender_factory=_make_recommender_factory(spec),
     )
 
 
@@ -442,9 +559,15 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
     should_stop = (lambda: cancel_event.is_set()) if cancel_event is not None else None
 
     per_day: List[Dict[int, dict]] = []
+    spec = _spec_for(cfg, condition)
+    sim = _build_sim(cfg, seed, condition, network, poi_rows, spec)
+    # Dashboard panels accumulate across every day (see metrics.RunMetrics);
+    # only Table 1 / Table 2 stay eval-day quantities.
+    run_metrics = sim_metrics.RunMetrics(sim)
 
     def _on_day(day_index, sim_) -> None:
         per_day.append(viz.build_timelines(sim_))
+        run_metrics.observe_day(sim_)
         # Day-granular progress. With one simulation per task there is no other
         # way for the parent to see inside a task, and tasks are long.
         if progress_q is not None:
@@ -454,7 +577,6 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
             except Exception:
                 pass  # progress is advisory — never fail a run over it
 
-    sim = _build_sim(cfg, seed, condition, network, poi_rows)
     sim.run_days(int(cfg["num_days"]), on_day_complete=_on_day, should_stop=should_stop)
 
     merged = viz.merge_day_timelines(per_day)
@@ -464,6 +586,7 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
         "condition": condition,
         "t1": table1_metrics(sim),
         "utils": eval_day_leisure_utilities(sim.agents),
+        "metrics": run_metrics.finalize(sim),
         "summary": {
             "recommendation_acceptance_rate": summ.get("recommendation_acceptance_rate", 0.0),
             "avg_travel_time_min": summ.get("avg_travel_time_min", 0.0),
@@ -475,10 +598,11 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
         },
     }
 
-    # The POI catalog and the network extent are identical across conditions at a
-    # given seed, and "No RS" always runs — so ship them back from that task
-    # alone instead of pickling the whole catalog once per condition.
-    if condition == "No RS":
+    # The POI catalog, the agent population and the network extent are identical
+    # across conditions at a given seed, and the control always runs — so ship
+    # them back from that task alone instead of pickling them once per arm.
+    if condition == CONTROL:
+        out["agents"] = sim_metrics.agent_frame(sim)
         net = sim.road_network
         south, west, north, east = net.bounds
         csouth, cwest, cnorth, ceast = net.core_bounds
@@ -523,6 +647,128 @@ def _agg_table2(condition: str, per_seed_t2: List[dict]) -> dict:
         "improved_pct": float(np.mean([t["improved_pct"] for t in per_seed_t2])),
         "mean_orc": float(np.mean([t["mean_orc"] for t in per_seed_t2])),
         "n_matched": int(np.sum([t["n_matched"] for t in per_seed_t2])),
+    }
+
+
+def _pooled_mean(rows: List[dict], value_key: str, weight_key: str = "n") -> float:
+    """Sample-size-weighted mean across seeds.
+
+    Weighted, not a mean of means: a seed where only nine agents in a band took
+    a leisure trip would otherwise count as much as one where sixty did, which
+    for the thinner income bands is most of the noise in the panel.
+    """
+    total = sum(float(r.get(weight_key, 0) or 0) for r in rows)
+    if total <= 0:
+        return 0.0
+    return sum(float(r.get(value_key, 0.0)) * float(r.get(weight_key, 0) or 0)
+               for r in rows) / total
+
+
+def _agg_segment_panel(per_seed: List[dict]) -> Dict[str, dict]:
+    """Merge one segmentation's ``{group: {n, mean_utility, neg_rate}}`` maps."""
+    groups = {g for seed_rows in per_seed for g in seed_rows}
+    out = {}
+    for group in sorted(groups):
+        rows = [s[group] for s in per_seed if group in s]
+        out[group] = {
+            "n": int(sum(r["n"] for r in rows)),
+            "mean_utility": _pooled_mean(rows, "mean_utility"),
+            "neg_rate": _pooled_mean(rows, "neg_rate"),
+        }
+    return out
+
+
+def _agg_spatial(per_seed: List[dict]) -> Dict[str, dict]:
+    """Merge the spatial panel across seeds."""
+    def merge(rows: List[dict]) -> dict:
+        return {
+            "n": int(sum(r["n"] for r in rows)),
+            "mean_distance_km": _pooled_mean(rows, "mean_distance_km"),
+            "mean_emissions_g": _pooled_mean(rows, "mean_emissions_g"),
+            "mean_travel_min": _pooled_mean(rows, "mean_travel_min"),
+            # A median cannot be pooled from per-seed medians; the weighted mean
+            # of them is the honest approximation and is labelled as such.
+            "median_detour": _pooled_mean(rows, "median_detour"),
+            "median_excess_km": _pooled_mean(rows, "median_excess_km"),
+        }
+
+    bands = {b for s in per_seed for b in s["by_income"]}
+    return {
+        "overall": merge([s["overall"] for s in per_seed]),
+        "by_income": {
+            band: merge([s["by_income"][band] for s in per_seed if band in s["by_income"]])
+            for band in sorted(bands)
+        },
+    }
+
+
+def _agg_per_day(per_seed: List[List[dict]]) -> List[dict]:
+    """Average each day's record across seeds, truncated to the shortest run."""
+    if not per_seed:
+        return []
+    length = min(len(s) for s in per_seed)
+    keys = sorted({k for s in per_seed for row in s for k in row})
+    out = []
+    for day in range(length):
+        row = {"day": day + 1}
+        for key in keys:
+            values = [s[day][key] for s in per_seed if key in s[day]]
+            row[key] = float(np.mean(values)) if values else 0.0
+        out.append(row)
+    return out
+
+
+def _agg_lorenz(curves: List[List[list]]) -> List[list]:
+    """Average Lorenz curves pointwise.
+
+    ``lorenz_points`` normally samples a fixed 41-point x-grid, which makes a
+    pointwise mean well defined — but its no-visits early return emits just two
+    points. A seed in which nobody took a leisure trip would therefore be a
+    short curve, and zipping it against the others would run off its end. Only
+    curves on the majority grid are averaged; the rest are dropped rather than
+    interpolated, since a two-point curve carries no shape to preserve.
+    """
+    if not curves:
+        return []
+    widths = [len(c) for c in curves]
+    grid = max(set(widths), key=widths.count)
+    usable = [c for c in curves if len(c) == grid]
+    if not usable:
+        return []
+    return [
+        [usable[0][i][0], float(np.mean([c[i][1] for c in usable]))]
+        for i in range(grid)
+    ]
+
+
+def _agg_metrics(per_seed: List[dict]) -> Dict[str, object]:
+    """Everything the dashboard needs for one condition, merged over seeds."""
+    category: Dict[str, Dict[str, int]] = {}
+    for seed_rows in per_seed:
+        for band, by_category in seed_rows["category_by_income"].items():
+            row = category.setdefault(band, {})
+            for name, count in by_category.items():
+                row[name] = row.get(name, 0) + count
+
+    segmentations = {k for s in per_seed for k in s["segments"]}
+    lorenz = [s["lorenz"] for s in per_seed]
+    return {
+        "per_day": _agg_per_day([s["per_day"] for s in per_seed]),
+        "segments": {
+            key: _agg_segment_panel([s["segments"][key] for s in per_seed if key in s["segments"]])
+            for key in sorted(segmentations)
+        },
+        "category_by_income": category,
+        "spatial": _agg_spatial([s["spatial"] for s in per_seed]),
+        "lorenz": _agg_lorenz(lorenz),
+        "footfall": {
+            key: float(np.mean([s["footfall"][key] for s in per_seed]))
+            for key in per_seed[0]["footfall"]
+        } if per_seed else {},
+        "taste": {
+            key: float(np.mean([s["taste"][key] for s in per_seed]))
+            for key in per_seed[0]["taste"]
+        } if per_seed else {},
     }
 
 
@@ -757,6 +1003,65 @@ class RunManager:
 
         return self._assemble(run_id, cfg, seeds, results)
 
+    @staticmethod
+    def _welfare_map(conditions: List[str], ok_seeds: List[int],
+                     results: Dict[Tuple[int, str], dict]) -> List[dict]:
+        """Per-agent home point carrying each arm's utility delta vs the control.
+
+        One row per (seed, agent) that took a leisure trip under the control and
+        under at least one recommender; ``delta`` holds ``condition -> ΔU``. The
+        map bins these into hexagons, so the payload is deliberately flat and
+        rounded rather than pre-aggregated — the frontend chooses the bin size.
+
+        Built from each arm's ``run_utility`` (mean leisure net utility over the
+        WHOLE run), not from the eval-day ``utils`` that Table 2 uses. Table 2 is
+        a paper-defined eval-day quantity and stays that way; a map is not, and
+        on a single day only a minority of agents go out, so intersecting "went
+        out under the control" with "went out under this arm" left barely a
+        couple of dozen points to bin.
+
+        Agents with no leisure trip in an arm are simply absent from that arm's
+        delta rather than recorded as zero: a zero would read as "unaffected"
+        when what actually happened is "did not go out", and averaged into a
+        hexagon it would pull the cell toward neutral.
+
+        Capped at ``WELFARE_MAP_MAX_POINTS``: this is the one part of the run
+        payload that scales with agents x seeds, and at the top of the allowed
+        range (10,000 agents, 12 seeds) it would be a 120,000-row, ~12 MB JSON
+        body on every /api/runs/{id}. Over the cap it is thinned by an even
+        stride rather than by truncation, which would otherwise drop whole seeds
+        and, with them, whole parts of the map.
+        """
+        rows: List[dict] = []
+        for seed in ok_seeds:
+            frame = results[(seed, CONTROL)].get("agents")
+            if not frame:
+                continue
+            control = results[(seed, CONTROL)]["metrics"]["run_utility"]
+            for i, agent_id in enumerate(frame["agent_id"]):
+                base = control.get(agent_id)
+                if base is None:
+                    continue
+                deltas = {}
+                for condition in conditions:
+                    if condition == CONTROL:
+                        continue
+                    value = results[(seed, condition)]["metrics"]["run_utility"].get(agent_id)
+                    if value is not None:
+                        deltas[condition] = round(float(value) - float(base), 5)
+                if not deltas:
+                    continue
+                rows.append({
+                    "lat": frame["home_lat"][i],
+                    "lon": frame["home_lon"][i],
+                    "income": frame["income"][i],
+                    "delta": deltas,
+                })
+        if len(rows) > WELFARE_MAP_MAX_POINTS:
+            stride = math.ceil(len(rows) / WELFARE_MAP_MAX_POINTS)
+            rows = rows[::stride]
+        return rows
+
     def _assemble(self, run_id: str, cfg: RunConfig, seeds: List[int],
                   results: Dict[Tuple[int, str], dict]) -> Run:
         conditions = cfg.all_conditions()
@@ -780,10 +1085,10 @@ class RunManager:
         table2 = [
             _agg_table2(c, [
                 table2_from_utilities(results[(s, c)]["utils"],
-                                      results[(s, "No RS")]["utils"])
+                                      results[(s, CONTROL)]["utils"])
                 for s in ok_seeds
             ])
-            for c in conditions if c != "No RS"
+            for c in conditions if c != CONTROL
         ]
 
         t1_by_cond = {r["condition"]: r for r in table1}
@@ -815,6 +1120,12 @@ class RunManager:
             for c in conditions
         }
 
+        metrics = {
+            c: _agg_metrics([results[(s, c)]["metrics"] for s in ok_seeds])
+            for c in conditions
+        }
+        welfare_map = self._welfare_map(conditions, ok_seeds, results)
+
         per_condition = {
             c: {
                 s: SeedViz(
@@ -828,8 +1139,8 @@ class RunManager:
             for c in conditions
         }
         # POIs and the network extent came back on the No-RS task only.
-        pois_by_seed = {s: results[(s, "No RS")].get("pois", []) for s in ok_seeds}
-        net0 = results[(ok_seeds[0], "No RS")]["net"]
+        pois_by_seed = {s: results[(s, CONTROL)].get("pois", []) for s in ok_seeds}
+        net0 = results[(ok_seeds[0], CONTROL)]["net"]
 
         return Run(
             run_id=run_id,
@@ -842,6 +1153,8 @@ class RunManager:
             table2=table2,
             headlines=headlines,
             aggregate=aggregate,
+            metrics=metrics,
+            welfare_map=welfare_map,
             view=net0["view"],
             bounds=net0["bounds"],
             core_bounds=net0["core_bounds"],

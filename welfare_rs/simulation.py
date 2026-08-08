@@ -10,14 +10,17 @@ import random
 from collections import Counter
 from pathlib import Path
 
-from . import params
+from . import params, tastes
 from .agent import Agent
 from .datastructures import Trip
 from .poi_select import select_catalog_rows
 from .utils import clamp, haversine_km, softmax
 from .recommender_systems import (
+    ConfigurableRecommender,
     Place,
     PlaceDynamics,
+    RecommenderConfig,
+    SingleRecommenderOrchestrator,
     build_recommender_stack,
 )
 
@@ -55,6 +58,7 @@ class Simulation:
         disabled_modes=None,
         recommender_override=None,
         recommender_factory=None,
+        recommender_config=None,
     ):
         if road_network is None:
             raise ValueError(
@@ -71,6 +75,10 @@ class Simulation:
         self.time_step = time_step if time_step is not None else sd["time_step"]
         self.use_recommenders = use_recommenders
         self.rs_policy = rs_policy or {}
+        # The builder-defined recommender for this run. None keeps the legacy
+        # four-platform stack (build_recommender_stack), which is retained so
+        # existing notebooks and scripts still work.
+        self.recommender_config = recommender_config
         self.eta_shift = eta_shift
         self.use_persona_agents = use_persona_agents
         self.persona_csv_path = persona_csv_path if persona_csv_path is not None else params.NYC_PERSONA_CSV_PATH
@@ -109,6 +117,14 @@ class Simulation:
         # Place catalog and agents must exist before some recommender factories
         # can finish wiring treatment-specific stacks (for example Oracle).
         self.place_catalog = self._build_place_catalog()
+        self.place_by_id = {p.place_id: p for p in self.place_catalog}
+        # Empirical taste mix of the catalog, which agent tastes are drawn from.
+        # Derived from the POIs themselves, so it reflects this metro's actual
+        # supply rather than an assumed one.
+        self.taste_distribution = tastes.taste_distribution(
+            [(p.place_id, p.name, p.category) for p in self.place_catalog],
+            {p.place_id: p.taste_tags for p in self.place_catalog},
+        )
 
         # Live per-POI rating/review/popularity state, fed by visits and
         # like/dislike feedback during the run and consumed by the recommenders.
@@ -139,12 +155,32 @@ class Simulation:
             except (KeyError, ValueError, TypeError):
                 pass
         syn_rng = random.Random(self.seed + 991)
+        tp = params.TASTE_PARAMS
         for i in range(_num_agents):
             if personas:
                 persona = personas[i] if i < len(personas) else self._synthesize_persona(i, personas, syn_rng, used_homes)
                 agent = self._build_agent_from_persona(i, persona)
             else:
                 agent = self._build_random_agent(i)
+            # Latent taste, on its own RNG stream keyed by (seed, agent id).
+            # Agent i must hold the SAME taste under every condition or the
+            # paired No-RS comparison is comparing different people; a dedicated
+            # stream also keeps the draw from shifting when unrelated model
+            # changes consume a different number of values from self.rng.
+            #
+            # Seeded from a STRING, not an arithmetic combination. Mersenne
+            # Twister states from consecutive integer seeds are correlated in
+            # their first draws — Random(n) and Random(n+1) opened 0.2636 and
+            # 0.2824 here — so ``seed * k + i`` gave neighbouring agents
+            # near-identical tastes. Agents are built in persona order, so that
+            # correlation would have run straight through every by-segment
+            # metric. Random() hashes a str seed (SHA-512) and decorrelates.
+            agent.tastes = tastes.sample_agent_tastes(
+                self.taste_distribution,
+                random.Random(f"tastes:{self.seed}:{i}"),
+                beta=float(tp["beta"]),
+                per_family=int(tp["per_family"]),
+            )
             self.agents.append(agent)
 
         # Routing only ever runs between agent homes/works and catalog POIs;
@@ -176,6 +212,27 @@ class Simulation:
     def community_mode_bias(self, mode):
         """Return a social-practice bias for a mode (SPT)."""
         return self.context.get("community_mode_bias", {}).get(mode, 0.0)
+
+    def taste_bonus(self, agent, place_id):
+        """Extra activity utility when ``place_id`` matches the agent's taste.
+
+        This is the ground truth the recommenders do not observe. It is what
+        makes "which POI" a question a recommender can be right or wrong about:
+        without it every candidate of a subtype yields the same activity
+        utility to a given agent, and the only thing a recommendation can
+        change is how far the agent travels.
+        """
+        if not place_id:
+            return 0.0
+        place = self.place_by_id.get(place_id)
+        if place is None or not place.taste_tags:
+            return 0.0
+        agent_tastes = getattr(agent, "tastes", None)
+        if not agent_tastes:
+            return 0.0
+        if tastes.taste_match(agent_tastes, place.taste_tags):
+            return float(params.TASTE_PARAMS["match_bonus"])
+        return 0.0
 
     def sample_poi(self, subtype, origin, rng):
         """Sample an organic destination POI for a leisure subtype.
@@ -609,16 +666,24 @@ class Simulation:
             [(place_id, lat, lon) for (place_id, _n, _c, lat, lon) in selected]
         )
 
+        # Taste tags come from the business names, so they are assigned over the
+        # whole selection at once: the imputation for unlabelled venues draws
+        # from the distribution the labelled ones reveal.
+        ids = [(pid or f"poi_{i + 1}", name or cat, cat)
+               for i, (pid, name, cat, _lat, _lon) in enumerate(selected)]
+        tags_by_id = tastes.assign_place_tags(ids)
+
         catalog = []
-        for place_id, name, cat, lat, lon in selected:
+        for (place_id, name, cat, lat, lon), (pid, _n, _c) in zip(selected, ids):
             rating, review_count, popularity = self._synth_prominence(place_id)
             catalog.append(
                 Place(
-                    place_id=place_id or f"poi_{len(catalog) + 1}",
+                    place_id=pid,
                     name=name or cat,
                     category=cat,
                     location=(lat, lon),
                     keywords=tuple(params.CATEGORY_KEYWORDS.get(cat, (cat,))),
+                    taste_tags=tags_by_id.get(pid, ()),
                     rating=rating,
                     review_count=review_count,
                     popularity=popularity,
@@ -631,6 +696,16 @@ class Simulation:
         # the paper's "as the crow flies" signal, deliberately cruder than the
         # network cost of the realised trip (haversine already returns km, so
         # no coordinate scaling is needed).
+        if self.recommender_config is not None:
+            return SingleRecommenderOrchestrator(
+                ConfigurableRecommender(
+                    catalog=self.place_catalog,
+                    config=self.recommender_config,
+                    dynamics=self.place_dynamics,
+                    coord_distance_km=haversine_km,
+                )
+            )
+        # Legacy four-platform stack, kept for callers that predate the builder.
         return build_recommender_stack(
             self.place_catalog,
             google_maps_config=self.rs_policy.get("google_maps", {}),
@@ -681,7 +756,20 @@ class Simulation:
                         popularity=popularity,
                     )
                 )
-        return catalog
+        # Synthetic names carry no taste signal, so every place here is imputed
+        # (uniformly over the family's vocabulary — see assign_place_tags).
+        tags_by_id = tastes.assign_place_tags(
+            [(p.place_id, p.name, p.category) for p in catalog]
+        )
+        return [
+            Place(
+                place_id=p.place_id, name=p.name, category=p.category,
+                location=p.location, keywords=p.keywords,
+                taste_tags=tags_by_id.get(p.place_id, ()),
+                rating=p.rating, review_count=p.review_count, popularity=p.popularity,
+            )
+            for p in catalog
+        ]
 
     def _build_place_catalog(self):
         loaded = self._load_osm_poi_catalog(self.poi_csv_path, self.poi_rows)
@@ -871,6 +959,11 @@ class Simulation:
             activity_utility += seg_cfg.get("activity_utility", 0.0)
             activity_utility += uw["activity_intrinsic_coeff"] * agent.motivation_weights["intrinsic"]
             activity_utility += uw["activity_escape_coeff"] * agent.motivation_weights["escape"]
+            # Realised taste match at the destination actually reached. This is
+            # the term that flows into the trip's activity_utility, hence into
+            # leisure_net_utility (the welfare metric) and into the like/dislike
+            # the platform learns from.
+            activity_utility += self.taste_bonus(agent, next_activity.place_id)
         utility = travel_utility + activity_utility
 
         return {

@@ -29,16 +29,21 @@ from .datastructures import Activity, Trip
 from .geo import RoadNetwork, build_road_network, haversine_km
 from .metro import build_metro_network, build_network, is_metro
 from .recommender_systems import (
+    RECOMMENDER_PRESETS,
+    ConfigurableRecommender,
     GoogleMapsReplica,
     LeisureRSOrchestrator,
     Place,
     PlaceDynamics,
     PopularityRecommender,
     Recommendation,
+    RecommenderConfig,
     RecommenderSystem,
+    SingleRecommenderOrchestrator,
     UserContext,
     build_recommender_stack,
 )
+from . import metrics, tastes
 from .simulation import Simulation
 from .welfare_layer import (
     ContinuousFeedback,
@@ -68,8 +73,13 @@ __all__ = [
     "LocalDataSource",
     "PostgresDataSource",
     "get_datasource",
-    # recommenders
+    # recommenders — one configurable scorer, plus the legacy four-platform
+    # stack kept for callers that predate the builder.
     "RecommenderSystem",
+    "ConfigurableRecommender",
+    "RecommenderConfig",
+    "SingleRecommenderOrchestrator",
+    "RECOMMENDER_PRESETS",
     "GoogleMapsReplica",
     "PopularityRecommender",
     "LeisureRSOrchestrator",
@@ -78,6 +88,9 @@ __all__ = [
     "PlaceDynamics",
     "UserContext",
     "Recommendation",
+    # latent tastes + dashboard metrics
+    "tastes",
+    "metrics",
     # welfare layer
     "WelfareAwareOrchestrator",
     "TravelCostEstimator",

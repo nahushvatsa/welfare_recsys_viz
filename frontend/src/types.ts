@@ -1,5 +1,35 @@
 // Shared API types (mirror backend/models.py and backend/viz.py outputs).
 
+/** One recommender the user built. Every field is a knob on the same scorer. */
+export interface RecommenderSpec {
+  label: string;
+  w_rating: number;
+  w_reviews: number;
+  w_relevance: number;
+  w_proximity: number;
+  w_popularity: number;
+  w_personalization: number;
+  distance_scale_km: number;
+  popularity_gamma: number;
+  learning_rate: number;
+  /** "" | "pup" | "rm" | "pup_rm" */
+  welfare_gate: string;
+  pup_alpha: number;
+  rm_epsilon: number;
+  random_ranking: boolean;
+}
+
+/** The six weighted components, in the order they are shown to the user. */
+export const WEIGHT_KEYS = [
+  "w_rating",
+  "w_reviews",
+  "w_relevance",
+  "w_proximity",
+  "w_popularity",
+  "w_personalization",
+] as const;
+export type WeightKey = (typeof WEIGHT_KEYS)[number];
+
 export interface RunConfig {
   city: string;
   num_agents: number;
@@ -10,11 +40,14 @@ export interface RunConfig {
   num_seeds: number;
   // Recommenders to run. The No-RS control is always added server-side, so an
   // empty array is a valid "control only" study.
-  conditions: string[];
+  recommenders: RecommenderSpec[];
   multimodal: boolean;
   use_real_pois: boolean;
-  pup_alpha: number;
-  rm_epsilon: number;
+}
+
+/** A preset is a set of values for the same knobs, not a different design. */
+export interface Preset extends Partial<RecommenderSpec> {
+  name: string;
 }
 
 // Paper Table 1 (aggregate welfare) — one row per condition, averaged over seeds.
@@ -53,11 +86,72 @@ export interface City {
 
 export interface CitiesResponse {
   cities: City[];
-  treatments: string[]; // includes "No RS"; the UI pins it as the control
+  presets: Preset[]; // starting points for the recommender builder
+  control: string; // the pinned No-RS control's label
+  max_recommenders: number;
+  treatments: string[]; // deprecated fixed vocabulary
   pois_available: Record<string, boolean>; // per city key
   warmed?: Record<string, boolean>; // road network cached on disk
   precomputed?: Record<string, boolean>; // routing matrices precomputed
   defaults: RunConfig;
+}
+
+// ── Dashboard metrics ────────────────────────────────────────────────────────
+
+export interface SegmentCell {
+  n: number;
+  mean_utility: number;
+  neg_rate: number;
+}
+
+export interface SpatialCell {
+  n: number;
+  mean_distance_km: number;
+  mean_emissions_g: number;
+  mean_travel_min: number;
+  median_detour: number;
+  median_excess_km: number;
+}
+
+/** One simulated day, averaged across seeds. Indexable, because the chart
+ *  frame builder pulls a metric out by name. */
+export interface DayRecord {
+  [metric: string]: number;
+  day: number;
+  leisure_trips: number;
+  acceptance_rate: number;
+  mean_utility: number;
+  gini: number;
+  top1_share: number;
+  top5_share: number;
+  top10_share: number;
+  coverage: number;
+  total_visits: number;
+  n_places: number;
+  all_rate: number;
+  recommended_rate: number;
+  organic_rate: number;
+  all_n: number;
+  recommended_n: number;
+  organic_n: number;
+}
+
+export interface ConditionMetrics {
+  per_day: DayRecord[];
+  segments: Record<string, Record<string, SegmentCell>>; // income | trust | paradigm
+  category_by_income: Record<string, Record<string, number>>;
+  spatial: { overall: SpatialCell; by_income: Record<string, SpatialCell> };
+  lorenz: [number, number][];
+  footfall: Record<string, number>;
+  taste: Record<string, number>;
+}
+
+/** One agent's home, carrying each arm's utility delta vs the control. */
+export interface WelfareMapRow {
+  lat: number;
+  lon: number;
+  income: string;
+  delta: Record<string, number>;
 }
 
 export interface RunMeta {
@@ -73,6 +167,10 @@ export interface RunMeta {
   table2: Table2Row[]; // one row per recommender (the control has none)
   headlines: Record<string, Headline>; // per condition
   aggregate: Record<string, Record<string, number>>; // per condition
+  metrics: Record<string, ConditionMetrics>; // dashboard panels, per condition
+  welfare_map: WelfareMapRow[]; // agent homes + per-condition utility delta
+  income_bands: string[]; // poorest-first, for stable chart axes
+  trust_groups: string[]; // Q1..Q4
   view: { latitude: number; longitude: number };
   bounds: { south: number; west: number; north: number; east: number }; // full metro
   core_bounds: { south: number; west: number; north: number; east: number }; // principal city

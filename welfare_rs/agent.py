@@ -74,6 +74,11 @@ class Agent:
         self.last_eta = 0.0
         self.accepted_recommendation_count = 0
         self.daily_recommendations = {}
+        # Latent taste per family ({"dining": ("thai", "deli"), ...}), assigned
+        # by the Simulation from the catalog's own supply mix. Invisible to the
+        # recommenders: it moves this agent's realised utility, and the platform
+        # can only infer it from the feedback that utility produces.
+        self.tastes = {}
         # Per-day welfare-metric flags (reflect the most recently planned day).
         # had_leisure_opportunity: agent committed to a leisure outing (a slot
         # where the RS could have issued a suggestion). rs_abstained: that outing
@@ -808,6 +813,11 @@ class Agent:
             activity_utility += pp["activity_travel_affinity_coeff"] * self.attitudes["travel_affinity"]
             activity_utility += pp["activity_pref_coeff"] * (self.leisure_preferences[subtype] - 1.0)
             activity_utility += self._subtype_personality_adjustment(subtype)
+            # The agent knows its own taste and can see what the nearby place
+            # is, so a subtype whose closest option happens to suit it is worth
+            # more tonight. Same bonus the realised trip is scored with, so
+            # expectation and outcome are on one scale.
+            activity_utility += env.taste_bonus(self, desired_place_id)
 
             interest_map = pp["interest_map"]
             if subtype in interest_map.get(self.primary_interest, set()):

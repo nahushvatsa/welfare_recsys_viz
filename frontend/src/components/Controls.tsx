@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
+import RecommenderBuilder from "./RecommenderBuilder";
 import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "../types";
 
 export type RunStatus = "idle" | "running" | "ready" | "error";
+
+// Mirrors the server's own ceilings (backend/models.py). Kept in step on
+// purpose: the field used to allow 100,000 while the API rejected anything over
+// 10,000, so an over-large population passed client validation and came back a
+// 422 the user had no way to anticipate.
+const MAX_AGENTS = 10000;
+const MAX_DAYS = 60;
+const MAX_SEEDS = 12;
 
 interface ControlsProps {
   cities: CitiesResponse;
@@ -31,23 +40,8 @@ export default function Controls({
   dirty,
   children,
 }: ControlsProps) {
-  // "No RS" is the control: always run, never a choice, so it is pinned rather
-  // than listed. Everything else is togglable.
-  const recommenders = cities.treatments.filter((t) => t !== "No RS");
-  const selected = config.conditions ?? [];
-  const showPup = selected.some((t) => t === "PUP" || t === "PUP+RM");
-  const showRm = selected.some((t) => t === "RM" || t === "PUP+RM");
+  const specs = config.recommenders ?? [];
   const running = status === "running";
-
-  function toggleCondition(name: string, on: boolean) {
-    const next = new Set(selected);
-    if (on) next.add(name);
-    else next.delete(name);
-    // Emit in the server's canonical order, so ticking A-then-B produces the
-    // same array as B-then-A. Otherwise the parent's JSON.stringify dirty check
-    // would report a change when nothing actually changed.
-    setConfig({ conditions: recommenders.filter((t) => next.has(t)) });
-  }
 
   // Numeric fields are edited as raw text so they can be fully erased/retyped
   // (a controlled number coerced empty -> 1, causing "type 5, get 15"). The
@@ -56,15 +50,15 @@ export default function Controls({
   const [agentsText, setAgentsText] = useState(String(config.num_agents));
   const [daysText, setDaysText] = useState(String(config.num_days));
   const [seedsText, setSeedsText] = useState(String(config.num_seeds));
-  const agents = validateInt(agentsText, 1, 100000);
-  const days = validateInt(daysText, 1, 60);
-  const seeds = validateInt(seedsText, 1, 12);
+  const agents = validateInt(agentsText, 1, MAX_AGENTS);
+  const days = validateInt(daysText, 1, MAX_DAYS);
+  const seeds = validateInt(seedsText, 1, MAX_SEEDS);
   const inputError = agents.error ?? days.error ?? seeds.error;
 
   // Study size, for the cost hint below. Falls back to the committed seed count
   // so the number doesn't blank out while the field is mid-edit.
   const nSeeds = seeds.value ?? config.num_seeds;
-  const nConditions = selected.length + 1; // + the No-RS control
+  const nConditions = specs.length + 1; // + the pinned control
 
   const poisAvailable = cities.pois_available[config.city] ?? false;
 
@@ -99,12 +93,12 @@ export default function Controls({
         <input
           type="number"
           min={1}
-          max={100000}
+          max={MAX_AGENTS}
           value={agentsText}
           aria-invalid={agents.error ? true : undefined}
           onChange={(e) => {
             setAgentsText(e.target.value);
-            const v = validateInt(e.target.value, 1, 100000).value;
+            const v = validateInt(e.target.value, 1, MAX_AGENTS).value;
             if (v !== null) setConfig({ num_agents: v });
           }}
         />
@@ -115,12 +109,12 @@ export default function Controls({
         <input
           type="number"
           min={1}
-          max={60}
+          max={MAX_DAYS}
           value={daysText}
           aria-invalid={days.error ? true : undefined}
           onChange={(e) => {
             setDaysText(e.target.value);
-            const v = validateInt(e.target.value, 1, 60).value;
+            const v = validateInt(e.target.value, 1, MAX_DAYS).value;
             if (v !== null) setConfig({ num_days: v });
           }}
         />
@@ -131,12 +125,12 @@ export default function Controls({
         <input
           type="number"
           min={1}
-          max={12}
+          max={MAX_SEEDS}
           value={seedsText}
           aria-invalid={seeds.error ? true : undefined}
           onChange={(e) => {
             setSeedsText(e.target.value);
-            const v = validateInt(e.target.value, 1, 12).value;
+            const v = validateInt(e.target.value, 1, MAX_SEEDS).value;
             if (v !== null) setConfig({ num_seeds: v });
           }}
         />
@@ -162,58 +156,23 @@ export default function Controls({
 
       <h2>Recommenders</h2>
       <p className="muted">
-        Pick any number. Each one runs as its own simulation, in parallel,
-        against the same No-RS control — then you can compare their metrics and
-        switch the map between them.
+        Build one or more. Each is the same scorer with different weights — a
+        preset just sets them for you. Every recommender runs as its own
+        simulation, in parallel, against the same control.
       </p>
-      <label
-        className="toggle"
-        title="The baseline every comparison is paired against. Always run."
-      >
-        <input type="checkbox" checked disabled readOnly />
-        No RS <span className="muted">(control)</span>
-      </label>
-      {recommenders.map((t) => (
-        <label className="toggle" key={t}>
-          <input
-            type="checkbox"
-            checked={selected.includes(t)}
-            onChange={(e) => toggleCondition(t, e.target.checked)}
-          />
-          {t}
-        </label>
-      ))}
+      <RecommenderBuilder
+        specs={specs}
+        presets={cities.presets}
+        max={cities.max_recommenders}
+        control={cities.control}
+        disabled={running}
+        onChange={(recommenders) => setConfig({ recommenders })}
+      />
       <p className="run-cost">
         {nConditions} condition{nConditions === 1 ? "" : "s"} × {nSeeds} seed
         {nSeeds === 1 ? "" : "s"} = <b>{nConditions * nSeeds} simulations</b>
         {nConditions * nSeeds > 1 ? ", run in parallel" : ""}
       </p>
-      {showPup && (
-        <label>
-          PUP α (min P[U≥0]): {config.pup_alpha.toFixed(2)}
-          <input
-            type="range"
-            min={0}
-            max={1}
-            step={0.05}
-            value={config.pup_alpha}
-            onChange={(e) => setConfig({ pup_alpha: parseFloat(e.target.value) })}
-          />
-        </label>
-      )}
-      {showRm && (
-        <label>
-          RM ε (regret ceiling): {config.rm_epsilon.toFixed(2)}
-          <input
-            type="range"
-            min={0}
-            max={1.5}
-            step={0.05}
-            value={config.rm_epsilon}
-            onChange={(e) => setConfig({ rm_epsilon: parseFloat(e.target.value) })}
-          />
-        </label>
-      )}
 
       {running ? (
         <button className="stop-btn" onClick={onStop}>■ Stop simulation</button>
