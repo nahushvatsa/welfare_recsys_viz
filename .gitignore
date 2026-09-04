@@ -225,6 +225,18 @@ data/poi_children_merged_by_wkt.csv
 # schema, then only the derived serving tables matter. Re-downloadable.
 data/census/
 
+# ── Human-subjects data (IRB-FY2026-11354) — NEVER commit ────────────────────
+# The Prolific survey package and everything derived from it at respondent
+# level. The handoff terms (data_handoff/README.md S9) require this to stay on
+# institutional storage and prohibit redistribution; this repo has a public
+# remote, so a stray `git add -A` would be a disclosure, not a mistake in
+# style. Survey data lives in the server's `survey` schema (db/load_survey.py)
+# and on institutional disk -- never in git.
+data_handoff/
+data/survey_personas_2026.csv
+data/study_exports/
+georecsim.pdf
+
 # ── Server DB schema + ETL (kept off the public repo by request) ──
 # Contains no credentials (passwords come from .env via psql -v / libpq env
 # vars), so this is a distribution choice, not a security one. Note the only

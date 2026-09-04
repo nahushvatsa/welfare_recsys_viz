@@ -522,7 +522,12 @@ def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows,
         num_agents=int(cfg["num_agents"]),
         seed=int(seed),
         use_recommenders=(condition != CONTROL),
-        persona_csv_path=ds.persona_csv_path() or params.NYC_PERSONA_CSV_PATH,
+        # Population from the datasource: under WELFARE_RS_DATASOURCE=postgres
+        # this is the survey.personas view, otherwise the persona CSV. The path
+        # is still passed as the fallback for a worker whose datasource has
+        # neither (personas() returns None).
+        persona_rows=ds.personas(),
+        persona_csv_path=ds.persona_csv_path() or params.SURVEY_PERSONA_CSV_PATH,
         road_network=network,
         poi_rows=poi_rows,
         disabled_modes=("transit",),

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import RecommenderBuilder from "./RecommenderBuilder";
+import { condLabel } from "./charts";
 import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "../types";
 
 export type RunStatus = "idle" | "running" | "ready" | "error";
@@ -217,7 +218,7 @@ export default function Controls({
             <ul className="cond-progress">
               {Object.entries(progress.per_condition).map(([name, done]) => (
                 <li key={name}>
-                  <span className="cond-name">{name}</span>
+                  <span className="cond-name">{condLabel(name)}</span>
                   <span className="cond-track">
                     <span
                       className="cond-fill"

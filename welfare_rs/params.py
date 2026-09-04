@@ -40,7 +40,13 @@ SIMPLIFICATION_TOGGLES: dict = {
     # default. Flip any of these to ``False`` to restore the
     # corresponding piece of the original (richer) model for comparison.
     "CAR_ONLY_MODE": True,
-    "DERIVED_DEMAND_ONLY": True,
+    # OFF: the MTTC motivation mixture is what makes the agents MTTC agents
+    # rather than pure derived demand, and the paper's behavioural-theory claim
+    # rests on it. With this on, every agent held derived=1.0 and the other
+    # three motivations at exactly 0.0, so the four sites that read them
+    # (Agent._tpb_intention, the participation boost, the activity benefit and
+    # the feedback score) were all multiplying by zero.
+    "DERIVED_DEMAND_ONLY": False,
 }
 
 # Willingness-to-accept (eta) model: a baseline from the trust-in-platforms and
@@ -55,6 +61,28 @@ SIMPLIFIED_ETA_PARAMS: dict = {
     "baseline_autonomy_coeff": 0.40,
     # Quality term: delta_qual = quality_weight * (score - 0.5)
     "quality_weight": 0.18,
+    # Extra-travel term: delta_cost = -beta_delta_cost * (C_offered - C_own),
+    # both priced by Agent._price_round_trip. This is Eq. 2's -beta_D * dC_it:
+    # how much further the offered venue is than the one the agent had already
+    # chosen for itself, which platforms display beside every result.
+    #
+    # SIGNED, not clipped. A proximity-led ranker that offers something closer
+    # than the agent's own pick earns an acceptance bonus, which is the paper's
+    # "an agent about to walk 3 blocks can decide instead to walk an extra
+    # block" read in both directions.
+    #
+    # Value: the paper gives no number for beta_D, and no study estimates a
+    # distance elasticity of recommendation acceptance, so this is specified
+    # rather than estimated — the same standing as the rest of the ICLV map.
+    # 0.30 was chosen against the measured spread of dC (Manhattan, 400 agents,
+    # 6 days, 500 offers per arm): mean dC is -0.381 under proximity-led ranking
+    # and +0.269 under footfall-led, a gap of 0.650. At 0.30 that becomes a
+    # ~20-point acceptance gap between the two designs — enough that distance
+    # matters, while staying below the trust term's +/-0.20 so it informs
+    # adoption rather than dominating it. Median offers in every arm move by
+    # under 0.05; the term bites the long right tail, where a venue is genuinely
+    # far, which is the behaviour it is meant to capture.
+    "beta_delta_cost": 0.30,
     # Memory term: delta_mem = memory_weight * min(memory_cap, n_accepted)
     "memory_weight": 0.015,
     "memory_cap": 5,
@@ -71,6 +99,15 @@ DEFAULT_PERSONA_CSV_PATH: str = os.path.join(
 # Persona file for the OSM / New York frontend (homes sampled on the network).
 NYC_PERSONA_CSV_PATH: str = os.path.join(
     _REPO_ROOT, "data", "synthetic_personas_realism_first_dopt_with_start_locs_NewYork.csv"
+)
+
+# Survey-grounded population: one persona per respondent of the April 2026
+# Prolific stated-preference survey (IRB-FY2026-11354, N=473). Built from
+# data_handoff/ by data/build_survey_personas.py. This is the empirical
+# population the paper describes; the two synthetic files above predate it and
+# are kept so earlier runs remain reproducible.
+SURVEY_PERSONA_CSV_PATH: str = os.path.join(
+    _REPO_ROOT, "data", "survey_personas_2026.csv"
 )
 
 # ── OSM road-network geography (geo.py) ──────────────────────────────────────
@@ -684,9 +721,15 @@ AGENT_DEFAULTS: dict = {
     # Satisficing
     "satisficing_base_range": (6.0, 16.0),
     "satisficing_income_divisor": 100000,
-    # VOT
+    # Value of time. income / vot_hours_per_year is an hourly wage equivalent;
+    # VOT is a fraction of it. Small (2012) puts the value of travel time
+    # savings at roughly half the wage rate, which is the employed share here.
+    # Non-earners take half again: the survey reports HOUSEHOLD income, so the
+    # wage equivalent is not theirs to begin with.
     "vot_floor": 5,
     "vot_hours_per_year": 2000,
+    "vot_wage_share_employed": 0.50,
+    "vot_wage_share_non_earner": 0.25,
     # Work schedule
     "work_start_range": (7 * 60, 9 * 60),
     "work_duration_range": (7 * 60, 9 * 60),
@@ -711,9 +754,14 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
         "awareness": 0.30,
     },
     "planning_orientation": {
-        "conscientiousness": 0.45,
-        "maximization": 0.35,
-        "low_spontaneity": 0.20,
+        "conscientiousness": 0.40,
+        "maximization": 0.30,
+        "low_spontaneity": 0.15,
+        # Survey s4_search_c: "I would cross-check options across multiple
+        # sources before deciding." A deliberation indicator, same family as
+        # conscientiousness and maximization. Weights in this block sum to 1
+        # because the result is clamped to [0, 1] and read centred on 0.5.
+        "cross_platform_search": 0.15,
     },
     "social_orientation": {
         "extraversion": 0.55,
@@ -725,11 +773,13 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
         "unexpected_discovery": 0.25,
         "advice_goal_directed": 0.20,
     },
+    # Renormalised over the three measured inputs after the survey turned out
+    # to carry no disappointing-recommendation item. Weights sum to 1 because
+    # the result is clamped to [0, 1] and read centred on 0.5.
     "risk_aversion": {
-        "neuroticism": 0.65,
-        "autonomy": 0.15,
-        "awareness": 0.10,
-        "negative_experience": 0.10,
+        "neuroticism": 0.72,
+        "autonomy": 0.17,
+        "awareness": 0.11,
     },
     "budget_sensitivity": {
         "budget_tightness": 0.60,
@@ -766,6 +816,10 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
     "attitude_shift": {
         "travel_affinity_variety": 0.25,
         "travel_affinity_frequency": 0.20,
+        # Survey overnight_num: trips per 12 months, a second travel-propensity
+        # indicator alongside weekly local outings. These are independent shift
+        # magnitudes applied as coeff * (x - 0.5), not weights summing to 1.
+        "travel_affinity_overnight": 0.12,
         "status_trend": 0.28,
         "practice_social": 0.20,
         "practice_trend": 0.20,
@@ -843,7 +897,6 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
         "variety_seeking": 0.18,
         "local_frequency": 0.15,
         "spontaneity": 0.16,
-        "negative_experience": 0.12,
         "city_familiarity": 0.10,
         "softmax_maximization": 0.55,
         "softmax_spontaneity": 0.30,
@@ -854,27 +907,104 @@ SURVEY_BEHAVIOR_PARAMS: dict = {
 # ── Persona agent mapping ────────────────────────────────────────────────────
 
 PERSONA_MAPPING: dict = {
+    # Both the synthetic-persona labels and the survey's own band labels are
+    # accepted, so one lookup serves either population file.
+    #
+    # Survey income is HOUSEHOLD income before taxes (Q6), while the value of
+    # time it feeds (Agent.vot = income / vot_hours_per_year) is an individual
+    # wage equivalent. Multi-earner households therefore get an overstated VOT.
+    # The two open-ended bands need an assumed bound: "Under $25,000" is floored
+    # at 12000 and "$200,000 or more" capped at 300000.
     "income_bands": {
         "<35k": (20000, 34000),
         "35-75k": (35000, 74000),
         "75k-125k": (75000, 124000),
         "125k+": (125000, 180000),
+        # Survey Q6 bands.
+        "Under $25,000": (12000, 24999),
+        "$25,000 - $49,999": (25000, 49999),
+        "$50,000 - $74,999": (50000, 74999),
+        "$75,000 - $99,999": (75000, 99999),
+        "$100,000 - $149,000": (100000, 149000),
+        "$150,000 - $199,999": (150000, 199999),
+        "$200,000 or more": (200000, 300000),
     },
+    # Survey age is a 6-band ordinal (Q1); years are drawn uniformly inside the
+    # band. "65 or older" is capped at 85 to match the synthetic bands' ceiling.
     "age_bands": {
         "teen": (18, 19),
         "young adult": (20, 34),
         "mid adult": (35, 54),
         "old adult": (55, 69),
         "senior": (70, 85),
+        # Survey Q1 bands.
+        "18-24": (18, 24),
+        "25-34": (25, 34),
+        "35-44": (35, 44),
+        "45-54": (45, 54),
+        "55-64": (55, 64),
+        "65 or older": (65, 85),
     },
     "transit_access_levels": {"high": 0.85, "medium": 0.55, "low": 0.25},
+    # Attributes the survey does not collect. They were previously drawn per
+    # agent from the synthetic persona file, whose level shares came from a
+    # D-optimal experimental design — balanced by construction (32% ADA needs,
+    # 33% carless, 50% non-English) rather than representative of any
+    # population. Rather than invent population rates, they are now held fixed
+    # for every agent, so they contribute no heterogeneity and cannot be
+    # mistaken for an empirical source of it.
+    #
+    # Car and transit access are fixed because every trip is a car trip
+    # (CAR_ONLY_MODE, and the paper's car-only assumption). Mobility needs are
+    # fixed at "none" for the same reason. Primary leisure interest and
+    # environmental attitude are dropped outright rather than pinned: both
+    # applied a utility bonus, and a constant bonus for all agents is just a
+    # shift in the origin. The green weight instead keeps its random base and
+    # the survey's Openness shift (SURVEY_BEHAVIOR_PARAMS.preference_shift).
+    "fixed_attributes": {
+        "car_access": "own car",
+        "transit_access": "medium",
+        "mobility_needs": "none",
+        "walk_tolerance_min": 15,
+        # One broad window for everyone. LEISURE_SEGMENTS place most outings in
+        # the evening, so the weekday-evening band is the least distorting
+        # constant; PARTICIPATION_PARAMS.time_window_bonuses still applies it.
+        "time_window": "weekday evening",
+        "risk_salience": "low",
+        # "" matches no key in PARTICIPATION_PARAMS.interest_map, so no subtype
+        # receives the primary-interest bonus.
+        "primary_interest": "",
+    },
+    # Persona columns copied onto Agent.characteristics for reporting and
+    # segmentation. Carried only — no decision rule reads them. Absent columns
+    # are skipped, so this list is safe against either population file.
+    "carried_fields": (
+        "Education",
+        "Education_num",
+        "Employment",
+        "RaceEthnicity",
+        "HomeLanguage",
+        "CensusRegion",
+        "CensusDivision",
+        "ResidenceLength",
+        "ResidenceLength_num",
+        "LeisureSpend",
+        "LeisureSpend_num",
+        "CityFam_num",
+        "Age_num",
+        "Income_num",
+        "Sex_num",
+        "Sex",
+        "scenario",
+        "Autonomy_Control",
+        "Platform_Comfort",
+    ),
     "no_car_penalty": 2.2,
     "carshare_penalty": 0.9,
-    # Motivation adjustments from persona traits
+    # Motivation adjustment from a persona trait. Only the survey-derived one
+    # remains: the others keyed off primary leisure interest and travel-party
+    # composition, which the survey does not measure.
     "motivation_adjustments": {
-        "food_cultural_derived": 0.15,
-        "nightlife_nature_intrinsic": 0.18,
-        "solo_escape": 0.10,
         "top_rated_positionality": 0.14,
     },
 }

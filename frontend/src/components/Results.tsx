@@ -1,8 +1,10 @@
 import { useMemo, useState } from "react";
 import {
+  condLabel,
   conditionColors,
   DayLines,
   DivergingHeatmap,
+  FigureMode,
   GroupedBars,
   LorenzChart,
   Panel,
@@ -42,6 +44,8 @@ const CATEGORY_LABEL: Record<string, string> = {
 
 export default function Results({ run, condition }: { run: RunMeta; condition: string }) {
   const [tab, setTab] = useState<TabId>("overview");
+  // Screenshot mode: panels drop to a fixed paper-column width. See FigureMode.
+  const [figure, setFigure] = useState(false);
   const shown = run.headlines[condition] ? condition : run.default_condition;
   const control = run.conditions[0];
   const colors = useMemo(
@@ -53,7 +57,7 @@ export default function Results({ run, condition }: { run: RunMeta; condition: s
   const nSeeds = run.seeds.length;
 
   return (
-    <div className="results">
+    <div className={figure ? "results figure-mode" : "results"}>
       <div className="results-head">
         <h3>
           Results · {run.city_label}
@@ -63,31 +67,43 @@ export default function Results({ run, condition }: { run: RunMeta; condition: s
             {nSeeds} seed{nSeeds > 1 ? "s" : ""} · {run.conditions.length} conditions
           </span>
         </h3>
-        <nav className="tabs" role="tablist">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              role="tab"
-              aria-selected={tab === t.id}
-              className={tab === t.id ? "tab active" : "tab"}
-              onClick={() => setTab(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
+        <div className="head-tools">
+          <nav className="tabs" role="tablist">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={tab === t.id}
+                className={tab === t.id ? "tab active" : "tab"}
+                onClick={() => setTab(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+          <button
+            className={figure ? "figure-toggle on" : "figure-toggle"}
+            aria-pressed={figure}
+            onClick={() => setFigure((f) => !f)}
+            title="Shrink each panel to one paper column (~3.3 in) so a screenshot drops straight into the manuscript at a readable point size. Panels marked wide span the full text width."
+          >
+            Figure mode
+          </button>
+        </div>
       </div>
 
-      {tab === "overview" && <Overview run={run} shown={shown} />}
-      {tab === "loop" && (
-        <FeedbackLoop run={run} metrics={metrics} colors={colors} control={control} />
-      )}
-      {tab === "geography" && (
-        <Geography run={run} metrics={metrics} colors={colors} control={control} treated={treated} />
-      )}
-      {tab === "who" && (
-        <WhoGainsLoses run={run} metrics={metrics} colors={colors} control={control} />
-      )}
+      <FigureMode.Provider value={figure}>
+        {tab === "overview" && <Overview run={run} shown={shown} />}
+        {tab === "loop" && (
+          <FeedbackLoop run={run} metrics={metrics} colors={colors} control={control} />
+        )}
+        {tab === "geography" && (
+          <Geography run={run} metrics={metrics} colors={colors} control={control} treated={treated} />
+        )}
+        {tab === "who" && (
+          <WhoGainsLoses run={run} metrics={metrics} colors={colors} control={control} />
+        )}
+      </FigureMode.Provider>
     </div>
   );
 }
@@ -102,7 +118,7 @@ function Overview({ run, shown }: { run: RunMeta; shown: string }) {
   return (
     <>
       <p className="muted small">
-        Headline figures are for <b>{shown}</b> — the condition the map is
+        Headline figures are for <b>{condLabel(shown)}</b> — the condition the map is
         showing. Tables cover every condition. Both are computed on the final
         (evaluation) day, matching the paper; the other tabs pool all{" "}
         {run.num_days} days for resolution.
@@ -131,7 +147,7 @@ function Overview({ run, shown }: { run: RunMeta; shown: string }) {
             <tbody>
               {run.table1.map((r) => (
                 <tr key={r.condition} className={r.condition === shown ? "row-hi" : ""}>
-                  <td>{r.condition}</td>
+                  <td>{condLabel(r.condition)}</td>
                   <td>{num(r.mean_utility)}</td>
                   <td>{num(r.sigma_u)}</td>
                   <td>{pct(r.neg_rate)}</td>
@@ -155,7 +171,7 @@ function Overview({ run, shown }: { run: RunMeta; shown: string }) {
               <tbody>
                 {run.table2.map((r) => (
                   <tr key={r.condition} className={r.condition === shown ? "row-hi" : ""}>
-                    <td>{r.condition}</td>
+                    <td>{condLabel(r.condition)}</td>
                     <td>{pct(r.harmed_pct)}</td>
                     <td>{pct(r.improved_pct)}</td>
                     <td>{num(r.mean_orc)}</td>
@@ -169,7 +185,7 @@ function Overview({ run, shown }: { run: RunMeta; shown: string }) {
       )}
 
       <p className="muted small">
-        {shown}, across {nSeeds} seed{nSeeds > 1 ? "s" : ""}: rec. acceptance{" "}
+        {condLabel(shown)}, across {nSeeds} seed{nSeeds > 1 ? "s" : ""}: rec. acceptance{" "}
         {pct(agg.acceptance_rate)} · avg travel time {num(agg.avg_travel_time_min, 1)} min.
       </p>
     </>
@@ -195,18 +211,7 @@ function FeedbackLoop({
 
   return (
     <div className="panel-grid">
-      <Panel
-        title="How many places absorb the visits"
-        hint={
-          <>
-            The <b>effective number of venues</b> (inverse Simpson, 1/Σpᵢ²): how many
-            equally-busy places would produce the observed spread. Falling means demand
-            is funnelling onto fewer venues. Robust to catalog size — a plain Gini over{" "}
-            {(metrics[control]?.footfall?.n_places ?? 0).toLocaleString()} POIs would read
-            ~0.99 for every condition and measure nothing.
-          </>
-        }
-      >
+      <Panel title="Effective number of venues">
         <DayLines data={days} series={run.conditions} colors={colors}
                   yLabel="effective venues" format={(v) => v.toFixed(1)} />
       </Panel>
@@ -219,10 +224,7 @@ function FeedbackLoop({
                   yLabel="share of visits" format={(v) => `${(v * 100).toFixed(1)}%`} />
       </Panel>
 
-      <Panel
-        title="Concentration of footfall (Lorenz)"
-        hint="Across the venues that were visited at all. The further a curve bows below the diagonal, the more unequally visits are distributed."
-      >
+      <Panel title="Concentration of footfall (Lorenz)">
         <LorenzChart curves={lorenz} colors={colors} />
       </Panel>
 
@@ -258,7 +260,7 @@ function FeedbackLoop({
                   <tr key={c} className={c === control ? "row-control" : ""}>
                     <td>
                       <span className="swatch" style={{ background: colors[c] }} />
-                      {c}{c === control ? " (control)" : ""}
+                      {condLabel(c)}{c === control ? " (control)" : ""}
                     </td>
                     <td>{c === control ? "—" : pct(t.recommended_rate)}</td>
                     <td>{pct(t.organic_rate)}</td>
@@ -324,7 +326,7 @@ function Geography({
 
       <Panel
         title="Extra CO₂ from being recommended to"
-        hint={<>Change in tailpipe emissions per leisure trip versus the <b>{control}</b> control. Above the line, the recommender is adding emissions; below it, saving them.</>}
+        hint={<>Change in tailpipe emissions per leisure trip versus the <b>{condLabel(control)}</b> control. Above the line, the recommender is adding emissions; below it, saving them.</>}
       >
         <GroupedBars data={co2Rows} categoryKey="band" series={treated} colors={colors}
                      yLabel="kg CO₂e per trip" zeroLine
@@ -345,7 +347,7 @@ function Geography({
                 <tr key={r.condition} className={r.condition === control ? "row-control" : ""}>
                   <td>
                     <span className="swatch" style={{ background: colors[r.condition] }} />
-                    {r.condition}{r.condition === control ? " (control)" : ""}
+                    {condLabel(r.condition)}{r.condition === control ? " (control)" : ""}
                   </td>
                   <td>{r.ratio.toFixed(2)}×</td>
                   <td>{r.excess >= 0 ? "+" : ""}{r.excess.toFixed(2)} km</td>
@@ -356,11 +358,7 @@ function Geography({
         </div>
       </Panel>
 
-      <Panel
-        title="Where the winners and losers live"
-        hint={<>Agent homes binned into hexagons, coloured by mean change in leisure net utility versus the control. Blue is better off under <b>{treated[0] ?? "the recommender"}</b>, orange worse off. Homes come from real LODES commutes, so this is the metro's actual residential geography.</>}
-        wide
-      >
+      <Panel title="Where the winners and losers live" wide>
         <WelfareMap run={run} conditions={treated} />
       </Panel>
     </div>
@@ -421,32 +419,26 @@ function WhoGainsLoses({
 
   return (
     <div className="panel-grid">
-      <Panel
-        title="Welfare by household income"
-        hint={<>Mean leisure net utility, pooled over the run. The grey <b>{control}</b> bar is what these agents got with no recommender at all.</>}
-      >
+      <Panel title="Utility by household income">
         <GroupedBars data={incomeRows} categoryKey="band" series={run.conditions}
                      colors={colors} yLabel="mean net utility" zeroLine />
       </Panel>
 
-      <Panel
-        title="Welfare by trust in platforms"
-        hint="Quartiles of the agents' trust latent variable, which drives how likely they are to accept a recommendation. Q1 trusts least, Q4 most — so this is who the recommender actually reaches, and whether reaching them helped."
-      >
+      <Panel title="Utility by trust in platforms">
         <GroupedBars data={trustRows} categoryKey="group" series={run.conditions}
                      colors={colors} yLabel="mean net utility" zeroLine />
       </Panel>
 
       <Panel
         title="What each income group ends up visiting"
-        hint={<>Change in the share of a band's leisure visits going to each venue type, in percentage points versus <b>{control}</b>. Blue means the recommender sends that group there more often than they would have gone on their own.</>}
+        hint={<>Change in the share of a band's leisure visits going to each venue type, in percentage points versus <b>{condLabel(control)}</b>. Blue means the recommender sends that group there more often than they would have gone on their own.</>}
         wide
       >
         {treated.length > 1 && (
           <label className="inline-picker">
             Condition
             <select value={heatCondition} onChange={(e) => setHeatCondition(e.target.value)}>
-              {treated.map((c) => <option key={c} value={c}>{c}</option>)}
+              {treated.map((c) => <option key={c} value={c}>{condLabel(c)}</option>)}
             </select>
           </label>
         )}

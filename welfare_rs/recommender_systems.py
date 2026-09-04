@@ -521,16 +521,17 @@ class RecommenderConfig:
 
 #: Named starting points for the builder. Each is a set of values for the SAME
 #: knobs — the platforms differ by which weights are zero, not by having
-#: different machinery. "Google Maps" is proximity-led with no footfall term;
-#: "OpenTable" is footfall-led with no proximity term. That is exactly the
-#: design difference the two original classes encoded.
+#: different machinery. "Proximity-led" (the Google Maps-style ranking) has no
+#: footfall term; "Footfall-led" (the OpenTable-style one) has no proximity
+#: term. That is exactly the design difference the two original classes
+#: encoded.
 RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
-    "Google Maps": {
+    "Proximity-led": {
         "w_rating": 0.25, "w_reviews": 0.20, "w_relevance": 0.10,
         "w_proximity": 0.35, "w_popularity": 0.00, "w_personalization": 0.10,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
-    "OpenTable": {
+    "Footfall-led": {
         "w_rating": 0.20, "w_reviews": 0.25, "w_relevance": 0.10,
         "w_proximity": 0.00, "w_popularity": 0.35, "w_personalization": 0.10,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,

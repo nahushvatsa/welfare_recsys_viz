@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import { MapboxOverlay } from "@deck.gl/mapbox";
 import { HexagonLayer } from "@deck.gl/aggregation-layers";
+import { condLabel } from "./charts";
 import type { RunMeta, WelfareMapRow } from "../types";
 
 const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
@@ -135,7 +136,7 @@ export default function WelfareMap({
             Condition
             <select value={condition} onChange={(e) => setCondition(e.target.value)}>
               {conditions.map((c) => (
-                <option key={c} value={c}>{c}</option>
+                <option key={c} value={c}>{condLabel(c)}</option>
               ))}
             </select>
           </label>

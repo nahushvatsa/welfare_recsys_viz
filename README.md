@@ -136,7 +136,7 @@ work for engine-level experiments; the app itself only surfaces the 8 metros.
 
 A study is the **No-RS control** plus up to five recommenders the user builds in
 the sidebar. Every recommender is the *same* scorer with different knob values —
-the presets ("Google Maps", "OpenTable", "Viral", …) differ by which weights they
+the presets ("Proximity-led", "Footfall-led", "Viral", …) differ by which weights they
 zero out, not by having different machinery:
 
 | Knob | Meaning |

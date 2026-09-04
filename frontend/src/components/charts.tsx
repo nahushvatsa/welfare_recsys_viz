@@ -6,7 +6,7 @@
  * always sits first, because every panel is a comparison against it and the eye
  * needs a fixed reference.
  */
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 import {
   Bar,
   BarChart,
@@ -33,6 +33,41 @@ export const SERIES_COLORS = [
 ];
 export const CONTROL_COLOR = "#8a8a94";
 
+/**
+ * Display names for conditions.
+ *
+ * Presentation only. The raw condition string stays the key everywhere it
+ * matters — it indexes `metrics`, `colors`, `welfare_map.delta` and the API's
+ * `?condition=` — so this must never be used to look anything up. Matched
+ * case-insensitively so a study labelled "footfall-led" reads the same as
+ * "Footfall-led".
+ */
+const CONDITION_LABEL: Record<string, string> = {
+  "footfall-led": "Popularity RS",
+  "proximity-led": "Proximity RS",
+  personalized: "Personalized RS",
+};
+
+export function condLabel(condition: string): string {
+  return CONDITION_LABEL[condition.toLowerCase()] ?? condition;
+}
+
+/**
+ * Figure mode: render panels at the proportions of a paper figure.
+ *
+ * A screenshot is scaled to the column, so what matters is the ratio of text to
+ * plot area, not either one's pixel size. At the dashboard's ~700px panel width
+ * the 14px chart text lands at ~4.8pt once it is squeezed into an ACM column —
+ * illegible. Fixing the panel at 470px (see .figure-mode in styles.css) puts the
+ * same text at ~7pt. The chart also loses a little height here so the captured
+ * block is nearer the 3:2 an ACM column figure usually wants.
+ */
+export const FigureMode = createContext(false);
+
+function useChartHeight(height: number): number {
+  return useContext(FigureMode) ? Math.round(height * 0.78) : height;
+}
+
 /** Stable colour per condition: the control is grey, the rest cycle. */
 export function conditionColors(
   conditions: string[],
@@ -57,8 +92,37 @@ function fmt(format?: (v: number) => string) {
   };
 }
 
-const AXIS = { stroke: "var(--chart-axis)", fontSize: 11 };
+const AXIS = { stroke: "var(--chart-axis)", fontSize: 13 };
 const GRID = { stroke: "var(--chart-grid)", strokeDasharray: "3 3" };
+
+/**
+ * Axis titles and legend, sized to be readable in a projected slide rather than
+ * only on a laptop. The panels that carry these charts no longer print a
+ * description under the heading, which is where the room came from.
+ *
+ * `textAnchor` is not cosmetic. Recharts derives it from `position`, and
+ * `insideLeft` yields "start" — so a title rotated -90° starts at the axis
+ * midpoint and grows *upward*, taking its full length out of the top half
+ * alone. At figure-mode heights that half is ~64px against a ~105px title, and
+ * the top of the word is clipped. "middle" centres the rotated text on the
+ * midpoint instead, spending half its length each way. Harmless on the X titles
+ * below, whose position already anchors them "middle".
+ */
+const AXIS_TITLE = { fontSize: 14, fill: "var(--chart-axis)", textAnchor: "middle" as const };
+const LEGEND_STYLE = { fontSize: 14, paddingTop: 6 };
+/** X axes that carry a title need room for ticks + title; 30 (the Recharts
+ *  default) clips the title once the fonts go up. */
+const X_AXIS_HEIGHT = 52;
+/**
+ * How far the X title sits above the bottom of that 52px band.
+ *
+ * `insideBottom` measures up from the band's lower edge (y = bottom - offset),
+ * so bigger means higher. The ticks end ~22px down and the legend opens 6px
+ * below the band, which leaves the title ~10px of air above and ~12px below —
+ * centred in the gap rather than sitting on the legend, which is where the old
+ * -2 (tuned for the default 30px band) had pushed it.
+ */
+const X_TITLE_OFFSET = 6;
 
 export function Panel({
   title,
@@ -86,7 +150,7 @@ function tooltipStyle() {
       background: "var(--chart-tooltip-bg)",
       border: "1px solid var(--chart-grid)",
       borderRadius: 6,
-      fontSize: 12,
+      fontSize: 13.5,
     },
     labelStyle: { color: "var(--fg)" },
   };
@@ -108,18 +172,19 @@ export function DayLines({
   height?: number;
   format?: (v: number) => string;
 }) {
+  const h = useChartHeight(height);
   return (
-    <ResponsiveContainer width="100%" height={height}>
+    <ResponsiveContainer width="100%" height={h}>
       <LineChart data={data} margin={{ top: 6, right: 12, bottom: 4, left: 4 }}>
         <CartesianGrid {...GRID} />
-        <XAxis dataKey="day" {...AXIS} tickLine={false}
-               label={{ value: "simulated day", position: "insideBottom", offset: -2, fontSize: 11, fill: "var(--chart-axis)" }} />
-        <YAxis {...AXIS} tickLine={false} width={48}
-               label={{ value: yLabel, angle: -90, position: "insideLeft", fontSize: 11, fill: "var(--chart-axis)" }} />
+        <XAxis dataKey="day" {...AXIS} tickLine={false} height={X_AXIS_HEIGHT}
+               label={{ value: "simulated day", position: "insideBottom", offset: X_TITLE_OFFSET, ...AXIS_TITLE }} />
+        <YAxis {...AXIS} tickLine={false} width={62}
+               label={{ value: yLabel, angle: -90, position: "insideLeft", ...AXIS_TITLE }} />
         <Tooltip {...tooltipStyle()} formatter={fmt(format)} />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
+        <Legend wrapperStyle={LEGEND_STYLE} />
         {series.map((s) => (
-          <Line key={s} type="monotone" dataKey={s} stroke={colors[s]}
+          <Line key={s} type="monotone" dataKey={s} name={condLabel(s)} stroke={colors[s]}
                 strokeWidth={2} dot={false} isAnimationActive={false} />
         ))}
       </LineChart>
@@ -147,19 +212,20 @@ export function GroupedBars({
   format?: (v: number) => string;
   zeroLine?: boolean;
 }) {
+  const h = useChartHeight(height);
   return (
-    <ResponsiveContainer width="100%" height={height}>
+    <ResponsiveContainer width="100%" height={h}>
       <BarChart data={data} margin={{ top: 6, right: 12, bottom: 4, left: 4 }}>
         <CartesianGrid {...GRID} vertical={false} />
-        <XAxis dataKey={categoryKey} {...AXIS} tickLine={false} />
-        <YAxis {...AXIS} tickLine={false} width={52}
-               label={{ value: yLabel, angle: -90, position: "insideLeft", fontSize: 11, fill: "var(--chart-axis)" }} />
+        <XAxis dataKey={categoryKey} {...AXIS} tickLine={false} height={34} />
+        <YAxis {...AXIS} tickLine={false} width={66}
+               label={{ value: yLabel, angle: -90, position: "insideLeft", ...AXIS_TITLE }} />
         <Tooltip {...tooltipStyle()} cursor={{ fill: "var(--chart-grid)", opacity: 0.25 }}
                  formatter={fmt(format)} />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
+        <Legend wrapperStyle={LEGEND_STYLE} />
         {zeroLine && <ReferenceLine y={0} stroke="var(--chart-axis)" strokeWidth={1} />}
         {series.map((s) => (
-          <Bar key={s} dataKey={s} fill={colors[s]} isAnimationActive={false} radius={[2, 2, 0, 0]} />
+          <Bar key={s} dataKey={s} name={condLabel(s)} fill={colors[s]} isAnimationActive={false} radius={[2, 2, 0, 0]} />
         ))}
       </BarChart>
     </ResponsiveContainer>
@@ -257,6 +323,7 @@ export function LorenzChart({
   colors: Record<string, string>;
   height?: number;
 }) {
+  const h = useChartHeight(height);
   const names = Object.keys(curves);
   const grid = curves[names[0]] ?? [];
   const data = grid.map((point, i) => {
@@ -266,23 +333,24 @@ export function LorenzChart({
   });
 
   return (
-    <ResponsiveContainer width="100%" height={height}>
+    <ResponsiveContainer width="100%" height={h}>
       <LineChart data={data} margin={{ top: 6, right: 12, bottom: 4, left: 4 }}>
         <CartesianGrid {...GRID} />
         <XAxis dataKey="x" type="number" domain={[0, 1]} {...AXIS} tickLine={false}
+               height={X_AXIS_HEIGHT}
                tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
-               label={{ value: "POIs, least visited first", position: "insideBottom", offset: -2, fontSize: 11, fill: "var(--chart-axis)" }} />
-        <YAxis domain={[0, 1]} {...AXIS} tickLine={false} width={48}
+               label={{ value: "POIs, least visited first", position: "insideBottom", offset: X_TITLE_OFFSET, ...AXIS_TITLE }} />
+        <YAxis domain={[0, 1]} {...AXIS} tickLine={false} width={62}
                tickFormatter={(v: number) => `${Math.round(v * 100)}%`}
-               label={{ value: "share of visits", angle: -90, position: "insideLeft", fontSize: 11, fill: "var(--chart-axis)" }} />
+               label={{ value: "share of visits", angle: -90, position: "insideLeft", ...AXIS_TITLE }} />
         <Tooltip {...tooltipStyle()}
                  formatter={fmt((v) => `${(v * 100).toFixed(1)}%`)}
                  labelFormatter={(v) => `${(Number(v) * 100).toFixed(0)}% of POIs`} />
-        <Legend wrapperStyle={{ fontSize: 11 }} />
+        <Legend wrapperStyle={LEGEND_STYLE} />
         <Line dataKey="equality" stroke="var(--chart-axis)" strokeDasharray="4 4"
               strokeWidth={1} dot={false} isAnimationActive={false} name="perfect equality" />
         {names.map((n) => (
-          <Line key={n} dataKey={n} stroke={colors[n]} strokeWidth={2} dot={false} isAnimationActive={false} />
+          <Line key={n} dataKey={n} name={condLabel(n)} stroke={colors[n]} strokeWidth={2} dot={false} isAnimationActive={false} />
         ))}
       </LineChart>
     </ResponsiveContainer>

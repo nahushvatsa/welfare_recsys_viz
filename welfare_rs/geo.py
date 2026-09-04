@@ -245,6 +245,7 @@ class RoadNetwork:
         self._commutes = None
         self._commute_cum = None      # prefix sum of job weights
         self._commute_total = 0.0
+        self._commute_seg_cum = {}    # LODES age segment -> (prefix sum, total)
 
     def __getstate__(self) -> dict:
         """Exclude the lazily-rebuilt acceleration structures from pickling (so
@@ -265,6 +266,10 @@ class RoadNetwork:
         state["_mat_rows"] = {}
         state["_pred_cache"] = {}
         state["_commute_total"] = 0.0
+        # Per-segment prefix sums are as long as the pair table (three arrays of
+        # a few million floats on a large metro), and are rebuilt lazily from the
+        # pairs the worker re-attaches, so they never belong in the cache.
+        state["_commute_seg_cum"] = {}
         return state
 
     # Attributes added after warm pickles were first written. Restoring them
@@ -281,6 +286,9 @@ class RoadNetwork:
         for key in self._LAZY_DEFAULTS:
             state.setdefault(key, None)
         state.setdefault("_commute_total", 0.0)
+        state.setdefault("_commute_seg_cum", {})
+        if state.get("_commute_seg_cum") is None:
+            state["_commute_seg_cum"] = {}
         state.setdefault("_mat_rows", {})
         if state.get("_mat_rows") is None:  # pickled before the row cache existed
             state["_mat_rows"] = {}
@@ -1043,6 +1051,97 @@ class RoadNetwork:
 
     # ── real commutes (LODES block pairs) ────────────────────────────────────
 
+    @staticmethod
+    def lodes_age_segment(age_years) -> int:
+        """Index of the LODES worker-age segment holding ``age_years``.
+
+        LODES OD tables are segmented as sa01 (<=29), sa02 (30-54), sa03 (55+);
+        the boundaries here are those, not the survey's own age bands.
+        """
+        if age_years <= 29:
+            return 0
+        if age_years <= 54:
+            return 1
+        return 2
+
+    @staticmethod
+    def lodes_earnings_segment(annual_income) -> int:
+        """Index of the LODES earnings segment for an annual income figure.
+
+        LODES segments monthly earnings as se01 (<=$1250), se02 ($1251-3333),
+        se03 (>$3333), so the annual figure is divided by 12.
+
+        Caveat worth carrying: LODES earnings are what one worker is paid for
+        one job, while the survey reports total HOUSEHOLD income before taxes.
+        Household income is at least individual earnings and usually more, so
+        agents from multi-earner households land in a higher segment than their
+        own pay would place them, biasing the conditioned draw toward the
+        workplaces of higher earners. Callers pass this only for agents who hold
+        a job; a non-earner has no job earnings to segment on at all.
+        """
+        monthly = float(annual_income) / 12.0
+        if monthly <= 1250.0:
+            return 0
+        if monthly <= 3333.0:
+            return 1
+        return 2
+
+    def _commute_segment_cum(self, age_seg, earn_seg):
+        """Cumulative job weights within a LODES age and/or earnings segment.
+
+        Built on first use and cached under ``(age_seg, earn_seg)``: a metro
+        carries millions of pairs and a run touches at most a few thousand, so
+        the prefix sums are only worth paying for in the segments a population
+        actually draws from. Either index may be None to leave that margin free.
+
+        LODES publishes the two segmentations as separate marginal counts per
+        pair, never their cross-tabulation, so conditioning on both at once
+        cannot be exact. The joint weight is taken as
+        ``age[a] * earn[e] / jobs``, the count expected if the two were
+        independent within the pair. Conditioning on a single margin needs no
+        such assumption.
+
+        Returns ``(None, 0.0)`` when the requested segment carries no jobs, which
+        is the caller's signal to fall back to the unconditioned draw.
+        """
+        key = (age_seg, earn_seg)
+        cached = self._commute_seg_cum.get(key)
+        if cached is not None:
+            return cached
+
+        pairs = self._commutes
+        age = getattr(pairs, "age", None)
+        earn = getattr(pairs, "earn", None)
+        n = len(pairs)
+
+        def margin(arr, index):
+            if index is None:
+                return None
+            if arr is None or arr.shape[0] != n:
+                return False  # segment counts unavailable
+            return np.asarray(arr[:, index], dtype=np.float64)
+
+        a = margin(age, age_seg)
+        e = margin(earn, earn_seg)
+        if a is False or e is False:
+            entry = (None, 0.0)
+        else:
+            if a is None and e is None:
+                weights = np.asarray(pairs.jobs, dtype=np.float64)
+            elif e is None:
+                weights = a
+            elif a is None:
+                weights = e
+            else:
+                jobs = np.asarray(pairs.jobs, dtype=np.float64)
+                weights = np.divide(a * e, jobs, out=np.zeros_like(jobs), where=jobs > 0)
+            cum = np.cumsum(weights)
+            total = float(cum[-1]) if cum.size else 0.0
+            entry = (cum, total) if total > 0 else (None, 0.0)
+
+        self._commute_seg_cum[key] = entry
+        return entry
+
     def attach_commutes(self, pairs) -> None:
         """Attach block-level home->work pairs as the placement distribution.
 
@@ -1055,6 +1154,7 @@ class RoadNetwork:
             self._commutes = None
             self._commute_cum = None
             self._commute_total = 0.0
+            self._commute_seg_cum = {}
             return
         weights = np.asarray(pairs.jobs, dtype=np.float64)
         cum = np.cumsum(weights)
@@ -1063,10 +1163,12 @@ class RoadNetwork:
             self._commutes = None
             self._commute_cum = None
             self._commute_total = 0.0
+            self._commute_seg_cum = {}
             return
         self._commutes = pairs
         self._commute_cum = cum
         self._commute_total = total
+        self._commute_seg_cum = {}
 
     @property
     def has_commutes(self) -> bool:
@@ -1076,12 +1178,24 @@ class RoadNetwork:
     def num_commute_pairs(self) -> int:
         return 0 if self._commutes is None else len(self._commutes)
 
-    def sample_commute(self, rng: random.Random):
+    def sample_commute(self, rng: random.Random, age_years=None, annual_income=None):
         """Draw one real commute, or None when no pairs are attached.
 
         A pair is drawn with probability ∝ its LODES job count, so the commute
         length distribution — and the home/work correlation that produces it —
         matches the published data rather than two independent uniform draws.
+
+        Passing ``age_years`` and/or ``annual_income`` restricts the draw to the
+        matching LODES worker segment, so an agent's commute geography stays
+        consistent with the demographics it was given: where the young and the
+        over-55 work in a metro, and where low and high earners work, are not the
+        same distributions. Falls back to the unconditioned draw when the segment
+        carries no jobs, or when the attached pairs have no segment counts.
+
+        ``annual_income`` is divided by 12 to reach the monthly figure LODES
+        segments on. See :meth:`lodes_earnings_segment` for why that mapping is
+        approximate, and :meth:`_commute_segment_cum` for how the two margins are
+        combined when both are given.
 
         Returns ``(home, work, home_access_km, work_access_km)``. The two
         locations are the block internal points **snapped to the graph**; the
@@ -1094,9 +1208,17 @@ class RoadNetwork:
         """
         if self._commutes is None:
             return None
-        x = rng.random() * self._commute_total
-        i = int(np.searchsorted(self._commute_cum, x, side="right"))
-        i = min(i, len(self._commute_cum) - 1)
+        cum, total = self._commute_cum, self._commute_total
+        if age_years is not None or annual_income is not None:
+            seg_cum, seg_total = self._commute_segment_cum(
+                None if age_years is None else self.lodes_age_segment(age_years),
+                None if annual_income is None else self.lodes_earnings_segment(annual_income),
+            )
+            if seg_total > 0:
+                cum, total = seg_cum, seg_total
+        x = rng.random() * total
+        i = int(np.searchsorted(cum, x, side="right"))
+        i = min(i, len(cum) - 1)
         c = self._commutes
 
         h_true = (float(c.h_lat[i]), float(c.h_lon[i]))

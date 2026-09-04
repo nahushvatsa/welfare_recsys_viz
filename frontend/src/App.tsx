@@ -4,6 +4,7 @@ import MapView from "./components/MapView";
 import Results from "./components/Results";
 import RunList from "./components/RunList";
 import { BLANK_SPEC } from "./components/RecommenderBuilder";
+import { condLabel } from "./components/charts";
 import { cancelRun, createRun, fetchRun, getCities, getRun, subscribeProgress } from "./api";
 import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "./types";
 
@@ -265,7 +266,7 @@ export default function App() {
               <div className="section-head">
                 <h3>
                   Activity-travel over the day · {runMeta.city_label} ·{" "}
-                  {condition}
+                  {condLabel(condition)}
                 </h3>
                 <div className="viz-pickers">
                   {runMeta.conditions.length > 1 && (
@@ -277,7 +278,7 @@ export default function App() {
                       >
                         {runMeta.conditions.map((c) => (
                           <option key={c} value={c}>
-                            {c}
+                            {condLabel(c)}
                             {c === "No RS" ? " (control)" : ""}
                           </option>
                         ))}

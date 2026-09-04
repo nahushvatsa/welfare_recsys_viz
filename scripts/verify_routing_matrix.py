@@ -153,8 +153,8 @@ def main() -> None:
     fresh = build_metro_network(metro, cache_dir=cache)  # untouched caches
     sim = Simulation(
         num_agents=400, seed=42, use_recommenders=True,
-        persona_csv_path=ds.persona_csv_path(),
-        road_network=fresh, poi_rows=ds.poi_rows(metro),
+        persona_rows=ds.personas(), road_network=fresh,
+        poi_rows=ds.poi_rows(metro),
         disabled_modes=("transit",),
     )
     sim.run_days(2)

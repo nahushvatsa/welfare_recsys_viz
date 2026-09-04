@@ -13,6 +13,48 @@ from .utils import clamp, sigmoid, softmax
 from .recommender_systems import LEISURE_SUBTYPE_TO_DEFAULT_KEYWORDS, UserContext
 
 
+# Declared response scale of every survey item, as (min, max) in the item's own
+# units. :meth:`Agent._normalize_score` reads this table instead of guessing
+# from the value, so a producer must hand over each measurement on its native
+# scale — a 7-point Likert item as 1..7, not as an already-normalised 0..1.
+SURVEY_ITEM_SCALES: dict = {
+    # 7-point Likert (1 = Strongly disagree .. 7 = Strongly agree).
+    "follow_through_friend": (1.0, 7.0),
+    "follow_through_platform": (1.0, 7.0),
+    "follow_through_ai": (1.0, 7.0),
+    "cross_platform_search": (1.0, 7.0),
+    "price_filter_tendency": (1.0, 7.0),
+    "group_coordination_preference": (1.0, 7.0),
+    "popularity_herding": (1.0, 7.0),
+    "unexpected_discovery": (1.0, 7.0),
+    "review_posting": (1.0, 7.0),
+    "social_posting": (1.0, 7.0),
+    "switch_when_dissatisfied": (1.0, 7.0),
+    "multi_platform_parallel": (1.0, 7.0),
+    "ai_itinerary_comfort": (1.0, 7.0),
+    "explanation_needed": (1.0, 7.0),
+    # 5-point frequency items. spontaneity_share is the survey's spur_num and
+    # city_familiarity its CityFam_num; both are 1-5, not the 0-100 percentage
+    # and 7-point Likert they were previously normalised against.
+    "incentive_coupon": (1.0, 5.0),
+    "incentive_sponsored": (1.0, 5.0),
+    "incentive_loyalty": (1.0, 5.0),
+    "spontaneity_share": (1.0, 5.0),
+    "city_familiarity": (1.0, 5.0),
+    # Counts, on their natural units.
+    "local_leisure_frequency": (0.0, 7.0),    # outings per week
+    "overnight_trip_frequency": (0.0, 12.0),  # trips per 12 months
+    # Proportions the producer has already expressed on [0, 1].
+    "budget_tightness": (0.0, 1.0),
+    "advice_goal_directed": (0.0, 1.0),
+    "objective_algorithmic_literacy": (0.0, 1.0),
+}
+
+# Big Five, maximization and the platform-attitude composites are all unweighted
+# means of 7-point items, so they share one scale.
+PSYCHOMETRIC_SCALE: tuple = (1.0, 7.0)
+
+
 class Agent:
     """A heterogeneous traveler with preferences, motivations, and paradigms.
 
@@ -23,7 +65,8 @@ class Agent:
     - Self-determination theory: intrinsic vs extrinsic motivation split.
     """
 
-    def __init__(self, agent_id, income, age, car_ownership, home, work, seed=0, eta_shift=0.0):
+    def __init__(self, agent_id, income, age, car_ownership, home, work, seed=0,
+                 eta_shift=0.0, is_employed=True):
         ad = params.AGENT_DEFAULTS
         self.id = agent_id
         self.characteristics = {
@@ -32,8 +75,23 @@ class Agent:
             "car_ownership": car_ownership,
         }
 
-        # Value of time (VOT).
-        self.vot = max(ad["vot_floor"], income / ad["vot_hours_per_year"])
+        # Whether this agent holds a job. Drives two things: the day is anchored
+        # at a workplace only for the employed (see plan_day), and the value of
+        # time below. Defaults True so callers that predate the survey population
+        # keep the work-anchored day they have always had.
+        self.is_employed = bool(is_employed)
+
+        # Value of time: a fraction of the hourly wage equivalent, not the whole
+        # of it. Small (2012) — the paper's own citation for VOT — puts the value
+        # of travel time savings at about half the wage rate. Non-earners take
+        # half again, because the survey reports HOUSEHOLD income and the wage
+        # equivalent is not theirs to begin with.
+        wage_equivalent = income / ad["vot_hours_per_year"]
+        wage_share = (
+            ad["vot_wage_share_employed"] if self.is_employed
+            else ad["vot_wage_share_non_earner"]
+        )
+        self.vot = max(ad["vot_floor"], wage_equivalent * wage_share)
 
         rng = random.Random(seed + agent_id)
         self.preferences = {
@@ -126,7 +184,6 @@ class Agent:
             "group_coordination_preference": 0.5,
             "popularity_herding": 0.5,
             "unexpected_discovery": 0.5,
-            "negative_recommendation_experience": 0.5,
             "review_posting": 0.5,
             "social_posting": 0.5,
             "switch_when_dissatisfied": 0.5,
@@ -221,25 +278,24 @@ class Agent:
         self._base_satisficing_threshold = self.satisficing_threshold
 
     def _normalize_score(self, value, scale_min=1.0, scale_max=7.0):
-        """Normalize a raw survey measurement into [0, 1]."""
+        """Normalize a raw survey measurement into [0, 1].
+
+        The scale is always taken from the caller, never inferred from the
+        value. An earlier version short-circuited on ``0 <= score <= 1`` to pass
+        already-normalised inputs through untouched, which silently mapped a raw
+        "1" — "Strongly disagree", the floor of every 7-point item — onto 1.0,
+        the ceiling. Producers must therefore hand over each measurement on the
+        scale declared for it in :data:`SURVEY_ITEM_SCALES`.
+        """
         if value is None:
             return None
         try:
             score = float(value)
         except (TypeError, ValueError):
             return None
-        if 0.0 <= score <= 1.0:
-            return score
         if scale_max <= scale_min:
             return None
         return clamp((score - scale_min) / (scale_max - scale_min), 0.0, 1.0)
-
-    def _normalized_or(self, mapping, key, fallback, scale_min=1.0, scale_max=7.0):
-        value = mapping.get(key)
-        normalized = self._normalize_score(value, scale_min=scale_min, scale_max=scale_max)
-        if normalized is None:
-            return fallback
-        return normalized
 
     def _set_score_if_present(self, target, mapping, key, scale_min=1.0, scale_max=7.0):
         if key not in mapping:
@@ -272,7 +328,8 @@ class Agent:
         planning_orientation = clamp(
             sp["planning_orientation"]["conscientiousness"] * bf["conscientiousness"]
             + sp["planning_orientation"]["maximization"] * lv["maximization"]
-            + sp["planning_orientation"]["low_spontaneity"] * (1.0 - it["spontaneity_share"]),
+            + sp["planning_orientation"]["low_spontaneity"] * (1.0 - it["spontaneity_share"])
+            + sp["planning_orientation"]["cross_platform_search"] * it["cross_platform_search"],
             0.0,
             1.0,
         )
@@ -293,8 +350,7 @@ class Agent:
         risk_aversion = clamp(
             sp["risk_aversion"]["neuroticism"] * bf["neuroticism"]
             + sp["risk_aversion"]["autonomy"] * lv["autonomy_preference"]
-            + sp["risk_aversion"]["awareness"] * lv["algorithmic_awareness"]
-            + sp["risk_aversion"]["negative_experience"] * it["negative_recommendation_experience"],
+            + sp["risk_aversion"]["awareness"] * lv["algorithmic_awareness"],
             0.0,
             1.0,
         )
@@ -377,7 +433,8 @@ class Agent:
         self.attitudes["travel_affinity"] = clamp(
             self.attitudes["travel_affinity"]
             + sp["attitude_shift"]["travel_affinity_variety"] * (variety_seeking - 0.5)
-            + sp["attitude_shift"]["travel_affinity_frequency"] * (it["local_leisure_frequency"] - 0.5),
+            + sp["attitude_shift"]["travel_affinity_frequency"] * (it["local_leisure_frequency"] - 0.5)
+            + sp["attitude_shift"]["travel_affinity_overnight"] * (it["overnight_trip_frequency"] - 0.5),
             0.0,
             1.0,
         )
@@ -500,6 +557,28 @@ class Agent:
             adjustment += sb["trend_bonus"] * (bc["trend_susceptibility"] - 0.5)
         return adjustment
 
+    def _price_round_trip(self, env, origin, destination, subtype):
+        """Expected disutility of going to ``destination`` and home again.
+
+        Distance only, on the network — the ex-ante view. The realised trip is
+        charged in time under congestion downstream, which is what lets an
+        agent's expectation fall short of the outcome.
+
+        One method rather than two call sites because the acceptance decision
+        differences this against the agent's own pick, and the paper requires
+        both sides to be priced by the same cost model: "The gap is priced with
+        the same cost model the agent used to rank the evening's options, so it
+        values travel the same way whether planning or responding."
+        """
+        pp = params.PARTICIPATION_PARAMS
+        d_out = env.distance_km(origin, destination)
+        d_back = env.distance_km(destination, self.home)
+        disutility = pp["expected_trip_disutility_per_km"] * (d_out + d_back)
+        disutility *= self._trip_disutility_multiplier()
+        if subtype in {"park", "workout_or_run"} and self.walk_tolerance_min >= pp["outdoor_walk_tol_threshold"]:
+            disutility *= pp["outdoor_walk_tol_discount"]
+        return disutility
+
     def _trip_disutility_multiplier(self):
         """Scale expected travel burden from psychological and survey factors."""
         dm = params.SURVEY_BEHAVIOR_PARAMS["trip_disutility_multiplier"]
@@ -522,7 +601,11 @@ class Agent:
                 "latent_variables": {...},
                 "items": {...}
             }
-        Values may be normalized [0,1] or raw Likert-style scores.
+
+        Every value must be on its own native response scale: the psychometric
+        composites on 1-7 (:data:`PSYCHOMETRIC_SCALE`) and each item on the scale
+        declared for it in :data:`SURVEY_ITEM_SCALES`. Values already normalised
+        to [0, 1] are *not* detected and would be read as scale minima.
         """
         if not isinstance(profile, Mapping):
             return
@@ -536,79 +619,21 @@ class Agent:
         if not isinstance(items, Mapping):
             items = {}
 
+        psych_min, psych_max = PSYCHOMETRIC_SCALE
         for key in self.big_five:
-            self._set_score_if_present(self.big_five, bf, key)
+            self._set_score_if_present(
+                self.big_five, bf, key, scale_min=psych_min, scale_max=psych_max
+            )
         for key in self.latent_variables:
-            self._set_score_if_present(self.latent_variables, lv, key)
+            self._set_score_if_present(
+                self.latent_variables, lv, key, scale_min=psych_min, scale_max=psych_max
+            )
 
-        # 7-point items by default.
-        for key in (
-            "follow_through_friend",
-            "follow_through_platform",
-            "follow_through_ai",
-            "cross_platform_search",
-            "price_filter_tendency",
-            "group_coordination_preference",
-            "popularity_herding",
-            "unexpected_discovery",
-            "negative_recommendation_experience",
-            "review_posting",
-            "social_posting",
-            "switch_when_dissatisfied",
-            "multi_platform_parallel",
-            "ai_itinerary_comfort",
-            "explanation_needed",
-            "city_familiarity",
-        ):
-            self._set_score_if_present(self.survey_items, items, key)
-
-        # 5-point items.
-        for key in ("incentive_coupon", "incentive_sponsored", "incentive_loyalty"):
-            self._set_score_if_present(self.survey_items, items, key, scale_min=1.0, scale_max=5.0)
-
-        # Categorical/frequency items pre-scaled to [0, 1] or given in percentages/count bins.
-        self.survey_items["spontaneity_share"] = self._normalized_or(
-            items,
-            "spontaneity_share",
-            self.survey_items["spontaneity_share"],
-            scale_min=0.0,
-            scale_max=100.0,
-        )
-        self.survey_items["local_leisure_frequency"] = self._normalized_or(
-            items,
-            "local_leisure_frequency",
-            self.survey_items["local_leisure_frequency"],
-            scale_min=0.0,
-            scale_max=7.0,
-        )
-        self.survey_items["overnight_trip_frequency"] = self._normalized_or(
-            items,
-            "overnight_trip_frequency",
-            self.survey_items["overnight_trip_frequency"],
-            scale_min=0.0,
-            scale_max=12.0,
-        )
-        self.survey_items["budget_tightness"] = self._normalized_or(
-            items,
-            "budget_tightness",
-            self.survey_items["budget_tightness"],
-            scale_min=0.0,
-            scale_max=1.0,
-        )
-        self.survey_items["advice_goal_directed"] = self._normalized_or(
-            items,
-            "advice_goal_directed",
-            self.survey_items["advice_goal_directed"],
-            scale_min=0.0,
-            scale_max=1.0,
-        )
-        self.survey_items["objective_algorithmic_literacy"] = self._normalized_or(
-            items,
-            "objective_algorithmic_literacy",
-            self.survey_items["objective_algorithmic_literacy"],
-            scale_min=0.0,
-            scale_max=1.0,
-        )
+        for key in self.survey_items:
+            scale_min, scale_max = SURVEY_ITEM_SCALES.get(key, PSYCHOMETRIC_SCALE)
+            self._set_score_if_present(
+                self.survey_items, items, key, scale_min=scale_min, scale_max=scale_max
+            )
 
         self._refresh_behavior_from_survey()
 
@@ -643,12 +668,20 @@ class Agent:
 
     # ── Eta (recommendation acceptance) ──────────────────────────────────────
 
-    def _estimate_eta(self, recommendation_score):
-        """Willingness to accept a recommendation (eta).
+    def _estimate_eta(self, recommendation_score, delta_cost=0.0):
+        """Willingness to accept a recommendation (eta) — the paper's Eq. 2.
 
         eta = baseline(trust, autonomy) + population-wide eta_shift
-              + quality term (RS score) + memory term (accepted count),
+              + quality term (RS score) - extra-travel term (delta_cost)
+              + memory term (accepted count),
         clamped to [eta_min, eta_max]. See ``params.SIMPLIFIED_ETA_PARAMS``.
+
+        ``delta_cost`` is Eq. 2's dC_it: the offered venue's expected round-trip
+        disutility minus that of the venue the agent had already picked, both
+        from :meth:`_price_round_trip`. Positive means the offer costs more
+        travel, which lowers acceptance; negative means it is closer than the
+        agent's own choice, which raises it. Defaults to 0.0 so callers with no
+        alternative to compare against are unaffected.
         """
         sep = params.SIMPLIFIED_ETA_PARAMS
         trust = self.latent_variables.get("trust_platforms", 0.5)
@@ -659,10 +692,11 @@ class Agent:
             - sep["baseline_autonomy_coeff"] * (autonomy - 0.5)
         )
         quality_effect = sep["quality_weight"] * (recommendation_score - 0.5)
+        travel_effect = sep["beta_delta_cost"] * float(delta_cost)
         memory_effect = sep["memory_weight"] * min(
             sep["memory_cap"], self.accepted_recommendation_count
         )
-        eta = eta_base + self.eta_shift + quality_effect + memory_effect
+        eta = eta_base + self.eta_shift + quality_effect - travel_effect + memory_effect
         return clamp(eta, sep["eta_min"], sep["eta_max"])
 
     # ── Feedback ─────────────────────────────────────────────────────────────
@@ -751,7 +785,7 @@ class Agent:
 
         base_remote = ad["remote_base"] + (ad["remote_no_car_boost"] if self.characteristics["car_ownership"] is False else 0.0)
         base_remote += ad["remote_age_55_boost"] if self.characteristics["age"] > 55 else 0.0
-        remote_today = rng.random() < min(ad["remote_cap"], base_remote)
+        remote_today = self.is_employed and rng.random() < min(ad["remote_cap"], base_remote)
 
         work_start = rng.randint(*ad["work_start_range"])
         work_duration = rng.randint(*ad["work_duration_range"])
@@ -762,13 +796,25 @@ class Agent:
         self.had_leisure_opportunity = False
         self.rs_abstained = False
 
-        if remote_today:
+        # An agent who does not hold a job gets no work activity and no commute,
+        # and its discretionary trip departs from home. The survey's 34% who are
+        # retired, unemployed, out of the labour force or studying would
+        # otherwise be charged a commute to a workplace they do not have, and
+        # their leisure travel would be measured from it. Their day still turns
+        # over on the same clock: the survey measures no time-of-day preference,
+        # so inventing a different one for non-workers would be an assumption
+        # the data cannot support. The leisure window is drawn identically and
+        # only its origin differs — which is exactly the existing remote-work
+        # path, and is why that path is reused rather than duplicated.
+        if not self.is_employed:
+            schedule.append(Activity("home", "", "organic", False, "", work_start, work_duration, self.home, is_mandatory=True))
+        elif remote_today:
             schedule.append(Activity("work", "", "organic", False, "", work_start, work_duration, self.home, is_mandatory=True))
         else:
             schedule.append(Activity("work", "", "organic", False, "", work_start, work_duration, self.work, is_mandatory=True))
 
         after_work_start = work_start + work_duration
-        origin_after_work = self.home if remote_today else self.work
+        origin_after_work = self.home if (remote_today or not self.is_employed) else self.work
 
         self.daily_recommendations = {}
 
@@ -800,12 +846,9 @@ class Agent:
             if leisure_start + leisure_duration > open_end:
                 continue
 
-            d_out = env.distance_km(origin_after_work, desired_location)
-            d_back = env.distance_km(desired_location, self.home)
-            expected_trip_disutility = pp["expected_trip_disutility_per_km"] * (d_out + d_back)
-            expected_trip_disutility *= self._trip_disutility_multiplier()
-            if subtype in {"park", "workout_or_run"} and self.walk_tolerance_min >= pp["outdoor_walk_tol_threshold"]:
-                expected_trip_disutility *= pp["outdoor_walk_tol_discount"]
+            expected_trip_disutility = self._price_round_trip(
+                env, origin_after_work, desired_location, subtype
+            )
 
             activity_utility = seg_cfg["activity_utility"]
             activity_utility += pp["activity_intrinsic_coeff"] * self.motivation_weights["intrinsic"]
@@ -843,6 +886,9 @@ class Agent:
                     "desired_place_id": desired_place_id,
                     "activity_utility": activity_utility,
                     "net_utility": net_utility,
+                    # Kept so the acceptance decision can difference against it
+                    # without re-routing the agent's own pick.
+                    "trip_disutility": expected_trip_disutility,
                 }
             )
 
@@ -857,7 +903,6 @@ class Agent:
                 + pp["signal_net_utility_coeff"] * best_net
             )
             participation_signal += sp["spontaneity"] * (self.survey_items["spontaneity_share"] - 0.5)
-            participation_signal -= sp["negative_experience"] * (self.survey_items["negative_recommendation_experience"] - 0.5)
             participation_signal += sp["city_familiarity"] * (self.survey_items["city_familiarity"] - 0.5)
             p_participate = clamp(sigmoid(participation_signal), 0.0, pp["p_participate_max"])
             do_leisure = (rng.random() < p_participate) and (best_net > pp["min_net_utility"])
@@ -906,7 +951,14 @@ class Agent:
             chosen_place_id = chosen["desired_place_id"]
             source = "organic"
             if best_rec is not None:
-                eta = self._estimate_eta(best_rec.score)
+                # Eq. 2's dC_it. The agent's own pick was already priced when
+                # the evening's options were ranked, so only the offered venue
+                # needs routing here.
+                delta_cost = (
+                    self._price_round_trip(env, origin_after_work, best_rec.place.location, subtype)
+                    - chosen["trip_disutility"]
+                )
+                eta = self._estimate_eta(best_rec.score, delta_cost=delta_cost)
                 accepted = rng.random() < eta
                 if accepted:
                     chosen_location = best_rec.place.location

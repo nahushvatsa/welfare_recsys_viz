@@ -99,7 +99,7 @@ def welfare_gain(
         pct_harmed: fraction of agents with negative gain
         gini_treatment: Gini of treatment utilities
         gini_baseline: Gini of baseline utilities
-        orc: Over-Recommendation Cost
+        orc_all_agents: clipped mean loss over ALL agents (NOT the paper's ORC)
     """
     u_t = np.array(utility_treatment, dtype=float)
     u_b = np.array(utility_baseline, dtype=float)
@@ -112,7 +112,11 @@ def welfare_gain(
         "pct_harmed": float(np.mean(diff < 0)),
         "gini_treatment": gini_coefficient(u_t),
         "gini_baseline": gini_coefficient(u_b),
-        "orc": over_recommendation_cost(u_t, u_b),
+        # NOT the paper's ORC. That is per-harmed-agent and lives in
+        # table2_from_utilities; this averages a clipped loss over ALL
+        # agents on total-trip utility. Named apart so the two cannot be
+        # confused by a caller reading this dict.
+        "orc_all_agents": over_recommendation_cost(u_t, u_b),
     }
 
 
@@ -125,13 +129,12 @@ def welfare_gain(
 # (all-trip) utility — a different quantity from the paper's per-harmed-agent ORC.
 
 def leisure_net_utility(trip) -> float:
-    """Paper-aligned realised net trip utility ``U = V - C`` for a leisure trip.
+    """Paper-aligned realised net trip utility ``U = V - C/xi`` for a leisure trip (paper Eq. 3).
 
     ``V`` is the activity benefit (``trip.activity_utility``) and ``C`` is the
     generalized travel cost (``trip.gen_cost``) converted to utility units by the
     same ``gen_cost_denominator`` the simulation uses when travel cost enters mode
-    utility — so V and C live on one scale, matching the paper's Eq. 1 minus the
-    idiosyncratic term.
+    utility — so V and C live on one scale, matching the paper's Eq. 3.
     """
     from . import params
 
@@ -213,7 +216,7 @@ def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
     Agents are matched by id over those who took a leisure trip in *both* runs.
     Harmed % / Improved %: fraction whose eval-day leisure net utility is lower /
     higher under the treatment than under No RS. Mean ORC: mean of
-    ``U_organic - U_rec`` over harmed agents only (Eq. 14).
+    ``U_organic - U_rec`` over harmed agents only (Eq. 10).
     """
     return table2_from_utilities(
         eval_day_leisure_utilities(rec_sim.agents),

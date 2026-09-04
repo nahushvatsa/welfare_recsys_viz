@@ -11,6 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import params, tastes
+from . import agent as agent_module
 from .agent import Agent
 from .datastructures import Trip
 from .poi_select import select_catalog_rows
@@ -52,6 +53,7 @@ class Simulation:
         eta_shift=0.0,
         use_persona_agents=True,
         persona_csv_path=None,
+        persona_rows=None,
         poi_csv_path=None,
         poi_rows=None,
         road_network=None,
@@ -82,6 +84,11 @@ class Simulation:
         self.eta_shift = eta_shift
         self.use_persona_agents = use_persona_agents
         self.persona_csv_path = persona_csv_path if persona_csv_path is not None else params.NYC_PERSONA_CSV_PATH
+        # Persona rows may be handed in directly, the same way poi_rows are, so
+        # a datasource-driven backend can serve a population that is not a file
+        # (PostgresDataSource.personas() reads the survey.personas view). Takes
+        # precedence over persona_csv_path.
+        self.persona_rows = persona_rows
         self.poi_csv_path = poi_csv_path
         # Real-POI rows may be handed in directly (datasource-driven backends);
         # they take precedence over reading poi_csv_path.
@@ -144,10 +151,11 @@ class Simulation:
 
         _num_agents = num_agents if num_agents is not None else sd["num_agents"]
         self.agents = []
-        personas = self._load_personas(self.persona_csv_path) if self.use_persona_agents else []
+        personas = self._load_personas() if self.use_persona_agents else []
         # The given personas are used as-is for the first len(personas) agents.
-        # Beyond that, synthesise realistic, non-duplicate personas + homes (see
-        # _synthesize_persona) so the population can exceed the provided set.
+        # Beyond that, whole profiles are resampled with replacement (see
+        # _resample_persona) so the population can exceed the provided set
+        # without breaking the joint distribution over its attributes.
         used_homes = set()
         for p in personas:
             try:
@@ -158,7 +166,7 @@ class Simulation:
         tp = params.TASTE_PARAMS
         for i in range(_num_agents):
             if personas:
-                persona = personas[i] if i < len(personas) else self._synthesize_persona(i, personas, syn_rng, used_homes)
+                persona = personas[i] if i < len(personas) else self._resample_persona(i, personas, syn_rng, used_homes)
                 agent = self._build_agent_from_persona(i, persona)
             else:
                 agent = self._build_random_agent(i)
@@ -263,10 +271,22 @@ class Simulation:
 
     # ── Persona loading ──────────────────────────────────────────────────────
 
-    def _load_personas(self, persona_csv_path):
-        if not persona_csv_path:
+    def _load_personas(self):
+        """The agent population, from handed-in rows or the persona CSV.
+
+        Rows passed to the constructor win: on the lab server they come from
+        ``PostgresDataSource.personas()`` (the ``survey.personas`` view), which
+        yields the same dicts the CSV does — string values, empty string for a
+        missing cell — so nothing below this point can tell the two apart.
+        Order is preserved either way, and it matters: agent ``i`` is
+        ``personas[i]``, and the paired No-RS comparison needs that to be the
+        same respondent in every run.
+        """
+        if self.persona_rows is not None:
+            return [dict(r) for r in self.persona_rows if r.get("PersonaID")]
+        if not self.persona_csv_path:
             return []
-        path = Path(persona_csv_path)
+        path = Path(self.persona_csv_path)
         if not path.exists():
             return []
         rows = []
@@ -281,7 +301,7 @@ class Simulation:
         """Map a persona's real (lat, lon) to the nearest network node."""
         return self.road_network.snap_latlon(lat, lon)
 
-    def _sample_home_work(self, persona=None):
+    def _sample_home_work(self, persona=None, age_years=None, annual_income=None):
         """Return ``(home, work)`` for one agent.
 
         Preference order:
@@ -289,13 +309,19 @@ class Simulation:
         1. A **real LODES commute pair** when the network carries them — one
            draw ∝ that pair's job count gives a home and a workplace that
            actually go together, so commute lengths follow the published
-           distribution instead of two independent uniform draws.
+           distribution instead of two independent uniform draws. ``age_years``
+           and ``annual_income`` narrow that draw to the matching LODES worker
+           segments, keeping commute geography consistent with the agent's
+           demographics. Pass ``annual_income`` only for agents who hold a job:
+           LODES earnings are job earnings, so a non-earner has nothing to
+           segment on.
         2. Otherwise the provisional split: a county-weighted home (or the
            persona's own coordinates on an unlayered network) plus a uniform
            workplace inside the core.
         """
         net = self.road_network
-        drawn = net.sample_commute(self._loc_rng) if net.has_commutes else None
+        drawn = (net.sample_commute(self._loc_rng, age_years=age_years, annual_income=annual_income)
+                 if net.has_commutes else None)
         if drawn is not None:
             return drawn
 
@@ -316,36 +342,48 @@ class Simulation:
         return home, net.sample_core_latlon(self._loc_rng), 0.0, 0.0
 
     @staticmethod
-    def _coerce_unit_interval(value):
+    def _coerce_measurement(value):
+        """Parse a persona cell as a number on the item's own response scale.
+
+        Deliberately numeric-only. Categorical tokens ("high", "yes") used to be
+        mapped onto [0, 1] here, but the consumer normalises against each item's
+        declared scale (``agent.SURVEY_ITEM_SCALES``), so a 0.8 arriving for a
+        1-7 item would be read as below its floor. Token-valued persona columns
+        are handled in the fallback block, which emits native-scale values.
+        """
         if value is None:
             return None
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
         if isinstance(value, (int, float)):
             return float(value)
-        token = str(value).strip().lower()
+        token = str(value).strip()
         if token == "":
             return None
-        lookup = {
-            "yes": 1.0,
-            "no": 0.0,
-            "true": 1.0,
-            "false": 0.0,
-            "high": 0.8,
-            "medium": 0.5,
-            "med": 0.5,
-            "low": 0.2,
-            "option a": 1.0,
-            "a": 1.0,
-            "option b": 0.0,
-            "b": 0.0,
-            "it depends": 0.5,
-            "depends": 0.5,
-        }
-        if token in lookup:
-            return lookup[token]
         try:
             return float(token)
         except ValueError:
             return None
+
+    @staticmethod
+    def _unit_to_scale(unit_value, scale_min, scale_max):
+        """Place a 0-1 judgement onto an item's native response scale."""
+        return scale_min + float(unit_value) * (scale_max - scale_min)
+
+    @staticmethod
+    def _persona_is_employed(persona) -> bool:
+        """Whether a persona holds a job, from the survey's Employment item (Q5).
+
+        Full-time, part-time and self-employed count; retired, unemployed,
+        out-of-the-labour-force and student do not. Part-time is treated as
+        employed without proration — the survey records no hours, so any split
+        finer than this would be invented. Population files with no Employment
+        column fall back to employed, preserving the pre-survey behaviour.
+        """
+        raw = str(persona.get("Employment", "") or "").strip().lower()
+        if raw == "":
+            return True
+        return raw.startswith("employed") or raw.startswith("self-employed")
 
     @staticmethod
     def _first_nonempty(row, keys):
@@ -385,77 +423,98 @@ class Simulation:
         }
         latent_alias = {
             "maximization": ("maximization", "lv_maximization", "Maximization"),
-            "trust_platforms": ("trust_platforms", "lv_trust_platforms", "platform_trust"),
-            "autonomy_preference": ("autonomy_preference", "lv_autonomy", "autonomy_control"),
-            "algorithmic_awareness": ("algorithmic_awareness", "lv_algorithmic_awareness", "algorithm_awareness"),
-        }
-        item_alias = {
-            "local_leisure_frequency": ("q12_leisure_freq", "local_leisure_frequency"),
-            "overnight_trip_frequency": ("q13_overnight_freq", "overnight_trip_frequency"),
-            "spontaneity_share": ("q14_spontaneity", "spontaneity_share"),
-            "follow_through_friend": ("q17_follow_friend", "follow_through_friend"),
-            "follow_through_platform": ("q18_follow_platform", "follow_through_platform"),
-            "follow_through_ai": ("q19_follow_ai", "follow_through_ai"),
-            "incentive_coupon": ("q2_5a_coupon", "incentive_coupon"),
-            "incentive_sponsored": ("q2_5b_sponsored", "incentive_sponsored"),
-            "incentive_loyalty": ("q2_5c_loyalty", "incentive_loyalty"),
-            "cross_platform_search": ("search_depth", "cross_platform_search"),
-            "price_filter_tendency": ("price_filter_tendency", "price_filter_use"),
-            "group_coordination_preference": ("group_coordination_preference",),
-            "popularity_herding": ("q2_4i_trending", "popularity_herding"),
-            "unexpected_discovery": ("q2_4e_serendipity", "unexpected_discovery"),
-            "negative_recommendation_experience": (
-                "q2_4k_negative_platform",
-                "q6_1f_disappointing_recommendation",
-                "negative_recommendation_experience",
+            "trust_platforms": ("trust_platforms", "lv_trust_platforms", "Recommendation_Trust"),
+            # NOT the survey's Autonomy_Control composite. That composite is
+            # positively loaded on liking personalisation ("I like when a platform
+            # tailors its suggestions", "platforms help me discover things I would
+            # not have found") and correlates +0.46 with Recommendation_Trust and
+            # +0.43 with following platform recommendations. This slot enters
+            # eta_base with a NEGATIVE coefficient (params.SIMPLIFIED_ETA_PARAMS),
+            # so feeding it the composite inverts beta_O for the whole population.
+            # s6_autonomy_control_a — "I prefer to make my own leisure choices
+            # rather than follow platform suggestions" — is the item that measures
+            # this construct (-0.52 with trust, -0.29 with follow-through) and is
+            # deliberately excluded from every composite in the survey package.
+            "autonomy_preference": ("autonomy_preference", "lv_autonomy", "s6_autonomy_control_a"),
+            "algorithmic_awareness": (
+                "algorithmic_awareness",
+                "lv_algorithmic_awareness",
+                "Algorithmic_Awareness",
             ),
-            "review_posting": ("q6_4a_review", "review_posting"),
-            "social_posting": ("q6_4b_social_post", "social_posting"),
-            "switch_when_dissatisfied": ("q6_4c_switch_platform", "switch_when_dissatisfied"),
-            "multi_platform_parallel": ("q6_4d_multi_platform", "multi_platform_parallel"),
-            "advice_goal_directed": ("q22_advice_preference", "advice_goal_directed"),
-            "objective_algorithmic_literacy": ("q21_algorithmic_literacy", "objective_algorithmic_literacy"),
-            "city_familiarity": ("q11_city_familiarity", "city_familiarity"),
+        }
+        # Second alias in each tuple is the source column in the Prolific survey
+        # (data_handoff/algo_leisure_survey_2026.csv); see data/build_survey_personas.py.
+        item_alias = {
+            "local_leisure_frequency": ("local_leisure_frequency", "leisure_freq_num"),
+            "overnight_trip_frequency": ("overnight_trip_frequency", "overnight_num"),
+            "spontaneity_share": ("spontaneity_share", "spur_num"),
+            "follow_through_friend": ("follow_through_friend", "s2_Q16"),
+            "follow_through_platform": ("follow_through_platform", "s2_Q17"),
+            "follow_through_ai": ("follow_through_ai", "s2_Q18"),
+            # Q19's incentive battery has no counterpart in this survey.
+            "incentive_coupon": ("incentive_coupon",),
+            "incentive_sponsored": ("incentive_sponsored",),
+            "incentive_loyalty": ("incentive_loyalty",),
+            "cross_platform_search": ("cross_platform_search", "s4_search_c"),
+            "price_filter_tendency": ("price_filter_tendency", "s4_search_e"),
+            "group_coordination_preference": ("group_coordination_preference", "s4_group_coord_mean"),
+            "popularity_herding": ("popularity_herding", "s5_general_a"),
+            "unexpected_discovery": ("unexpected_discovery", "s3_attitudes_d"),
+            "review_posting": ("review_posting",),
+            "social_posting": ("social_posting", "s4_social_media_b"),
+            "switch_when_dissatisfied": ("switch_when_dissatisfied",),
+            "multi_platform_parallel": ("multi_platform_parallel", "s5_search_c"),
+            "advice_goal_directed": ("advice_goal_directed",),
+            "objective_algorithmic_literacy": (
+                "objective_algorithmic_literacy",
+                "s6_algo_knowledge_correct",
+            ),
+            "city_familiarity": ("city_familiarity", "CityFam_num"),
             "budget_tightness": ("budget_tightness",),
-            "ai_itinerary_comfort": ("q6_1e_ai_itinerary", "ai_itinerary_comfort"),
-            "explanation_needed": ("q6_1c_explanation_trust", "explanation_needed"),
+            "ai_itinerary_comfort": ("ai_itinerary_comfort", "s6_trust_reliance_c"),
+            "explanation_needed": ("explanation_needed", "s6_trust_reliance_d"),
         }
 
         for canonical, aliases in big_five_alias.items():
             raw = self._first_nonempty(persona, aliases)
-            value = self._coerce_unit_interval(raw)
+            value = self._coerce_measurement(raw)
             if value is not None:
                 profile["big_five"][canonical] = value
 
         for canonical, aliases in latent_alias.items():
             raw = self._first_nonempty(persona, aliases)
-            value = self._coerce_unit_interval(raw)
+            value = self._coerce_measurement(raw)
             if value is not None:
                 profile["latent_variables"][canonical] = value
 
         for canonical, aliases in item_alias.items():
             raw = self._first_nonempty(persona, aliases)
-            value = self._coerce_unit_interval(raw)
+            value = self._coerce_measurement(raw)
             if value is not None:
                 profile["items"][canonical] = value
 
-        # Fall back to existing persona fields when direct survey columns are absent.
+        # Fall back to the synthetic-persona columns when a survey measurement is
+        # absent. These are coarse judgements on [0, 1], so each is placed on its
+        # item's native scale before handing over — the consumer normalises
+        # against agent.SURVEY_ITEM_SCALES and does not detect pre-normalised
+        # values.
+        scales = agent_module.SURVEY_ITEM_SCALES
         if "budget_tightness" not in profile["items"]:
             budget = str(persona.get("Budget", "medium")).strip().lower()
-            profile["items"]["budget_tightness"] = {"low": 0.85, "medium": 0.50, "high": 0.20}.get(budget, 0.50)
+            unit = {"low": 0.85, "medium": 0.50, "high": 0.20}.get(budget, 0.50)
+            profile["items"]["budget_tightness"] = self._unit_to_scale(unit, *scales["budget_tightness"])
         if "follow_through_ai" not in profile["items"]:
             willingness_ai = str(persona.get("WillingnessAI", "med")).strip().lower()
-            profile["items"]["follow_through_ai"] = {"high": 0.80, "med": 0.55, "low": 0.25}.get(willingness_ai, 0.55)
+            unit = {"high": 0.80, "med": 0.55, "low": 0.25}.get(willingness_ai, 0.55)
+            profile["items"]["follow_through_ai"] = self._unit_to_scale(unit, *scales["follow_through_ai"])
         if "follow_through_platform" not in profile["items"]:
             profile["items"]["follow_through_platform"] = profile["items"]["follow_through_ai"]
         if "popularity_herding" not in profile["items"]:
             top_rated = str(persona.get("TopRated", "no")).strip().lower() == "yes"
-            profile["items"]["popularity_herding"] = 0.75 if top_rated else 0.40
-        if "spontaneity_share" not in profile["items"]:
-            group = str(persona.get("Group", "solo")).strip().lower()
-            profile["items"]["spontaneity_share"] = 0.62 if "friends" in group else 0.45
+            unit = 0.75 if top_rated else 0.40
+            profile["items"]["popularity_herding"] = self._unit_to_scale(unit, *scales["popularity_herding"])
         if "city_familiarity" not in profile["items"]:
-            profile["items"]["city_familiarity"] = 0.65
+            profile["items"]["city_familiarity"] = self._unit_to_scale(0.65, *scales["city_familiarity"])
 
         has_payload = any(profile[section] for section in ("big_five", "latent_variables", "items"))
         return profile if has_payload else {}
@@ -470,7 +529,7 @@ class Simulation:
             car_ownership = self.rng.random() < ad["car_ownership_prob_low_income"]
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
-        home, work, h_acc, w_acc = self._sample_home_work()
+        home, work, h_acc, w_acc = self._sample_home_work(age_years=age, annual_income=income)
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
         agent.home_access_km, agent.work_access_km = h_acc, w_acc
         agent.car_access_type = "own car" if car_ownership else "no car"
@@ -488,16 +547,21 @@ class Simulation:
         income = self.rng.randint(inc_lo, inc_hi)
         age = self.rng.randint(age_lo, age_hi)
 
-        car_access = str(persona.get("CarAccess", "no car")).strip()
-        transit_access = str(persona.get("TransitAccess", "medium")).strip()
-        mobility_needs = str(persona.get("MobilityNeeds", "none")).strip()
-        env_conscious = str(persona.get("EnvConscious", "low")).strip()
-        risk_salience = str(persona.get("RiskSalience", "low")).strip()
-        walk_tol = int(float(str(persona.get("WalkTolerance", "15")).strip()))
+        # Held fixed for the whole population: the survey measures none of these,
+        # and their former per-agent draw came from a balanced experimental
+        # design rather than any population. See PERSONA_MAPPING.fixed_attributes.
+        fa = pm["fixed_attributes"]
+        car_access = fa["car_access"]
+        transit_access = fa["transit_access"]
+        mobility_needs = fa["mobility_needs"]
+        risk_salience = fa["risk_salience"]
+        walk_tol = int(fa["walk_tolerance_min"])
+        primary_interest = fa["primary_interest"]
+        time_window = fa["time_window"]
+
+        # Survey-derived: Budget from monthly leisure spend, TopRated from the
+        # stated preference for well-known destinations (s5_general_a).
         budget = str(persona.get("Budget", "medium")).strip()
-        primary_interest = str(persona.get("PrimaryInterest", "cultural")).strip()
-        time_window = str(persona.get("TimeWindow", "weekday evening")).strip()
-        group = str(persona.get("Group", "solo")).strip()
         top_rated = str(persona.get("TopRated", "no")).strip().lower() == "yes"
 
         # TOGGLE: when CAR_ONLY_MODE is on we neutralise CarAccess /
@@ -518,9 +582,20 @@ class Simulation:
             car_ownership = False
             car_access_penalty = pm["no_car_penalty"]
 
-        home, work, h_acc, w_acc = self._sample_home_work(persona)
+        # Non-earners still take a LODES home: worker home locations are the
+        # best residential distribution the model has, and the workplace half of
+        # the drawn pair simply goes unused by their schedule. Their draw is
+        # conditioned on age only — LODES earnings segments are job earnings,
+        # which someone without a job does not have.
+        is_employed = self._persona_is_employed(persona)
+        home, work, h_acc, w_acc = self._sample_home_work(
+            persona,
+            age_years=age,
+            annual_income=income if is_employed else None,
+        )
 
-        agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
+        agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed,
+                      eta_shift=self.eta_shift, is_employed=is_employed)
         agent.home_access_km, agent.work_access_km = h_acc, w_acc
 
         agent.persona_id = str(persona.get("PersonaID", f"P{i:04d}"))
@@ -535,7 +610,24 @@ class Simulation:
 
         agent.characteristics["car_ownership"] = car_ownership
 
-        agent.preferences["green"] = 0.75 if env_conscious == "high" else 0.25
+        # Survey demographics recorded on the agent for reporting and
+        # segmentation. These are carried, not behavioural: nothing in the
+        # decision rules reads them.
+        #
+        # Employment is the exception — it is read, above, to decide whether the
+        # agent holds a job, and so whether its day is anchored at a workplace
+        # (Agent.plan_day) and whether it is charged the household income as its
+        # own value of time (Agent.vot). It is kept in this list as well so the
+        # raw label survives for reporting.
+        for _field in pm["carried_fields"]:
+            value = persona.get(_field)
+            if value is not None and str(value).strip() != "":
+                agent.characteristics[_field] = value
+
+        # No environmental-attitude override: the survey does not measure one.
+        # The green weight keeps the base draw from AGENT_DEFAULTS and the
+        # Openness-driven shift applied in Agent._refresh_behavior_from_survey,
+        # which is the only empirical signal available for it.
         if budget == "low":
             agent.preferences["cost"] = 1.2
         elif budget == "high":
@@ -543,8 +635,12 @@ class Simulation:
         else:
             agent.preferences["cost"] = 1.0
         agent.preferences["time"] = 1.1 if time_window == "weekday evening" else 0.95
-        agent.attitudes["travel_affinity"] = 0.65 if group in {"solo", "mixed friends 20-30"} else 0.5
-        agent.attitudes["status_seeking"] = 0.7 if primary_interest == "nightlife" else 0.4
+        # travel_affinity and status_seeking keep the base draw from
+        # AGENT_DEFAULTS and the shifts applied in
+        # Agent._refresh_behavior_from_survey. Their former overrides keyed off
+        # travel-party composition and primary leisure interest, neither of
+        # which the survey measures; with those held fixed the override was a
+        # constant, and a constant attitude carries no information.
         agent.attitudes["practice_conformity"] = 0.7 if top_rated else 0.45
 
         # TOGGLE: DERIVED_DEMAND_ONLY skips all persona-driven motivation
@@ -557,14 +653,13 @@ class Simulation:
                 "positionality": 0.0,
             }
         else:
+            # Only the survey-derived adjustment survives. The others keyed off
+            # primary leisure interest and travel-party composition, which the
+            # survey does not measure and which are now population constants —
+            # applying them to every agent alike would shift the whole mixture
+            # rather than differentiate anyone.
             ma = pm["motivation_adjustments"]
             mw = dict(agent.motivation_weights)
-            if primary_interest in {"food", "cultural"}:
-                mw["derived"] += ma["food_cultural_derived"]
-            if primary_interest in {"nightlife", "nature"}:
-                mw["intrinsic"] += ma["nightlife_nature_intrinsic"]
-            if group == "solo":
-                mw["escape"] += ma["solo_escape"]
             if top_rated:
                 mw["positionality"] += ma["top_rated_positionality"]
             total = sum(max(0.01, v) for v in mw.values())
@@ -583,19 +678,39 @@ class Simulation:
 
         return agent
 
-    def _synthesize_persona(self, idx, personas, rng, used_homes):
-        """Extrapolate a new persona to extend the population past the given set.
+    def _resample_persona(self, idx, personas, rng, used_homes):
+        """Extend the population past the given set by resampling a whole profile.
 
-        Each attribute is resampled independently from the base personas' empirical
-        distribution, so per-attribute frequencies match the provided population
-        while the combination is new (not a duplicate row). The home is a fresh,
-        distinct node from the active road network — a realistic on-street location,
-        the same way the base homes were sampled. Caveat: independent resampling
-        reproduces the marginals but not cross-attribute correlations.
+        One respondent is drawn with replacement and copied entire. Resampling
+        the profile rather than each attribute independently is what keeps an
+        agent's attributes jointly consistent: the correlations among personality,
+        platform attitudes and demographics are the observed ones, not the product
+        of their marginals. The previous implementation drew each column
+        independently, which reproduced every marginal exactly and destroyed every
+        correlation — with a survey population that structure is the point, so the
+        copies are whole.
+
+        The cost is duplication: a run of N agents over a sample of n respondents
+        reuses each profile about N/n times. Duplicates are not clones, because
+        latent taste and the home-work pair are drawn per agent downstream, so two
+        agents off the same respondent still differ in geography and in what they
+        like. ``PersonaID`` records the source respondent so runs can be clustered
+        on it.
+
+        The home is only used on unlayered single-city networks; on a metro graph
+        :meth:`_sample_home_work` takes the LODES commute pair instead. It is
+        redrawn distinct here so copies do not stack on one node, and left as the
+        source gives it when the population file carries no coordinates.
         """
-        columns = list(personas[0].keys())
-        synthetic = {col: rng.choice([p.get(col, "") for p in personas]) for col in columns}
-        synthetic["PersonaID"] = f"SYN{idx:04d}"
+        source = rng.choice(personas)
+        resampled = dict(source)
+        resampled["PersonaID"] = f"{source.get('PersonaID', 'P')}#{idx:05d}"
+
+        try:
+            float(source.get("start_latitude", ""))
+            float(source.get("start_longitude", ""))
+        except (TypeError, ValueError):
+            return resampled
 
         home = self.road_network.sample_home_latlon(rng)
         for _ in range(25):  # resample to keep homes distinct
@@ -603,9 +718,9 @@ class Simulation:
                 break
             home = self.road_network.sample_home_latlon(rng)
         used_homes.add((round(home[0], 6), round(home[1], 6)))
-        synthetic["start_latitude"] = f"{home[0]:.6f}"
-        synthetic["start_longitude"] = f"{home[1]:.6f}"
-        return synthetic
+        resampled["start_latitude"] = f"{home[0]:.6f}"
+        resampled["start_longitude"] = f"{home[1]:.6f}"
+        return resampled
 
     # ── Place catalog ────────────────────────────────────────────────────────
 

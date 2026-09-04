@@ -50,7 +50,7 @@ def run_once(metro: str, agents: int, days: int, use_matrix: bool) -> tuple:
     t0 = time.time()
     sim = Simulation(
         num_agents=agents, seed=42, use_recommenders=True,
-        persona_csv_path=ds.persona_csv_path(), road_network=net,
+        persona_rows=ds.personas(), road_network=net,
         poi_rows=ds.poi_rows(metro), disabled_modes=("transit",),
     )
     init_s = time.time() - t0

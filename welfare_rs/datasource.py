@@ -10,7 +10,7 @@ without touching the model:
   per-metro POI CSVs (``<cache>/pois/<metro>_leisure_pois.csv``) are local
   artifacts, regenerated or copied per machine.
 * :class:`PostgresDataSource` reads the same shapes from the lab server's
-  Postgres (ACS + LODES + POI tables) once it exists. Select it with
+  Postgres (survey + LODES + POI tables). Select it with
   ``WELFARE_RS_DATASOURCE=postgres`` and ``WELFARE_RS_PG_DSN=<dsn>``.
 
 Expected Postgres schema (mirrors the local file schemas)::
@@ -47,6 +47,25 @@ Expected Postgres schema (mirrors the local file schemas)::
         PRIMARY KEY (metro, h_geoid, w_geoid)
     );
 
+The population is served by a VIEW rather than a table::
+
+    survey.personas   -- 473 rows, one per survey respondent, 53 columns
+
+It is the SQL twin of ``data/build_survey_personas.py``, defined in
+``db/10_survey_personas.sql`` over the respondent-level ``survey.respondents``
+loaded by ``db/load_survey.py``. Three things about it are deliberate:
+
+* **A view, not a table.** The population is the survey sample itself, not a
+  synthesised draw, so there is nothing to materialise; 473 rows recomputed on
+  demand cost nothing and cannot drift from the respondent file.
+* **It is the access boundary.** ``survey.respondents`` is human-subjects data
+  under IRB-FY2026-11354 and the API-facing ``welfare_app`` role cannot read
+  it. A Postgres view executes with its OWNER's privileges, so ``welfare_app``
+  selects these 53 columns while holding no grant on the 136-column file
+  underneath. This is checked, not assumed — see db/09_survey_schema.sql.
+* **Row order is part of the contract**, because agent ``i`` is respondent
+  ``i``. See :meth:`DataSource.personas`.
+
 Both commute tables are derived from ONE filtered rowset — the LODES8 OD rows
 whose *work* block falls inside the core polygon — at two levels of
 aggregation. ``metro_county_flows`` is that set grouped by home county, and it
@@ -65,6 +84,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
@@ -164,6 +184,29 @@ class DataSource:
         networks (homes/works are sampled from the two-layer geography)."""
         raise NotImplementedError
 
+    def personas(self) -> Optional[List[dict]]:
+        """The agent population as dict rows, or None when the source has none.
+
+        One row per survey respondent, in the column layout
+        ``Simulation._load_personas`` consumes. Prefer this over
+        :meth:`persona_csv_path` — it is the only form the Postgres source can
+        serve, since there the population is a view rather than a file.
+
+        ROW ORDER IS LOAD-BEARING, not cosmetic. ``Simulation`` assigns
+        ``personas[i]`` to agent ``i`` for the first ``len(personas)`` agents,
+        and the paired No-RS counterfactual compares agent ``i`` across
+        conditions — so agent ``i`` must be the same respondent in every run, or
+        the pairing compares different people. Implementations must return a
+        deterministic order (respondent id ascending).
+
+        VALUES ARE STRINGS, exactly as ``csv.DictReader`` yields them, with the
+        empty string for a missing cell. That is a compatibility contract, not
+        laziness: it makes the DB path and the CSV path produce identical dicts,
+        so no consumer has to care which one it got. Python's ``str`` of a float
+        is shortest-round-trip, so ``float(str(x)) == x`` bit for bit.
+        """
+        return None
+
     def has_pois(self, metro: str) -> bool:
         raise NotImplementedError
 
@@ -253,8 +296,21 @@ class LocalDataSource(DataSource):
             return list(csv.DictReader(f))
 
     def persona_csv_path(self) -> Optional[str]:
-        path = params.NYC_PERSONA_CSV_PATH
-        return path if os.path.exists(path) else None
+        # Survey-grounded population (one profile per respondent). Falls back to
+        # the synthetic file when it has not been built — see
+        # data/build_survey_personas.py.
+        for path in (params.SURVEY_PERSONA_CSV_PATH, params.NYC_PERSONA_CSV_PATH):
+            if os.path.exists(path):
+                return path
+        return None
+
+    def personas(self) -> Optional[List[dict]]:
+        """Read the persona CSV. File order is respondent order (R001..R473)."""
+        path = self.persona_csv_path()
+        if path is None:
+            return None
+        with open(path, newline="", encoding="utf-8") as f:
+            return [r for r in csv.DictReader(f) if r.get("PersonaID")]
 
     def _od_csv_path(self, metro: str) -> Optional[str]:
         path = os.path.join(self._cache_dir, "od", f"{metro}_od_pairs.csv")
@@ -419,9 +475,69 @@ class PostgresDataSource(DataSource):
                             jobs=jobs, age=age, earn=earn)
 
     def persona_csv_path(self) -> Optional[str]:
-        # Personas stay file-based until the ACS-driven population lands.
-        path = params.NYC_PERSONA_CSV_PATH
-        return path if os.path.exists(path) else None
+        # Kept for callers that genuinely want a path (scripts/bench_routing.py,
+        # scripts/verify_routing_matrix.py). The DB population is served by
+        # personas() below; this is the on-disk fallback and may be absent on a
+        # server that only ever reads Postgres.
+        for path in (params.SURVEY_PERSONA_CSV_PATH, params.NYC_PERSONA_CSV_PATH):
+            if os.path.exists(path):
+                return path
+        return None
+
+    def personas(self) -> Optional[List[dict]]:
+        """Read the survey population from ``survey.personas``.
+
+        That view is the SQL twin of ``data/build_survey_personas.py``;
+        ``scripts/verify_survey_personas_view.py`` asserts the two agree on all
+        25,069 cells, so this path and the CSV path build the same agents.
+
+        ``ORDER BY "PersonaID"`` is repeated here even though the view already
+        carries one: a view's ORDER BY is not contractual through an outer
+        query, and this order decides which respondent becomes agent i (see
+        :meth:`DataSource.personas`).
+
+        Falls back to the CSV only when the view is genuinely not there — a
+        server that has the POI and commute tables but not yet the survey
+        schema. The catch is NARROW and LOUD on purpose: an outage or a
+        credentials problem must propagate, not quietly swap in whatever CSV
+        happens to be on that disk. A silent fallback is how a run stops being
+        the run you think it is.
+        """
+        import psycopg
+
+        try:
+            rows = self._query_named(
+                'SELECT * FROM survey.personas ORDER BY "PersonaID"', ())
+        except (psycopg.errors.UndefinedTable,        # 42P01 no such view
+                psycopg.errors.InvalidSchemaName,     # 3F000 no survey schema
+                psycopg.errors.InsufficientPrivilege  # 42501 not granted
+                ) as exc:
+            path = self.persona_csv_path()
+            warnings.warn(
+                f"survey.personas is unreadable ({exc.__class__.__name__}); "
+                f"falling back to {path or 'no persona file'}. The population "
+                f"is NOT coming from the database.",
+                RuntimeWarning, stacklevel=2,
+            )
+            if path is None:
+                return None
+            with open(path, newline="", encoding="utf-8") as f:
+                return [r for r in csv.DictReader(f) if r.get("PersonaID")]
+        # NULL -> '' and every value to str: see the contract in
+        # DataSource.personas. csv.DictReader yields strings, and matching it
+        # exactly is what lets the two sources be interchangeable.
+        return [{k: ("" if v is None else str(v)) for k, v in row.items()}
+                for row in rows]
+
+    def _query_named(self, sql: str, args: tuple) -> List[dict]:
+        """Like _query but returns dict rows keyed by the result column names."""
+        import psycopg
+
+        with psycopg.connect(self._dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, args)
+                cols = [d.name for d in cur.description]
+                return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
 # ── Selection ────────────────────────────────────────────────────────────────

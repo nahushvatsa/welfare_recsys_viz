@@ -226,6 +226,13 @@ body { background: var(--bg); color: var(--ink); }
 
 /* ── Results dashboard ────────────────────────────────────────────────────── */
 .results-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+.head-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.figure-toggle {
+  border: 1px solid var(--border); background: #fff; padding: 6px 12px; border-radius: 8px;
+  font-size: 12.5px; color: var(--muted); cursor: pointer; white-space: nowrap;
+}
+.figure-toggle:hover { border-color: var(--accent); color: var(--ink); }
+.figure-toggle.on { border-color: var(--accent); background: rgba(59,130,246,.10); color: #2b5fd0; font-weight: 600; }
 .tabs { display: flex; gap: 2px; background: #eef0f3; padding: 3px; border-radius: 8px; }
 .tab {
   border: 0; background: none; padding: 6px 13px; border-radius: 6px;
@@ -237,20 +244,22 @@ body { background: var(--bg); color: var(--ink); }
 .panel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 4px; }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 14px 8px; min-width: 0; }
 .panel.wide { grid-column: 1 / -1; }
-.panel h4 { margin: 0 0 4px; font-size: 13px; }
-.panel-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--muted); line-height: 1.55; }
+/* Panel headings carry the whole label now that several panels dropped their
+   description paragraph — that is where the extra size comes from. */
+.panel h4 { margin: 0 0 10px; font-size: 16px; }
+.panel-hint { margin: 0 0 10px; font-size: 12.5px; color: var(--muted); line-height: 1.55; }
 
 .table-scroll { overflow-x: auto; }
 .metrics-table .row-control td { color: var(--muted); }
 .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
-.inline-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
-.inline-picker select { padding: 3px 6px; font-size: 12px; border: 1px solid var(--border); border-radius: 5px; background: #fff; }
+.inline-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; color: var(--muted); margin-bottom: 8px; }
+.inline-picker select { padding: 3px 6px; font-size: 13.5px; border: 1px solid var(--border); border-radius: 5px; background: #fff; }
 
 /* Heatmap: a CSS grid, not a chart — every cell prints its own number, which is
    both more readable than a colour key and reachable by a screen reader. */
 .heatmap-scroll { overflow-x: auto; padding-bottom: 4px; }
-.heatmap { display: grid; gap: 2px; font-size: 11px; font-variant-numeric: tabular-nums; min-width: 420px; }
-.hm-corner, .hm-colhead, .hm-rowhead { color: var(--muted); font-size: 10.5px; padding: 4px 6px; }
+.heatmap { display: grid; gap: 2px; font-size: 13px; font-variant-numeric: tabular-nums; min-width: 420px; }
+.hm-corner, .hm-colhead, .hm-rowhead { color: var(--muted); font-size: 12.5px; padding: 4px 6px; }
 .hm-colhead { text-align: center; font-weight: 600; }
 .hm-rowhead { text-align: right; font-weight: 600; white-space: nowrap; }
 .hm-cell { padding: 7px 6px; text-align: center; border-radius: 3px; }
@@ -259,8 +268,12 @@ body { background: var(--bg); color: var(--ink); }
 .welfare-map-controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .welfare-map-canvas { height: 420px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
 .welfare-legend { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+/* The ramp is now the panel's only explanation of what a colour means, so its
+   end labels have to be readable rather than fine print. */
+.welfare-legend .muted.small,
+.welfare-map-controls .muted.small { font-size: 13.5px; }
 .legend-ramp {
-  flex: 1; max-width: 220px; height: 9px; border-radius: 5px;
+  flex: 1; max-width: 220px; height: 11px; border-radius: 6px;
   background: linear-gradient(90deg, #b44e0c, #d6823e, #ebbe96, #aac3e6, #568ad2, #1c52ac);
 }
 .legend-range { margin-left: auto; font-variant-numeric: tabular-nums; }
@@ -268,3 +281,23 @@ body { background: var(--bg); color: var(--ink); }
 @media (max-width: 1100px) {
   .panel-grid { grid-template-columns: 1fr; }
 }
+
+/* ── Figure mode ──────────────────────────────────────────────────────────────
+   For screenshots that go into the paper. A screenshot is scaled to the column
+   on the way in, so the only thing that decides legibility is the ratio of text
+   to plot width — shrinking the fonts here would achieve nothing. Instead the
+   panel is pinned to 470px with the fonts left alone: scaled to an ACM
+   \columnwidth (3.335in) that puts the 14px chart text at ~7pt, next to 9pt
+   body. A .wide panel keeps spanning both slots (954px) and lands at ~7.4pt in
+   a \textwidth figure. Crop to the panel's border.
+
+   Deliberately higher specificity than the max-width:1100px rule above, so a
+   laptop screen does not collapse the grid back to one fluid column. */
+.results.figure-mode .panel-grid {
+  grid-template-columns: repeat(2, 470px);
+  justify-content: start;
+}
+.results.figure-mode .panel { padding: 12px 12px 6px; }
+/* The caption carries this in the manuscript. */
+.results.figure-mode .panel-hint { display: none; }
+.results.figure-mode .welfare-map-canvas { height: 320px; }
