@@ -43,7 +43,8 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import (CITIES, CONTROL, MAX_RECOMMENDERS, TREATMENTS, RunConfig,
+from service import (CITIES, CONTROL, GOVERNOR, MAX_RECOMMENDERS, MAX_STUDIES,
+                     TREATMENTS, RunConfig,
                      manager, precomputed_cities, warmed_cities)
 from welfare_rs.recommender_systems import RECOMMENDER_PRESETS
 
@@ -132,6 +133,18 @@ def _require_run(run_id: str):
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/api/resources")
+def resources() -> dict:
+    """How the box is currently split between running studies.
+
+    Studies share one process pool and each gets an equal share of its slots,
+    so this is the only place the split is visible: how many are running, how
+    many slots each is entitled to, how many are actually busy, and how much
+    RAM headroom is left before the governor throttles new tasks.
+    """
+    return {"max_studies": MAX_STUDIES, **GOVERNOR.snapshot()}
 
 
 @app.get("/api/cities")

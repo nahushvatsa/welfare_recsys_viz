@@ -34,6 +34,27 @@ distribution rather than two independent uniform draws. The county set that
 defines the shell is the same data grouped by home county, so the graph always
 covers the homes it needs to place. See `db/07_commute_tables.sql`.
 
+## Studies run concurrently
+
+Studies no longer queue behind one another. They share **one** process pool
+sized to the box, and `ResourceGovernor` splits its slots evenly between
+whoever is running: one study spreads across all 60, a second arriving halves
+both to 30, and the first widens back out when the second finishes. Nothing is
+resized or restarted — the quota is simply re-read every time a task starts.
+
+Sharing one pool rather than giving each study its own is what keeps memory
+bounded: per-study pools would hold a separate copy of every metro graph and
+leave idle processes behind whenever a study narrowed. A RAM floor sits on the
+same path, so memory pressure throttles task *starts* instead of triggering an
+OOM kill that would take every running study with it.
+
+```
+GET /api/resources      # studies running, slots each, slots busy, RAM headroom
+```
+
+Knobs: `WELFARE_RS_MAX_WORKERS` (total slots), `WELFARE_RS_MAX_STUDIES`
+(default 4), `WELFARE_RS_MIN_FREE_RAM_GB` (default 24).
+
 ## Try it without any data
 
 A clone has no data: the census inputs are downloaded by scripts, the venue

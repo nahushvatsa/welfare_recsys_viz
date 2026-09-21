@@ -48,7 +48,9 @@ import multiprocessing as mp
 import queue
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
+                                ThreadPoolExecutor, wait)
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -139,7 +141,204 @@ MAX_WORKERS = int(os.environ.get("WELFARE_RS_MAX_WORKERS", "0") or 0) or (os.cpu
 
 
 def _worker_count(n_tasks: int) -> int:
+    """Slots a study of this size could use if it had the box to itself.
+
+    Reporting only since studies became concurrent — ResourceGovernor decides
+    what a study actually gets, and that depends on how many others are running.
+    """
     return max(1, min(n_tasks, os.cpu_count() or 1, MAX_WORKERS))
+
+
+# Studies allowed to run at once. They no longer queue behind each other: the
+# box's CPU budget is split evenly between however many are running, so two
+# studies get half the cores each and widen back out as one finishes.
+MAX_STUDIES = int(os.environ.get("WELFARE_RS_MAX_STUDIES", "0") or 0) or 4
+
+# RAM headroom kept free. Each simulation process holds its own copy of the
+# metro graph (a few hundred MB); the routing matrices are memmapped, so they
+# cost one shared page-cache copy however many workers there are. When headroom
+# falls below this the governor stops STARTING tasks — running ones finish
+# untouched, so the study slows rather than dying, and an OOM kill (which would
+# take the whole service, every study with it) is avoided.
+MIN_FREE_RAM_GB = float(os.environ.get("WELFARE_RS_MIN_FREE_RAM_GB", "24"))
+
+
+def _cgroup_headroom() -> Optional[int]:
+    """Bytes left under this service's cgroup memory cap, or None if uncapped.
+
+    systemd runs the service under MemoryMax, which is the limit that actually
+    kills it — usually lower than the box's free memory, so it has to be checked
+    separately from /proc/meminfo.
+    """
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            rel = f.read().strip().split(":")[-1]
+        base = os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+        with open(os.path.join(base, "memory.max"), encoding="utf-8") as f:
+            cap = f.read().strip()
+        if cap == "max":
+            return None
+        with open(os.path.join(base, "memory.current"), encoding="utf-8") as f:
+            used = int(f.read().strip())
+        return max(0, int(cap) - used)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _available_ram() -> Optional[int]:
+    """Usable headroom in bytes: the tighter of box-free and cgroup-free."""
+    headrooms = []
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    headrooms.append(int(line.split()[1]) * 1024)
+                    break
+    except (OSError, ValueError):
+        pass
+    cg = _cgroup_headroom()
+    if cg is not None:
+        headrooms.append(cg)
+    return min(headrooms) if headrooms else None
+
+
+class ResourceGovernor:
+    """Splits the CPU budget evenly across the studies running right now.
+
+    One shared process pool serves every study; this decides who may START a
+    task in it. Each running study gets ``MAX_WORKERS // n_studies`` slots (at
+    least one), recomputed on every acquire and release — so a study widens as
+    others finish and narrows as they start, with nothing resized or restarted
+    and no study ever starved.
+
+    Symmetric by construction: the quota depends only on how many studies are
+    running, never on which, how big, or who asked first. A study that wants
+    more slots than its share simply waits, and the wait is released the moment
+    another study finishes a task or exits.
+
+    The RAM floor is checked on the same path, so memory pressure throttles
+    task STARTS rather than killing the service.
+    """
+
+    def __init__(self, total_slots: int, min_free_ram_bytes: int):
+        self._total = max(1, total_slots)
+        self._min_free_ram = max(0, min_free_ram_bytes)
+        self._held: Dict[str, int] = {}
+        self._cond = threading.Condition()
+        self._ram_waits = 0
+
+    def register(self, run_id: str) -> None:
+        with self._cond:
+            self._held.setdefault(run_id, 0)
+            self._cond.notify_all()      # everyone's quota just shrank
+
+    def unregister(self, run_id: str) -> None:
+        with self._cond:
+            self._held.pop(run_id, None)
+            self._cond.notify_all()      # everyone's quota just grew
+
+    def _quota_locked(self) -> int:
+        return max(1, self._total // max(1, len(self._held)))
+
+    def quota(self) -> int:
+        with self._cond:
+            return self._quota_locked()
+
+    def _ram_ok(self) -> bool:
+        if not self._min_free_ram:
+            return True
+        free = _available_ram()
+        return free is None or free >= self._min_free_ram
+
+    def acquire(self, run_id: str, should_stop=None) -> bool:
+        """Take one slot, blocking until the study's share allows it.
+
+        Returns False if ``should_stop()`` went true while waiting, so a
+        cancelled study stops queueing more work instead of finishing its grid.
+        """
+        with self._cond:
+            while True:
+                if should_stop is not None and should_stop():
+                    return False
+                held = self._held.get(run_id, 0)
+                in_flight = sum(self._held.values())
+                if held < self._quota_locked() and in_flight < self._total:
+                    if self._ram_ok():
+                        self._held[run_id] = held + 1
+                        return True
+                    self._ram_waits += 1
+                # Timed wait: a slot freeing notifies, but RAM recovering does
+                # not, so the wait has to expire and re-check on its own.
+                self._cond.wait(timeout=2.0)
+
+    def try_acquire(self, run_id: str) -> bool:
+        """Take a slot if one is free right now; never block.
+
+        The top-up path must not block: a study reaps its own completed tasks,
+        so a blocking acquire there would wait for a slot that only the code
+        after it can release. Blocking acquire is for the idle case only.
+        """
+        with self._cond:
+            held = self._held.get(run_id, 0)
+            if (held < self._quota_locked()
+                    and sum(self._held.values()) < self._total
+                    and self._ram_ok()):
+                self._held[run_id] = held + 1
+                return True
+            return False
+
+    def release(self, run_id: str) -> None:
+        with self._cond:
+            if self._held.get(run_id):
+                self._held[run_id] -= 1
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            free = _available_ram()
+            return {
+                "total_slots": self._total,
+                "studies_running": len(self._held),
+                "slots_per_study": self._quota_locked(),
+                "slots_in_use": sum(self._held.values()),
+                "per_study": dict(self._held),
+                "ram_free_gb": round(free / 1e9, 1) if free is not None else None,
+                "ram_floor_gb": round(self._min_free_ram / 1e9, 1),
+                "ram_throttle_events": self._ram_waits,
+            }
+
+
+GOVERNOR = ResourceGovernor(MAX_WORKERS, int(MIN_FREE_RAM_GB * 1e9))
+
+# ONE pool for the whole box, not one per study. Per-study pools would each
+# spawn their own processes, so N studies would hold N copies of every metro
+# graph and idle processes would linger after a study narrowed. Sharing keeps
+# the process count at MAX_WORKERS no matter how many studies are running; the
+# governor decides which study may use them.
+_POOL_LOCK = threading.Lock()
+_POOL = None
+
+
+def shared_pool():
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = ProcessPoolExecutor(max_workers=MAX_WORKERS,
+                                        mp_context=mp.get_context("spawn"))
+        return _POOL
+
+
+def reset_shared_pool() -> None:
+    """Drop the pool after a worker dies, so the next study builds a fresh one.
+
+    A BrokenProcessPool is terminal for the executor, and a shared executor
+    means it would be terminal for every study that came after it.
+    """
+    global _POOL
+    with _POOL_LOCK:
+        old, _POOL = _POOL, None
+    if old is not None:
+        old.shutdown(wait=False, cancel_futures=True)
 
 
 # ── Config / run records ─────────────────────────────────────────────────────
@@ -516,6 +715,9 @@ def _worker_network(city: str, use_real_pois: bool):
     return net
 
 
+_NO_POPULATION_WARNED: set = set()
+
+
 def _population_rows(ds, city: str, seed: int, num_agents: int):
     """The pre-built ACS/PUMS population for this run, or None to fall back.
 
@@ -530,6 +732,18 @@ def _population_rows(ds, city: str, seed: int, num_agents: int):
     """
     n_reps = ds.population_replicates(city)
     if not n_reps:
+        # Said once per metro per process, not per run: a metro with no built
+        # population is a normal state, but a run silently using a different
+        # population than the operator believes is exactly what this codebase
+        # refuses to let happen quietly elsewhere.
+        if city not in _NO_POPULATION_WARNED:
+            _NO_POPULATION_WARNED.add(city)
+            warnings.warn(
+                f"{city}: no ACS/PUMS population built; agents come from the "
+                "survey persona population with run-time commute sampling. "
+                "Build one with db/build_population.py.",
+                RuntimeWarning, stacklevel=2,
+            )
         return None
     rows = ds.population(city, replicate=int(seed) % n_reps, limit=num_agents)
     if rows is None:
@@ -826,15 +1040,20 @@ class _InlineProgress:
 
 
 class RunManager:
-    """Builds and caches studies; serialises study execution (one study at a
-    time), parallelising the whole (seed x condition) grid across processes."""
+    """Builds and caches studies, running up to MAX_STUDIES of them at once and
+    parallelising each (seed x condition) grid across a shared process pool."""
 
     # Studies now retain map geometry for EVERY condition, not just one, so a
     # cached study is several times larger than it used to be. Keep fewer.
-    def __init__(self, max_runs: int = 4):
-        # One study at a time keeps memory bounded and avoids oversubscribing the
-        # CPU (seeds already fan out across all cores inside a study).
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="study")
+    def __init__(self, max_runs: int = 0):
+        # At least one resident slot per concurrently running study, or studies
+        # would evict each other's results as they finish.
+        max_runs = max_runs or max(4, MAX_STUDIES + 1)
+        # Studies run concurrently, up to MAX_STUDIES. Memory and CPU stay
+        # bounded not by serialising them but by ResourceGovernor, which splits
+        # a single shared process pool evenly between whoever is running.
+        self._executor = ThreadPoolExecutor(max_workers=MAX_STUDIES,
+                                            thread_name_prefix="study")
         self._runs: Dict[str, Run] = {}
         self._jobs: Dict[str, Job] = {}
         self._access: Dict[str, float] = {}   # run_id -> last read, for LRU eviction
@@ -996,7 +1215,6 @@ class RunManager:
                            progress_q=_InlineProgress(_tick))
             results[(res["seed"], res["condition"])] = res
         else:
-            workers = _worker_count(len(tasks))
             # 'spawn': fork-after-threads under uvicorn is unsafe.
             ctx = mp.get_context("spawn")
             # Manager-backed Event and Queue are shareable with spawned workers.
@@ -1021,21 +1239,72 @@ class RunManager:
 
             drain = threading.Thread(target=_drain, name="progress", daemon=True)
             drain.start()
+            # Tasks are started against the governor's CURRENT quota rather
+            # than submitted all at once, and the quota is re-read on every
+            # top-up. So a study that starts alone spreads across the box, gives
+            # slots back the moment another study starts, and takes them again
+            # when that one ends — without the grid being re-planned.
+            pool = shared_pool()
+            pending = list(tasks)
+            in_flight: Dict[object, Tuple[int, str]] = {}
+            GOVERNOR.register(run_id)
+            def _submit_next() -> None:
+                """Start one queued task. A slot is already held for it."""
+                s_, c_ = pending.pop(0)
+                try:
+                    fut = pool.submit(_run_one, cfg_dict, s_, c_,
+                                      job.mp_cancel, progress_q)
+                except (BrokenProcessPool, RuntimeError):
+                    GOVERNOR.release(run_id)
+                    reset_shared_pool()
+                    raise
+                in_flight[fut] = (s_, c_)
+
             try:
-                with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-                    futs = {
-                        pool.submit(_run_one, cfg_dict, s, c, job.mp_cancel, progress_q): (s, c)
-                        for s, c in tasks
-                    }
-                    try:
-                        for fut in as_completed(futs):
+                while pending or in_flight:
+                    # Top up without blocking: this thread reaps its own tasks
+                    # below, so blocking here would wait on a slot only this
+                    # loop can free.
+                    while pending and GOVERNOR.try_acquire(run_id):
+                        _submit_next()
+
+                    if not in_flight:
+                        if not pending:
+                            break
+                        # Nothing running and no free slot — the box is busy.
+                        # Now blocking is safe and right: there is nothing of
+                        # ours to reap, and the wait ends when any study frees
+                        # a slot or the study is cancelled.
+                        if not GOVERNOR.acquire(run_id, should_stop=job.cancel.is_set):
+                            break
+                        _submit_next()
+                        continue
+
+                    done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED,
+                                   timeout=2.0)
+                    for fut in done:
+                        in_flight.pop(fut, None)
+                        GOVERNOR.release(run_id)
+                    for fut in done:
+                        try:
                             res = fut.result()
-                            results[(res["seed"], res["condition"])] = res
-                    except SimulationCancelled:
-                        for f in futs:
-                            f.cancel()  # drop tasks not yet started
-                        raise
+                        except SimulationCancelled:
+                            for f in in_flight:
+                                f.cancel()
+                            for _ in range(len(in_flight)):
+                                GOVERNOR.release(run_id)
+                            in_flight.clear()
+                            raise
+                        except BrokenProcessPool:
+                            reset_shared_pool()
+                            raise
+                        results[(res["seed"], res["condition"])] = res
             finally:
+                for f in in_flight:
+                    f.cancel()
+                for _ in range(len(in_flight)):
+                    GOVERNOR.release(run_id)
+                GOVERNOR.unregister(run_id)
                 stop_drain.set()
                 drain.join(timeout=1.0)
                 job.mp_cancel = None
