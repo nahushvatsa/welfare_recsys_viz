@@ -1275,8 +1275,16 @@ class RunManager:
                         # Now blocking is safe and right: there is nothing of
                         # ours to reap, and the wait ends when any study frees
                         # a slot or the study is cancelled.
+                        #
+                        # acquire() returns False ONLY on cancellation, and that
+                        # has to be raised, not broken out of: falling through
+                        # would leave the loop and assemble a study from
+                        # whatever partial results exist, storing a cancelled
+                        # study as a finished one. Everywhere else cancellation
+                        # arrives as this exception from fut.result(); a study
+                        # cancelled while queueing has no future to raise it.
                         if not GOVERNOR.acquire(run_id, should_stop=job.cancel.is_set):
-                            break
+                            raise SimulationCancelled()
                         _submit_next()
                         continue
 
@@ -1289,6 +1297,14 @@ class RunManager:
                         try:
                             res = fut.result()
                         except SimulationCancelled:
+                            # cancel() only drops tasks that have not started;
+                            # already-running ones keep going until their next
+                            # day boundary sees mp_cancel. Their slots are
+                            # released now anyway, so other studies can move
+                            # immediately — a few slots are briefly
+                            # oversubscribed while the cancelled tasks wind
+                            # down, which is the right trade against making
+                            # every other study wait for a study that is over.
                             for f in in_flight:
                                 f.cancel()
                             for _ in range(len(in_flight)):
