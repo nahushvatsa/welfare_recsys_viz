@@ -247,6 +247,12 @@ class RoadNetwork:
         self._commute_total = 0.0
         self._commute_seg_cum = {}    # LODES age segment -> (prefix sum, total)
 
+        # Populated CORE blocks (attach_home_blocks). Not a sampler: the
+        # non-worker homes in a built population come from these blocks, and
+        # the routing precompute has to know about them or those agents route
+        # off the precomputed matrix. See routing_matrix.endpoint_universe.
+        self._home_block_latlon = None
+
     def __getstate__(self) -> dict:
         """Exclude the lazily-rebuilt acceleration structures from pickling (so
         the disk cache stays small and isn't coupled to sklearn/scipy pickle
@@ -1169,6 +1175,20 @@ class RoadNetwork:
         self._commute_cum = cum
         self._commute_total = total
         self._commute_seg_cum = {}
+
+    def attach_home_blocks(self, points) -> None:
+        """Record populated core block coordinates as possible agent homes.
+
+        ``points`` is a sequence of ``(lat, lon)``, or None to clear. Nothing
+        is snapped here — the routing precompute bulk-snaps them once, which is
+        far cheaper than snapping each on attach.
+        """
+        self._home_block_latlon = list(points) if points else None
+
+    @property
+    def home_block_latlon(self):
+        """Core block coordinates a non-worker agent home can be drawn at."""
+        return self._home_block_latlon or []
 
     @property
     def has_commutes(self) -> bool:

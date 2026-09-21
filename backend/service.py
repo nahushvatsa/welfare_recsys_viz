@@ -36,6 +36,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import warnings
 import sys
 
 # Make ``viz`` and ``welfare_rs`` importable even in spawned worker processes,
@@ -515,9 +516,39 @@ def _worker_network(city: str, use_real_pois: bool):
     return net
 
 
+def _population_rows(ds, city: str, seed: int, num_agents: int):
+    """The pre-built ACS/PUMS population for this run, or None to fall back.
+
+    A seed picks a replicate: replicates are what a seed used to do to the
+    population, so seed s reads replicate s (mod however many were built) and
+    seeds keep varying who the agents are, not only how they behave.
+
+    Falls back to the survey persona population — loudly — when nothing is
+    built for this metro, or when the built population is smaller than the run
+    asks for. Falling back is the right call rather than failing the run, but
+    it changes what the agents ARE, so it must never happen quietly.
+    """
+    n_reps = ds.population_replicates(city)
+    if not n_reps:
+        return None
+    rows = ds.population(city, replicate=int(seed) % n_reps, limit=num_agents)
+    if rows is None:
+        return None
+    if len(rows) < num_agents:
+        warnings.warn(
+            f"{city}: built population holds {len(rows):,} agents but the run asks "
+            f"for {num_agents:,}; falling back to the survey persona population. "
+            "Rebuild with db/build_population.py --agents to use census geography.",
+            RuntimeWarning, stacklevel=2,
+        )
+        return None
+    return rows
+
+
 def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows,
                spec: Optional[RecommenderSpec]):
     ds = get_datasource()
+    population_rows = _population_rows(ds, cfg["city"], seed, int(cfg["num_agents"]))
     return Simulation(
         num_agents=int(cfg["num_agents"]),
         seed=int(seed),
@@ -528,6 +559,10 @@ def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows,
         # neither (personas() returns None).
         persona_rows=ds.personas(),
         persona_csv_path=ds.persona_csv_path() or params.SURVEY_PERSONA_CSV_PATH,
+        # When present this decides the agents entirely — census geography and
+        # ACS/PUMS demographics — and the personas above are consulted only for
+        # the psychometrics of the respondent each agent matched.
+        population_rows=population_rows,
         road_network=network,
         poi_rows=poi_rows,
         disabled_modes=("transit",),

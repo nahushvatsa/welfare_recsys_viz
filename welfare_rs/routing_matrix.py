@@ -106,9 +106,11 @@ def _bulk_snap(net, lat, lon) -> set:
 def endpoint_universe(net) -> np.ndarray:
     """Sorted int64 node ids that routing can ever start or end at.
 
-    Three contributors, all resolved the way the model resolves them:
+    Four contributors, all resolved the way the model resolves them:
 
     * every node the metro's commute pairs snap onto (agent homes and workplaces),
+    * every node a populated CORE block snaps onto — where a built population
+      puts its non-workers, who have no commute pair to be covered by,
     * the inserted POI nodes, and
     * whatever each POI's **true** coordinate snaps to.
 
@@ -129,6 +131,11 @@ def endpoint_universe(net) -> np.ndarray:
     if poi_latlon:
         coords = np.array(list(poi_latlon.values()), dtype=np.float64)
         nodes |= _bulk_snap(net, coords[:, 0], coords[:, 1])
+
+    home_blocks = getattr(net, "home_block_latlon", None)
+    if home_blocks:
+        hb = np.asarray(home_blocks, dtype=np.float64)
+        nodes |= _bulk_snap(net, hb[:, 0], hb[:, 1])
 
     if net.has_commutes:
         c = net._commutes

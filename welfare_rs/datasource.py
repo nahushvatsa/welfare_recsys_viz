@@ -146,6 +146,53 @@ def _commute_pairs_from_rows(rows: Sequence[Sequence]) -> Optional[CommutePairs]
     )
 
 
+# Column -> parser for a population row. Applied by BOTH datasources, which is
+# what makes a CSV-backed population and a Postgres-backed one indistinguishable
+# to the engine. A column absent from this map is passed through as text.
+_POPULATION_TYPES = {
+    "replicate": int, "agent_id": int, "is_worker": bool,
+    "home_lat": float, "home_lon": float,
+    "work_lat": float, "work_lon": float,
+    "sporder": int, "age": int, "sex": int, "employed": bool,
+    "industry_seg": int, "own_earnings": float, "hh_income": float,
+    "vehicles": int, "disability": bool, "ambulatory": bool, "hh_size": int,
+    "commute_mode": int, "commute_min_implied": float,
+    "commute_min_reported": float, "transit_share": float,
+    "match_level": int,
+}
+
+# A column missing from the map above is passed through as TEXT, and a boolean
+# is the dangerous case: the string "False" is truthy, so an omitted
+# `ambulatory` silently gave every agent wheelchair mobility needs. Caught end
+# to end rather than by inspection, which is why
+# scripts/verify_acs_population.py now asserts that every non-text column of
+# public.metro_population appears here.
+
+_TRUE_TOKENS = {"t", "true", "1", "yes", "y"}
+
+
+def coerce_population_row(row: dict) -> dict:
+    """Type one population row, from either a CSV cell or a DB value.
+
+    Empty strings become None, because a CSV cannot distinguish "" from NULL
+    and the engine must see the same absence either way (a non-worker has no
+    workplace, and no vehicles recorded if its household is group quarters).
+    """
+    out = {}
+    for key, value in row.items():
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            out[key] = None
+            continue
+        parser = _POPULATION_TYPES.get(key)
+        if parser is None:
+            out[key] = value if isinstance(value, str) else str(value)
+        elif parser is bool:
+            out[key] = value if isinstance(value, bool) else str(value).strip().lower() in _TRUE_TOKENS
+        else:
+            out[key] = parser(value)
+    return out
+
+
 def select_counties(flows: List[CountyFlow], coverage: Optional[float] = None) -> List[CountyFlow]:
     """Apply the coverage rule: the smallest prefix of counties (sorted by
     inbound workers, descending) whose cumulative share reaches ``coverage``
@@ -209,6 +256,59 @@ class DataSource:
 
     def has_pois(self, metro: str) -> bool:
         raise NotImplementedError
+
+    def population(self, metro: str, replicate: int = 0,
+                   limit: Optional[int] = None) -> Optional[List[dict]]:
+        """A pre-built agent population for a metro, or None when absent.
+
+        One row per agent, each carrying its geography (LODES home and work, or
+        a core home block for a non-worker), the ACS/PUMS person it copies, and
+        the survey respondent supplying its psychometrics. Built offline by
+        ``db/build_population.py``; see the schema in db/14_population_schema.sql.
+
+        Nothing is sampled at run time. The draw needs reweighted PUMS, ACS
+        controls and the whole LODES pair table — a run has no business holding
+        any of that, and repeating the work per seed and per condition would be
+        both slow and a source of drift between conditions that must stay
+        comparable.
+
+        ROW ORDER IS LOAD-BEARING, exactly as in :meth:`personas`: agent ``i``
+        is the row with ``agent_id = i``, and the paired No-RS counterfactual
+        compares agent ``i`` across conditions. ``limit`` takes a prefix, so a
+        smaller run is a strict subset of a larger one rather than a different
+        population.
+
+        ``replicate`` is what a simulation seed used to do to the population:
+        seed ``s`` reads replicate ``s``, so seeds still vary who the agents are
+        as well as how they behave.
+
+        VALUES ARE NATIVELY TYPED here — ints, floats, bools, None — unlike
+        :meth:`personas`, which must mimic ``csv.DictReader`` strings for
+        compatibility with the file path it replaced. Both implementations run
+        their rows through :func:`coerce_population_row`, so the two paths
+        produce identical dicts by construction rather than by agreement.
+        """
+        return None
+
+    def population_replicates(self, metro: str) -> int:
+        """How many built population replicates a metro has, 0 if none.
+
+        A run picks one by seed, so it needs the count to map an arbitrary seed
+        onto a replicate that exists.
+        """
+        return 0
+
+    def home_blocks(self, metro: str) -> Optional[List[tuple]]:
+        """Populated CORE blocks as ``(lat, lon)``, or None when absent.
+
+        Needed by the routing precompute, not by the model: every point an
+        agent home can snap to must be inside the precomputed endpoint universe
+        (welfare_rs/routing_matrix.py), or those agents fall through to the
+        lazy per-source Dijkstra, which is quadratic in the agent count. Worker
+        homes come from the commute pairs and are already covered; non-worker
+        homes are drawn from these blocks and are not.
+        """
+        return None
 
     def commute_pairs(self, metro: str,
                       counties: Optional[Sequence[str]] = None) -> Optional[CommutePairs]:
@@ -311,6 +411,38 @@ class LocalDataSource(DataSource):
             return None
         with open(path, newline="", encoding="utf-8") as f:
             return [r for r in csv.DictReader(f) if r.get("PersonaID")]
+
+    def population(self, metro: str, replicate: int = 0,
+                   limit: Optional[int] = None) -> Optional[List[dict]]:
+        """Read a population exported to CSV by ``db/export_population.py``.
+
+        This is the no-database path: the file is a dump of one
+        ``(metro, replicate)`` slice of public.metro_population, already in
+        agent_id order. The order is re-asserted here anyway, because a file on
+        disk can be edited and the contract cannot rely on how it was written.
+        """
+        path = os.path.join(params.POPULATION_DIR,
+                            f"{metro}_r{int(replicate):02d}.csv")
+        if not os.path.exists(path):
+            return None
+        with open(path, newline="", encoding="utf-8") as f:
+            rows = [coerce_population_row(r) for r in csv.DictReader(f)]
+        rows.sort(key=lambda r: r["agent_id"])
+        if limit is not None:
+            rows = rows[:int(limit)]
+        return rows or None
+
+    def population_replicates(self, metro: str) -> int:
+        import glob
+
+        return len(glob.glob(os.path.join(params.POPULATION_DIR, f"{metro}_r*.csv")))
+
+    def home_blocks(self, metro: str) -> Optional[List[tuple]]:
+        path = os.path.join(params.POPULATION_DIR, f"{metro}_home_blocks.csv")
+        if not os.path.exists(path):
+            return None
+        with open(path, newline="", encoding="utf-8") as f:
+            return [(float(r["lat"]), float(r["lon"])) for r in csv.DictReader(f)] or None
 
     def _od_csv_path(self, metro: str) -> Optional[str]:
         path = os.path.join(self._cache_dir, "od", f"{metro}_od_pairs.csv")
@@ -473,6 +605,54 @@ class PostgresDataSource(DataSource):
             jobs, age, earn = jobs[:i], age[:i], earn[:i]
         return CommutePairs(h_lat=h_lat, h_lon=h_lon, w_lat=w_lat, w_lon=w_lon,
                             jobs=jobs, age=age, earn=earn)
+
+    def population(self, metro: str, replicate: int = 0,
+                   limit: Optional[int] = None) -> Optional[List[dict]]:
+        """Read a built population from ``public.metro_population``.
+
+        The ORDER BY and the ``agent_id`` bound are the row-order contract in
+        :meth:`DataSource.population`; ``LIMIT`` alone would not do, because it
+        is only a prefix of *some* order unless the order is stated here.
+
+        Returns None when the metro has no population built, which is a real
+        state and not an error: the caller then falls back to the survey
+        persona population plus run-time commute sampling.
+        """
+        import psycopg
+
+        sql = ("SELECT * FROM public.metro_population "
+               "WHERE metro = %s AND replicate = %s ORDER BY agent_id")
+        args = (metro, int(replicate))
+        if limit is not None:
+            sql += " LIMIT %s"
+            args = args + (int(limit),)
+        try:
+            rows = self._query_named(sql, args)
+        except (psycopg.errors.UndefinedTable,
+                psycopg.errors.InsufficientPrivilege) as exc:
+            warnings.warn(
+                f"public.metro_population is unreadable ({exc.__class__.__name__}); "
+                f"falling back to the survey persona population for {metro}.",
+                RuntimeWarning, stacklevel=2,
+            )
+            return None
+        return [coerce_population_row(r) for r in rows] or None
+
+    def population_replicates(self, metro: str) -> int:
+        import psycopg
+
+        try:
+            rows = self._query("SELECT count(DISTINCT replicate) "
+                               "FROM public.metro_population WHERE metro = %s", (metro,))
+        except (psycopg.errors.UndefinedTable, psycopg.errors.InsufficientPrivilege):
+            return 0
+        return int(rows[0][0]) if rows else 0
+
+    def home_blocks(self, metro: str) -> Optional[List[tuple]]:
+        rows = self._query(
+            "SELECT lat, lon FROM public.metro_home_blocks WHERE metro = %s "
+            "ORDER BY geoid", (metro,))
+        return [(float(lat), float(lon)) for lat, lon in rows] or None
 
     def persona_csv_path(self) -> Optional[str]:
         # Kept for callers that genuinely want a path (scripts/bench_routing.py,

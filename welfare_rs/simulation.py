@@ -7,6 +7,7 @@ import csv
 import hashlib
 import math
 import random
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -54,6 +55,7 @@ class Simulation:
         use_persona_agents=True,
         persona_csv_path=None,
         persona_rows=None,
+        population_rows=None,
         poi_csv_path=None,
         poi_rows=None,
         road_network=None,
@@ -89,6 +91,11 @@ class Simulation:
         # (PostgresDataSource.personas() reads the survey.personas view). Takes
         # precedence over persona_csv_path.
         self.persona_rows = persona_rows
+        # A pre-built ACS/PUMS population (db/build_population.py). When given,
+        # it decides the agents entirely: geography, demographics and which
+        # survey respondent each agent takes its psychometrics from. Nothing is
+        # sampled here — see DataSource.population for why that work is offline.
+        self.population_rows = list(population_rows) if population_rows else None
         self.poi_csv_path = poi_csv_path
         # Real-POI rows may be handed in directly (datasource-driven backends);
         # they take precedence over reading poi_csv_path.
@@ -152,6 +159,26 @@ class Simulation:
         _num_agents = num_agents if num_agents is not None else sd["num_agents"]
         self.agents = []
         personas = self._load_personas() if self.use_persona_agents else []
+
+        # With a built population, personas are looked up BY RESPONDENT ID
+        # rather than by position: the population already recorded which
+        # respondent each agent matched, on sex, employment, income and age.
+        self._persona_by_id = {}
+        if self.population_rows:
+            self._persona_by_id = {str(p.get("PersonaID")): p for p in personas}
+            missing = {r["respondent_id"] for r in self.population_rows
+                       if str(r["respondent_id"]) not in self._persona_by_id}
+            if missing:
+                raise ValueError(
+                    f"population references {len(missing)} respondent id(s) absent "
+                    f"from the survey population (first: {sorted(missing)[:3]}). "
+                    "The population and the survey view are out of step — rebuild "
+                    "with db/build_population.py.")
+            if len(self.population_rows) < _num_agents:
+                raise ValueError(
+                    f"population holds {len(self.population_rows):,} agents but the "
+                    f"run asks for {_num_agents:,}. Build more with "
+                    "db/build_population.py --agents.")
         # The given personas are used as-is for the first len(personas) agents.
         # Beyond that, whole profiles are resampled with replacement (see
         # _resample_persona) so the population can exceed the provided set
@@ -165,7 +192,9 @@ class Simulation:
         syn_rng = random.Random(self.seed + 991)
         tp = params.TASTE_PARAMS
         for i in range(_num_agents):
-            if personas:
+            if self.population_rows:
+                agent = self._build_agent_from_population(i, self.population_rows[i])
+            elif personas:
                 persona = personas[i] if i < len(personas) else self._resample_persona(i, personas, syn_rng, used_homes)
                 agent = self._build_agent_from_persona(i, persona)
             else:
@@ -283,7 +312,8 @@ class Simulation:
         same respondent in every run.
         """
         if self.persona_rows is not None:
-            return [dict(r) for r in self.persona_rows if r.get("PersonaID")]
+            return self._warn_if_synthetic([dict(r) for r in self.persona_rows
+                                            if r.get("PersonaID")])
         if not self.persona_csv_path:
             return []
         path = Path(self.persona_csv_path)
@@ -295,7 +325,7 @@ class Simulation:
             for row in reader:
                 if row.get("PersonaID"):
                     rows.append(row)
-        return rows
+        return self._warn_if_synthetic(rows)
 
     def _home_from_latlon(self, lat, lon):
         """Map a persona's real (lat, lon) to the nearest network node."""
@@ -340,6 +370,54 @@ class Simulation:
         # Fallback samplers return graph nodes directly, so there is no snap
         # gap to charge.
         return home, net.sample_core_latlon(self._loc_rng), 0.0, 0.0
+
+    def _home_work_from_population(self, row):
+        """Snap one population row's block coordinates onto the road graph.
+
+        Mirrors :meth:`welfare_rs.geo.RoadNetwork.sample_commute`, including
+        what it does with the snap gap. The stored coordinates are census block
+        internal points; outside the core the graph carries arterials only, so
+        a suburban home can snap 1-3 km. That distance is returned as an
+        un-networked access leg and charged by ``_evaluate_modes`` instead of
+        letting the trip silently start from the arterial.
+
+        A non-worker has no workplace, and its day is home-anchored
+        (:meth:`welfare_rs.agent.Agent.plan_day`). Its work slot is filled with
+        its home rather than left empty: every consumer of ``Agent.work``
+        expects a point, and a home-anchored day never routes to it.
+        """
+        from .geo import haversine_km
+
+        net = self.road_network
+        home_true = (float(row["home_lat"]), float(row["home_lon"]))
+        home = net.snap_latlon(*home_true)
+        h_acc = haversine_km(home_true, home)
+
+        if row.get("work_lat") is None or row.get("work_lon") is None:
+            return home, home, h_acc, 0.0
+        work_true = (float(row["work_lat"]), float(row["work_lon"]))
+        work = net.snap_latlon(*work_true)
+        return home, work, h_acc, haversine_km(work_true, work)
+
+    @staticmethod
+    def _warn_if_synthetic(personas):
+        """Announce a fabricated population, every time it is loaded.
+
+        data/make_demo_personas.py exists so the engine can run without the
+        IRB-protected survey, and its rows are invented. A run built on them
+        must never be mistaken for a run on the survey, so the warning is
+        raised rather than logged once: it lands in the output of whatever is
+        driving the run.
+        """
+        n_fake = sum(1 for p in personas if str(p.get("PersonaID", "")).startswith("SYNTHETIC-"))
+        if n_fake:
+            warnings.warn(
+                f"{n_fake} of {len(personas)} personas are SYNTHETIC (fabricated by "
+                "data/make_demo_personas.py). This run demonstrates the machinery "
+                "and reproduces no published result.",
+                RuntimeWarning, stacklevel=2,
+            )
+        return personas
 
     @staticmethod
     def _coerce_measurement(value):
@@ -536,7 +614,24 @@ class Simulation:
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
         return agent
 
-    def _build_agent_from_persona(self, i, persona):
+    def _build_agent_from_population(self, i, row):
+        """Build agent ``i`` from one pre-built population row.
+
+        The row already decided everything the model used to draw at run time:
+        which block this agent lives in, which workplace it commutes to (or
+        that it has none), how old it is, what it earns, whether its household
+        has a car, and which survey respondent it takes its psychometrics from.
+        Nothing is sampled here.
+
+        The persona is looked up by the respondent id the build matched, so the
+        agent's attitudes belong to someone of its own sex, employment status,
+        income band and age band — instead of to whoever happened to sit at
+        position ``i`` in the survey file.
+        """
+        persona = self._persona_by_id[str(row["respondent_id"])]
+        return self._build_agent_from_persona(i, persona, population=row)
+
+    def _build_agent_from_persona(self, i, persona, population=None):
         pm = params.PERSONA_MAPPING
         ad = params.AGENT_DEFAULTS
 
@@ -547,6 +642,18 @@ class Simulation:
         income = self.rng.randint(inc_lo, inc_hi)
         age = self.rng.randint(age_lo, age_hi)
 
+        if population is not None:
+            # Measured, not drawn. hh_income is the like-for-like replacement
+            # for the survey's household-income band; a group-quarters resident
+            # (a dorm or nursing home) has no household income at all, so its
+            # own earnings stand in, and only if it has neither does the band
+            # draw survive as a last resort.
+            for candidate in (population.get("hh_income"), population.get("own_earnings")):
+                if candidate is not None:
+                    income = int(candidate)
+                    break
+            age = int(population["age"])
+
         # Held fixed for the whole population: the survey measures none of these,
         # and their former per-agent draw came from a balanced experimental
         # design rather than any population. See PERSONA_MAPPING.fixed_attributes.
@@ -554,6 +661,24 @@ class Simulation:
         car_access = fa["car_access"]
         transit_access = fa["transit_access"]
         mobility_needs = fa["mobility_needs"]
+        transit_access_level = None
+
+        if population is not None:
+            # Three of the nine attributes the survey could not ground are now
+            # measured. They stay inert while CAR_ONLY_MODE is on — every agent
+            # is forced to a car below — and become live the moment it comes off.
+            vehicles = population.get("vehicles")
+            if vehicles is not None:
+                car_access = "own car" if vehicles > 0 else "none"
+            # Ambulatory difficulty specifically (PUMS DPHY), not the general
+            # disability flag: hearing, vision and cognitive difficulty do not
+            # change how far someone walks to a venue.
+            if population.get("ambulatory") is not None:
+                mobility_needs = "ADA/wheelchair" if population["ambulatory"] else "none"
+            # A neighbourhood measure (ACS B08301 transit share of the home
+            # tract), which is what transit access has always meant here.
+            if population.get("transit_share") is not None:
+                transit_access_level = max(0.0, min(1.0, float(population["transit_share"])))
         risk_salience = fa["risk_salience"]
         walk_tol = int(fa["walk_tolerance_min"])
         primary_interest = fa["primary_interest"]
@@ -587,12 +712,16 @@ class Simulation:
         # the drawn pair simply goes unused by their schedule. Their draw is
         # conditioned on age only — LODES earnings segments are job earnings,
         # which someone without a job does not have.
-        is_employed = self._persona_is_employed(persona)
-        home, work, h_acc, w_acc = self._sample_home_work(
-            persona,
-            age_years=age,
-            annual_income=income if is_employed else None,
-        )
+        if population is not None:
+            is_employed = bool(population["employed"])
+            home, work, h_acc, w_acc = self._home_work_from_population(population)
+        else:
+            is_employed = self._persona_is_employed(persona)
+            home, work, h_acc, w_acc = self._sample_home_work(
+                persona,
+                age_years=age,
+                annual_income=income if is_employed else None,
+            )
 
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed,
                       eta_shift=self.eta_shift, is_employed=is_employed)
@@ -601,7 +730,9 @@ class Simulation:
         agent.persona_id = str(persona.get("PersonaID", f"P{i:04d}"))
         agent.car_access_type = car_access
         agent.car_access_penalty = car_access_penalty
-        agent.transit_access_level = pm["transit_access_levels"].get(transit_access, 0.55)
+        agent.transit_access_level = (
+            transit_access_level if transit_access_level is not None
+            else pm["transit_access_levels"].get(transit_access, 0.55))
         agent.walk_tolerance_min = max(5, min(45, walk_tol))
         agent.mobility_needs = mobility_needs
         agent.primary_interest = primary_interest
@@ -623,6 +754,26 @@ class Simulation:
             value = persona.get(_field)
             if value is not None and str(value).strip() != "":
                 agent.characteristics[_field] = value
+
+        if population is not None:
+            # Provenance: every agent can be traced back to its census
+            # geography, its PUMS record and the survey respondent it matched,
+            # which is what makes a result auditable rather than merely
+            # reproducible. Carried only — no decision rule reads these.
+            agent.characteristics.update({
+                "population_source": "acs_pums",
+                "home_geoid": population["home_geoid"],
+                "home_tract": population["home_tract"],
+                "puma": population["puma"],
+                "pums_serialno": population["serialno"],
+                "is_worker": population["is_worker"],
+                "own_earnings": population.get("own_earnings"),
+                "hh_income": population.get("hh_income"),
+                "hh_size": population.get("hh_size"),
+                "vehicles": population.get("vehicles"),
+                "survey_match_keys": population.get("match_keys"),
+                "survey_match_level": population.get("match_level"),
+            })
 
         # No environmental-attitude override: the survey does not measure one.
         # The green weight keeps the base draw from AGENT_DEFAULTS and the

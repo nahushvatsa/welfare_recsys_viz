@@ -110,6 +110,12 @@ SURVEY_PERSONA_CSV_PATH: str = os.path.join(
     _REPO_ROOT, "data", "survey_personas_2026.csv"
 )
 
+# ACS/PUMS-built agent populations, exported from public.metro_population by
+# db/export_population.py. One CSV per (metro, replicate); the engine reads
+# them only when no database is configured, so a clone with downloaded data can
+# run without Postgres. Gitignored — populations are data, never code.
+POPULATION_DIR: str = os.path.join(_REPO_ROOT, "data", "population")
+
 # ── OSM road-network geography (geo.py) ──────────────────────────────────────
 #
 # City presets define the area to download from OpenStreetMap. The network is

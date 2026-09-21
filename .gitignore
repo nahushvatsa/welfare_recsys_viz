@@ -237,11 +237,20 @@ data/survey_personas_2026.csv
 data/study_exports/
 georecsim.pdf
 
-# ── Server DB schema + ETL (kept off the public repo by request) ──
-# Contains no credentials (passwords come from .env via psql -v / libpq env
-# vars), so this is a distribution choice, not a security one. Note the only
-# copy now lives on the server — back it up outside git.
-db/
+# NOTE: db/ is NO LONGER ignored (2026-09-21). The schema and ETL scripts are
+# the only way anyone — including us, later — can rebuild the data layer, so
+# they belong in the repo. They contain no credentials: passwords come from
+# .env via psql -v and libpq environment variables.
+
+# ── Census downloads and everything derived from them ──────────────────
+# Scripts are committed, data never is. `python db/fetch_census_data.py`
+# re-downloads all of it from Census/LEHD, and the SHA-256 manifest proves a
+# rebuild used the same bytes. ~2.4 GB; GitHub is not a data host.
+data/census/acs/
+data/census/pums/
+data/census/xwalk/
+data/census/manifest_acs_pums.json
+data/population
 
 # ── Operator-only scripts (this host, not the model) ──
 # Wrappers that source .env, build a Postgres DSN and setsid/nohup themselves

@@ -337,6 +337,14 @@ def _attach_commutes(net: RoadNetwork, metro: str,
         pairs = None
     net.attach_commutes(pairs)
 
+    # Core home blocks ride along with the commutes: both describe where agent
+    # homes can be, and both must be attached before the routing precompute
+    # decides which nodes to cover.
+    try:
+        net.attach_home_blocks(ds.home_blocks(metro))
+    except Exception:
+        net.attach_home_blocks(None)
+
 
 def ensure_routing_matrices(
     metro: str,

@@ -34,6 +34,46 @@ distribution rather than two independent uniform draws. The county set that
 defines the shell is the same data grouped by home county, so the graph always
 covers the homes it needs to place. See `db/07_commute_tables.sql`.
 
+## Try it without any data
+
+A clone has no data: the census inputs are downloaded by scripts, the venue
+catalog is a licensed dataset you supply yourself, and the survey population is
+IRB-protected and never leaves institutional storage. To see the machinery run
+anyway:
+
+```bash
+pip install -e .
+python data/make_demo_personas.py      # writes FABRICATED personas
+python scripts/run_demo.py             # small OSM network, 50 agents, 3 days
+```
+
+Those agents are invented and the run reproduces nothing — the engine says so
+in its own output every time it loads them. The real pipeline is below.
+
+## Agents come from real people
+
+An agent is not sampled at run time. Populations are built offline and stored,
+one row per agent, from three sources used for what each alone can do:
+
+* **LODES** places it — a real home-block → work-block commute, weighted by
+  jobs, which also fixes that job's age, earnings and industry band.
+* **ACS PUMS**, reweighted to the home tract with IPU, says who lives there:
+  one real person's age, own earnings, household income, vehicles, disability
+  and household size, *jointly*.
+* **The survey** (IRB-FY2026-11354) supplies psychometrics, matched to that
+  person on sex, employment, income band and age band.
+
+Non-workers are drawn from **core blocks only**. Their leisure trip departs
+from home rather than a workplace, so metro-wide homes would put much of the
+population 30–60 km from every venue and swamp every distance-normalised
+metric. The population is therefore *people whose day is anchored in the core*.
+
+Full design, approximations and limitations: **`docs/acs-population.md`**.
+Build it with `db/fetch_census_data.py` → `db/load_pums.py` → `db/load_acs.py`
+→ `db/build_tract_weights.py` → `db/build_population.py`, then verify with
+`scripts/verify_acs_population.py`. The repo carries the scripts; the data is
+downloaded by them and never committed.
+
 Cars route on **fastest network paths** (per-edge OSM speeds), so freeway
 commutes behave like freeway commutes; congestion and weather scale that time.
 
