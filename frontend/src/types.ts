@@ -41,7 +41,6 @@ export interface RunConfig {
   // Recommenders to run. The No-RS control is always added server-side, so an
   // empty array is a valid "control only" study.
   recommenders: RecommenderSpec[];
-  multimodal: boolean;
   use_real_pois: boolean;
 }
 

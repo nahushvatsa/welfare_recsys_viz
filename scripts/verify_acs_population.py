@@ -35,6 +35,11 @@ import numpy as np
 import psycopg
 
 DSN = os.environ.get("WELFARE_LOADER_DSN", "")
+
+# The commute-match rules live in the builder; import them rather than copy
+# them, so the check cannot drift from what the build does.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "db"))
+import build_population as bp  # noqa: E402
 TOL_MARGINAL = 0.02       # 2 percentage points on a share
 failures = []
 
@@ -268,18 +273,29 @@ def main() -> int:
               "no agent drives longer than the 135-minute cap",
               f"longest {longest:.0f} min, mean {mean_min} min")
 
-        # The whole point of matching on commute time: a long pair should land
-        # on someone who reports a long commute, not on whoever else fit.
+        # The whole point of the commute match: a pair should land on someone
+        # whose own reported time, at their own mode's speed, could cover it.
+        # Checked directly: the pair's distance band must be among the bands
+        # the person's time and mode make plausible (build_population's
+        # plausible_dist_bands). Misses are draws where the ladder relaxed the
+        # band because the tract had nobody fitting it.
         cur.execute("""
-            SELECT corr(commute_min_implied, commute_min_reported),
-                   count(*) FILTER (WHERE commute_min_reported IS NULL)
+            SELECT commute_min_implied, commute_min_reported, commute_mode
             FROM public.metro_population
             WHERE metro = %s AND replicate = %s AND is_worker
         """, (metro, rep))
-        r, n_null = cur.fetchone()
-        check(r is not None and r > 0.25,
-              "drawn commute length tracks the person's reported commute",
-              f"correlation {r:.3f} ({n_null:,} agents report no commute time)")
+        n_ranged = n_fit = 0
+        for implied_car_min, reported, mode in cur.fetchall():
+            bands = bp.plausible_dist_bands(reported, mode)
+            if bands is None or implied_car_min is None:
+                continue
+            km = implied_car_min / 60.0 * bp.EFFECTIVE_SPEED_KMH / bp.DETOUR_FACTOR
+            n_ranged += 1
+            n_fit += bp.commute_dist_band(km) in bands
+        share = n_fit / max(1, n_ranged)
+        check(n_ranged > 0 and share >= 0.90,
+              "each commute is one the person's own mode and reported time could cover",
+              f"{share:.1%} of {n_ranged:,} workers with a mode and time")
 
         # ── 5. Survey matching ───────────────────────────────────────────────
         section("5. survey match")

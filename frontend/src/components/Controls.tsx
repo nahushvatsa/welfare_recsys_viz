@@ -140,14 +140,6 @@ export default function Controls({
       <label className="toggle">
         <input
           type="checkbox"
-          checked={config.multimodal}
-          onChange={(e) => setConfig({ multimodal: e.target.checked })}
-        />
-        Multimodal (car + walk + bike)
-      </label>
-      <label className="toggle">
-        <input
-          type="checkbox"
           checked={config.use_real_pois}
           disabled={!poisAvailable}
           onChange={(e) => setConfig({ use_real_pois: e.target.checked })}

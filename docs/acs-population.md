@@ -168,9 +168,9 @@ rate (12–35% of employed agents on a given day), independently of non-workers.
 
 ## 5a. Car commutes are capped at what people actually drive
 
-LODES records *where* people commute, never *how*. Under `CAR_ONLY_MODE` the
-model drives every pair it draws, and the raw OD tail contains commutes nobody
-makes daily by car: NYC's longest pair is **488 km**, and 9.5% of NYC jobs
+LODES records *where* people commute, never *how*. When this cap was set the
+model drove every pair it drew (car-only), and the raw OD tail contains commutes
+nobody makes daily by car: NYC's longest pair is **488 km**, and 9.5% of NYC jobs
 (16.7% in LA) sit on pairs over 50 km.
 
 The cap comes from what car commuters report. PUMS `JWMNP` for people whose
@@ -181,20 +181,72 @@ draw entirely. Distance is converted to time with two stated assumptions — a
 1.25 detour factor and 55 km/h effective door-to-door speed — because the
 builder has no road graph; 135 min is then ~99 km straight-line.
 
-Within the surviving range, the pair's implied time is **matched to the
-person's own reported commute time** (`JWMNP`), in shared bands. Industry and
-earnings are relaxed before commute time in the draw ladder, because time is
-what keeps the geography honest while industry only sharpens it. Both times are
-stored on every agent (`commute_min_implied`, `commute_min_reported`) so the
-match can be audited, and `scripts/verify_acs_population.py` checks that they
-correlate.
+Within the surviving range, each pair is **matched to a person whose own
+reported commute time, at their own mode's speed, could cover it**. Every PUMS
+worker gets a plausible distance range from their reported time (`JWMNP`) and a
+door-to-door speed range for their mode (`JWTRNS`): walk 3.5–6 km/h, bike
+10–20, car 8–60, transit 8–50, over the 1.25 detour factor. The pair's
+straight-line distance must fall inside it, in shared distance bands. People who
+work from home, report "other" or give no time carry no range and match on the
+other keys only. Industry and earnings are relaxed before distance in the draw
+ladder, because distance is what keeps the geography honest while industry only
+sharpens it. `scripts/verify_acs_population.py` checks that at least 90% of
+workers hold a commute their own mode and time could cover.
+
+**Why ranges, and what they replaced (2026-09-22).** The first version converted
+every pair to a time at car speed (55 km/h) and matched that against reported
+time. A 3 km Manhattan commute came out at "4 minutes", matchable only to
+people reporting under 15 — walkers and very short drives. Among core residents
+working in the core, 74% of NYC agents walked against 24.5% in ACS B08301 for
+the same tracts, and transit riders all but vanished (Chicago 6.8% vs 23.8%, DC
+6.9% vs 32.4%, SF 4.9% vs 26.5%), because a 25-minute subway ride never
+matched. A single speed per mode fails the other way: at 55 km/h no driver
+reports a time short enough for a 1 km pair, so only walkers fitted. Ranges
+admit a walker at 37–64 minutes, a driver at 4–28 and a subway rider at 5–28
+for the same 3 km pair, which is what the city looks like.
+
+Result, core residents working in the core (replicates 0–3), against ACS
+B08301 for the same core tracts (which also counts residents who work
+outside the core, so walking there is expected to run a little lower):
+
+| Metro | Walk pop / ACS | Bike | Transit | Car |
+|---|---|---|---|---|
+| NYC | 26.6 / 24.5 | 4.2 / 3.3 | 56.5 / 60.0 | 8.3 / 9.4 |
+| DC | 14.6 / 14.6 | 4.5 / 4.8 | 27.4 / 32.4 | 52.1 / 47.1 |
+| SF Bay | 12.4 / 10.7 | 3.9 / 3.9 | 23.3 / 26.5 | 58.3 / 57.2 |
+| Chicago | 5.8 / 7.1 | 1.5 / 1.7 | 24.9 / 23.8 | 66.9 / 66.4 |
+| Seattle | 9.9 / 12.1 | 3.3 / 3.7 | 18.5 / 20.4 | 67.8 / 63.2 |
+| Miami | 11.4 / 6.1 | 0.7 / 0.9 | 4.7 / 8.4 | 81.3 / 83.1 |
+| LA | 2.6 / 3.8 | 0.4 / 0.8 | 6.5 / 8.2 | 89.7 / 86.4 |
+| Houston | 0.8 / 2.0 | 0.3 / 0.4 | 4.0 / 3.4 | 94.7 / 93.8 |
 
 **What this does not fix.** New Brunswick to Manhattan is ~55 km, about 75
 minutes driving — inside what people report — yet **62.6% of New Jersey
-residents working in New York take transit and only 35.4% drive**. No distance
-or time cap separates those; only mode does. Every agent now carries its own
-PUMS mode, ready for the multimodal step; until then the model drives them all,
-and that is a stated limitation rather than something the cap resolves.
+residents working in New York take transit and only 35.4% drive**. The agents
+now carry those transit riders, but the model has no transit mode to put them
+on. Every agent carries its own PUMS
+mode. Walking and cycling now exist (`multimodal.md`), but only for core
+residents; transit does not yet, so a New Jersey transit commuter still drives
+(or, in NYC, takes a ride if carless). That is a stated limitation rather than
+something the cap resolves.
+
+## 5b. Homes outside the graph's counties are skipped at run time
+
+The drive graph, and the commute pairs attached to it, cover only the counties
+that hold 95% of a metro's commuters, minus the metro's excluded counties
+(`params.METRO_PARAMS[...]["exclude_counties"]`). The rest is real LODES data
+with unusable geometry. This population build draws homes from every county,
+though, so some agents lived where there is no graph: 3.3% in DC, 2.7% NYC,
+1.8% Seattle, 1.6% Chicago, 1.0% Houston, 0.6% LA, 0.2% SF, none in Miami.
+Their homes snapped to the graph's edge, and every trip started with a
+straight-line access leg of 7-18 km at the median (up to 68 km), charged at
+25 km/h.
+
+`Simulation` now skips those rows, in row order, and the next rows take their
+places (`dropped_outside_graph`); the service fetches 20% more rows than
+agents to allow for it. Every condition of a study applies the same rule to
+the same rows. The rows stay in the database: the rule belongs to the graph,
+not to the census geography.
 
 ## 6. What each agent now carries
 
@@ -211,9 +263,12 @@ Still constant for everyone, because nothing supplies them: walking tolerance,
 preferred time window, risk salience, primary leisure interest, and the seven
 unmeasured survey item slots (see `survey-coverage.md`).
 
-Vehicles, transit share and ambulatory difficulty are stored and attached to
-agents but **inert while `CAR_ONLY_MODE` is on** — every agent is forced to a
-car. They become live when that toggle is removed for the multimodal work.
+Vehicles and ambulatory difficulty are live in mode choice (`multimodal.md`):
+a household without a vehicle has no car outside NYC, and ambulatory
+difficulty rules out cycling and caps walking at 1 km. The PUMS commute mode
+starts each agent's habit and is the target the walk and bike constants are
+calibrated to. Transit share only feeds perceived behavioural control (TPB),
+because there is no transit mode yet.
 
 ## 6a. Survey matching reweights the survey, and that has a cost
 

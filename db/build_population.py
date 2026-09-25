@@ -79,10 +79,10 @@ SI01_SECTORS = {"11", "21", "23", "31", "32", "33"}
 SI02_SECTORS = {"22", "42", "44", "45", "48", "49"}
 
 # ── Car-commute plausibility ────────────────────────────────────────────────
-# LODES records WHERE people commute, never HOW. Under CAR_ONLY_MODE the model
-# drives every one of them, and the OD tail contains commutes nobody drives
-# daily: the longest NYC pair is 488 km, and 9.5% of NYC jobs (16.7% in LA) sit
-# on pairs over 50 km.
+# LODES records WHERE people commute, never HOW. When this cap was set the model
+# drove every one of them (car-only), and the OD tail contains commutes nobody
+# drives daily: the longest NYC pair is 488 km, and 9.5% of NYC jobs (16.7% in
+# LA) sit on pairs over 50 km.
 #
 # The cap is set from what car commuters actually report. PUMS JWMNP for people
 # whose mode is car (JWTRNS = 1): New Jersey median 25 min, p90 60, p99 134;
@@ -103,25 +103,77 @@ EFFECTIVE_SPEED_KMH = 55.0
 # NOTE this does NOT make every remaining commute a plausible CAR commute.
 # New Brunswick to Manhattan is ~55 km, about 75 minutes driving — within what
 # people report — yet 62.6% of New Jersey residents working in New York take
-# transit and only 35.4% drive. Distance cannot separate those; mode can, and
-# every agent now carries its own PUMS mode (commute_mode / JWTRNS) ready for
-# the multimodal step. Until then the model drives them all, and that is a
-# stated limitation rather than something this cap fixes.
+# transit and only 35.4% drive. Distance cannot separate those; mode can. Every
+# agent carries its own PUMS mode (commute_mode / JWTRNS), and the draw below
+# now matches on it, but the model has no transit mode to put those riders on:
+# outside the core they still drive (or, in NYC, take a ride if carless). That
+# is a stated limitation rather than something this cap fixes.
 
-# Commute-time bands, shared by the pair's implied time and the person's own
-# reported time, so a long pair is matched to someone who reports a long
-# commute instead of to whoever happens to fit the other bands.
-COMMUTE_BANDS = [(0, 15), (15, 30), (30, 45), (45, 60), (60, 90), (90, 10000)]
+# Plausible DOOR-TO-DOOR speed ranges by PUMS mode (JWTRNS), in network km/h.
+# A person can hold a commute pair if their REPORTED commute time and the
+# pair's distance fit some speed inside their mode's range. Ranges, not point
+# speeds, because door-to-door speed is not one number: a 1 km drive (walk to
+# the car, lights, parking) averages a fraction of a 30 km freeway commute, and
+# a transit trip's wait matters more the shorter it is. These are stated
+# assumptions, deliberately wide, not estimates:
+#   walk 3.5-6      walking pace, ~1.0-1.6 m/s
+#   bike 10-20      urban cycling including stops
+#   car 8-60        dense-city short trip up to a freeway commute (the 55 km/h
+#                   the car cap uses sits inside)
+#   transit 8-50    local bus or short subway ride with its wait, up to commuter
+#                   rail
+# Codes: 1 car/truck/van, 2 bus, 3 subway, 4 commuter rail, 5 light rail,
+# 6 ferry, 7 taxi, 8 motorcycle, 9 bicycle, 10 walked. Worked from home (11),
+# other (12) and a missing mode or time carry no range: those people are
+# matched on the remaining keys only.
+MODE_SPEED_RANGE_KMH = {
+    1: (8.0, 60.0), 7: (8.0, 60.0), 8: (8.0, 60.0),
+    2: (8.0, 50.0), 3: (8.0, 50.0), 4: (8.0, 50.0), 5: (8.0, 50.0), 6: (8.0, 50.0),
+    9: (10.0, 20.0),
+    10: (3.5, 6.0),
+}
+
+# Commute-DISTANCE bands (straight-line km). The drawn pair falls in one; a
+# person is filed under every band their reported time and mode make
+# plausible, and the draw asks for the pair's band.
+#
+# This replaces matching on TIME with every pair converted at car speed. That
+# made a 3 km Manhattan commute "4 minutes", matchable only to people reporting
+# under 15 — walkers and very short drives — and put 74% of NYC's core
+# commuters on foot against 24.5% in ACS B08301 for the same tracts. A single
+# speed per mode fails the other way: at 55 km/h no driver reports a time short
+# enough for a 1 km pair, so only walkers qualified (Miami walk share rose from
+# 21% to 28%). Hence the ranges above.
+COMMUTE_DIST_BANDS_KM = [(0, 0.8), (0.8, 1.6), (1.6, 3), (3, 6), (6, 12),
+                         (12, 25), (25, 100000)]
 
 
-def commute_band(minutes):
-    """Index of the commute-time band, or None when the time is unknown."""
-    if minutes is None:
+def commute_dist_band(km):
+    """Index of the commute-distance band a pair falls in, or None if unknown."""
+    if km is None:
         return None
-    for i, (lo, hi) in enumerate(COMMUTE_BANDS):
-        if lo <= minutes < hi:
+    for i, (lo, hi) in enumerate(COMMUTE_DIST_BANDS_KM):
+        if lo <= km < hi:
             return i
-    return len(COMMUTE_BANDS) - 1
+    return len(COMMUTE_DIST_BANDS_KM) - 1
+
+
+def plausible_dist_bands(minutes, mode):
+    """Distance bands a reported commute time makes plausible for this mode.
+
+    Straight-line km between ``minutes * v_lo`` and ``minutes * v_hi`` (over the
+    detour factor). Returns a tuple of band indices, or None when the person
+    carries no range (see MODE_SPEED_RANGE_KMH).
+    """
+    if minutes is None or mode is None:
+        return None
+    rng = MODE_SPEED_RANGE_KMH.get(int(mode))
+    if rng is None:
+        return None
+    lo_km = float(minutes) / 60.0 * rng[0] / DETOUR_FACTOR
+    hi_km = float(minutes) / 60.0 * rng[1] / DETOUR_FACTOR
+    return tuple(i for i, (b_lo, b_hi) in enumerate(COMMUTE_DIST_BANDS_KM)
+                 if b_lo < hi_km and b_hi > lo_km)
 
 
 def implied_car_minutes(km):
@@ -288,7 +340,7 @@ class PumaSample:
                 "age_seg": age_segment(agep),
                 "earn_seg": earnings_segment(pernp) if employed else None,
                 "ind_seg": industry_segment(naicsp) if employed else None,
-                "time_band": commute_band(jwmnp) if employed else None,
+                "dist_bands": plausible_dist_bands(jwmnp, jwtrns) if employed else None,
                 "base_w": float(wgtp or 0.0),
             })
         self.serial_index = defaultdict(list)
@@ -310,11 +362,15 @@ class PumaSample:
         buckets = defaultdict(list)
         for i, r in enumerate(self.rows):
             if r["employed"]:
-                a, e, ind, t = r["age_seg"], r["earn_seg"], r["ind_seg"], r["time_band"]
-                # Exactly the keys the draw ladder asks for, no more.
-                buckets[(True, (a, e, ind, t))].append(i)
-                buckets[(True, (a, e, None, t))].append(i)
-                buckets[(True, (a, None, None, t))].append(i)
+                a, e, ind = r["age_seg"], r["earn_seg"], r["ind_seg"]
+                # Exactly the keys the draw ladder asks for, no more. A person
+                # sits under every distance band their commute makes plausible;
+                # one with no range (worked from home, other, missing) only
+                # under the keys that ignore distance, as before.
+                for t in (r["dist_bands"] or ()):
+                    buckets[(True, (a, e, ind, t))].append(i)
+                    buckets[(True, (a, e, None, t))].append(i)
+                    buckets[(True, (a, None, None, t))].append(i)
                 buckets[(True, (a, e, ind, None))].append(i)
                 buckets[(True, (a, e, None, None))].append(i)
                 buckets[(True, (a, None, None, None))].append(i)
@@ -369,19 +425,19 @@ class TractPool:
         return entry
 
     def draw(self, rng, *, worker, age_seg=None, earn_seg=None, ind_seg=None,
-             time_band=None):
+             dist_band=None):
         """Draw one person, relaxing the bands only as far as needed.
 
-        Industry and earnings are given up before the commute-time band,
-        because time is what keeps the drawn geography honest: a 90-minute pair
-        should belong to someone who reports a 90-minute commute, while
-        industry is only a sharpener.
+        Industry and earnings are given up before the commute-distance band,
+        because distance is what keeps the drawn geography honest: a 40 km pair
+        should belong to someone whose own reported commute reaches that far,
+        while industry is only a sharpener.
         """
         if worker:
             ladder = [
-                (age_seg, earn_seg, ind_seg, time_band),
-                (age_seg, earn_seg, None, time_band),
-                (age_seg, None, None, time_band),
+                (age_seg, earn_seg, ind_seg, dist_band),
+                (age_seg, earn_seg, None, dist_band),
+                (age_seg, None, None, dist_band),
                 (age_seg, earn_seg, ind_seg, None),
                 (age_seg, earn_seg, None, None),
                 (age_seg, None, None, None),
@@ -426,7 +482,7 @@ def load_pairs(cur, metro):
     coords = np.array([[r[2], r[3], r[4], r[5]] for r in rows], dtype=np.float64)
     jobs = np.array([r[6] for r in rows], dtype=np.float64)
     # Straight-line home->work distance, used for the car-commute cap and for
-    # the commute-time band each drawn pair is matched on.
+    # the commute-distance band each drawn pair is matched on.
     lat1, lon1, lat2, lon2 = (np.radians(coords[:, 0]), np.radians(coords[:, 1]),
                               np.radians(coords[:, 2]), np.radians(coords[:, 3]))
     km = 6371.0 * 2 * np.arcsin(np.sqrt(
@@ -436,7 +492,7 @@ def load_pairs(cur, metro):
     seg = np.array([[r[7] or 0, r[8] or 0, r[9] or 0,
                      r[10] or 0, r[11] or 0, r[12] or 0,
                      r[13] or 0, r[14] or 0, r[15] or 0] for r in rows], dtype=np.float64)
-    return h_geoid, w_geoid, coords, jobs, seg, minutes
+    return h_geoid, w_geoid, coords, jobs, seg, minutes, km
 
 
 def load_core_homes(cur, metro):
@@ -485,7 +541,7 @@ def draw_categorical(rng, weights, size):
 
 def build_metro(conn, metro, replicates, n_agents, log=print):
     cur = conn.cursor()
-    h_geoid, w_geoid, pair_xy, jobs, seg, pair_minutes = load_pairs(cur, metro)
+    h_geoid, w_geoid, pair_xy, jobs, seg, pair_minutes, pair_km = load_pairs(cur, metro)
 
     # Exclude commutes nobody drives daily. Zeroing the job weight removes the
     # pair from the draw entirely, which is what "not a car commute" means --
@@ -581,7 +637,7 @@ def build_metro(conn, metro, replicates, n_agents, log=print):
                 agents.append({"rep": replicate, "i": i, "worker": True, "pair": pi,
                                "tract": tract, "age_seg": segs[0],
                                "earn_seg": segs[1], "ind_seg": segs[2],
-                               "time_band": commute_band(float(pair_minutes[pi]))})
+                               "dist_band": commute_dist_band(float(pair_km[pi]))})
             else:
                 ci = int(block_idx[bi]); bi += 1
                 agents.append({"rep": replicate, "i": i, "worker": False,
@@ -626,7 +682,7 @@ def build_metro(conn, metro, replicates, n_agents, log=print):
             person, used_puma = pool.draw(
                 rng, worker=a["worker"],
                 age_seg=a.get("age_seg"), earn_seg=a.get("earn_seg"),
-                ind_seg=a.get("ind_seg"), time_band=a.get("time_band"))
+                ind_seg=a.get("ind_seg"), dist_band=a.get("dist_band"))
             if person is None:
                 raise SystemExit(
                     f"FATAL: PUMA {state}-{puma} has no "

@@ -66,7 +66,6 @@ def main() -> None:
     metro = sys.argv[1] if len(sys.argv) > 1 else "miami"
     agents = int(sys.argv[2]) if len(sys.argv) > 2 else 300
     days = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-    params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"] = True
 
     print(f"{metro}: {agents} agents x {days} days\n")
 

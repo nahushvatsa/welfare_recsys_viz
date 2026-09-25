@@ -120,9 +120,11 @@ CREATE TABLE IF NOT EXISTS public.metro_population (
     hh_size      smallint,
     commute_mode smallint,                 -- PUMS JWTRNS, this person's own mode
     -- Two commute times, kept side by side so the match can be audited:
-    -- what the drawn LODES pair implies for a car, and what this person
-    -- actually reported (PUMS JWMNP). The draw matches them by band, so a
-    -- long pair lands on someone who reports a long commute.
+    -- what the drawn LODES pair implies for a car (also what the 135-minute
+    -- car cap is applied to), and what this person actually reported (PUMS
+    -- JWMNP). The draw requires the pair's distance to be coverable in the
+    -- reported time at this person's own mode's speed range (see
+    -- db/build_population.py MODE_SPEED_RANGE_KMH).
     commute_min_implied  double precision,
     commute_min_reported smallint,
     -- Share of the HOME TRACT's workers commuting by public transport

@@ -211,9 +211,11 @@ For anyone doing a future cleanup pass:
 - **`DERIVED_DEMAND_ONLY` branches** (`agent.py`, `simulation.py`). The toggle is
   now `False`, so these never fire — but they are the ablation machinery the
   toggle exists for. Deleting them removes the capability, not dead code.
-- **Mode-choice machinery** (walk/bike/transit availability,
-  `mode_preference_bias`, `car_access_penalty`). Inert under `CAR_ONLY_MODE=True`,
-  but the paper names multi-modal travel as the architecture's next step.
+- **The transit stand-in** (`MODE_PARAMS["transit"]`, crowding, the transit
+  branch of the mode code). `CAR_ONLY_MODE` is gone and walk/bike/car choice is
+  live (see `multimodal.md`), but transit is disabled by default
+  (`params.DISABLED_MODES`): it is a flat speed over road distance, not a
+  transit network. Kept for when one exists.
 - **`over_recommendation_cost` / `welfare_gain`** (`experiment_harness.py`). A
   *deliberately different* quantity from the paper's ORC — clipped loss over all
   agents rather than per-harmed-agent. Its output key was renamed

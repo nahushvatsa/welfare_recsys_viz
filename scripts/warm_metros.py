@@ -3,11 +3,16 @@
 For each metro this geocodes the boundary polygons (Nominatim), downloads the
 core drive network + arterial shell (Overpass), composes/simplifies them, bakes
 the catalog POIs into the graph, and writes the disk caches (boundaries /
-GraphML / warm pickle) so runs from the app are purely local afterwards.
+GraphML / warm pickle) so runs from the app are purely local afterwards. It
+does the same for the core's walk and bike networks (welfare_rs.active_modes).
+
+Pin the Overpass mirror with $WELFARE_RS_OVERPASS_URL for bulk warming; the
+probe can otherwise pick overpass-api.de, which blocks this host after a burst
+of queries.
 
 It then precomputes the **routing matrices** — all-pairs shortest distance and
-fastest time over the metro's endpoint universe (see
-``welfare_rs.routing_matrix``). That is the expensive, reusable part: once it
+fastest time over the metro's endpoint universe, plus shortest walk and bike
+distance over its core endpoints (see ``welfare_rs.routing_matrix``). That is the expensive, reusable part: once it
 exists, a simulation never runs Dijkstra again, so concurrent runs and large
 agent populations cost nothing extra.
 
@@ -129,6 +134,9 @@ def main() -> None:
             f"{commutes} · {time.time() - t0:.0f}s",
             flush=True,
         )
+        for mode, mnet in sorted(net.mode_networks.items()):
+            print(f"  {mode}: {mnet.num_base_nodes:,} nodes · {mnet.num_edges:,} edges · "
+                  f"{len(mnet._poi_nodes):,} POI nodes", flush=True)
 
         if graph_only:
             continue
@@ -140,13 +148,16 @@ def main() -> None:
 
     print("\n" + "=" * 60)
     for metro in metros:
-        meta = routing_matrix.read_meta(params.GEO_PARAMS["cache_dir"], metro)
-        if meta:
-            gb = meta["universe"] ** 2 * 8 * 3 / 1e9
-            print(f"  {metro:9} universe {meta['universe']:>7,}  {gb:6.1f} GB  "
-                  f"built in {meta.get('build_seconds', 0):.0f}s")
-        else:
-            print(f"  {metro:9} no routing matrices")
+        for mode in ("drive", *params.ACTIVE_NETWORK_PARAMS["modes"]):
+            meta = routing_matrix.read_meta(params.GEO_PARAMS["cache_dir"], metro, mode)
+            label = f"{metro}/{mode}"
+            if meta:
+                tables = 3 if meta.get("has_time") else 1
+                gb = meta["universe"] ** 2 * 8 * tables / 1e9
+                print(f"  {label:15} universe {meta['universe']:>7,}  {gb:6.1f} GB  "
+                      f"built in {meta.get('build_seconds', 0):.0f}s")
+            else:
+                print(f"  {label:15} no routing matrices")
 
     if failures:
         print("\nFailed metros:")

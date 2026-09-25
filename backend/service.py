@@ -9,12 +9,12 @@ separate task on a ``ProcessPoolExecutor``. A 3-seed study over 4 recommenders i
 15 simulations running at once, not 3 sequential pairs. Why processes, and what
 they do and don't share:
 
-* Threads wouldn't help — the agent loop is pure-Python (GIL-bound), and the
-  per-run ``params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"]`` global would race.
-  Separate processes each get their own module globals, so the toggle is set
-  safely per worker and there is no cross-task contention.
+* Threads wouldn't help — the agent loop is pure-Python (GIL-bound). Separate
+  processes each get their own module globals, so there is no cross-task
+  contention.
 * The metro graph is *not* shared: the pool uses 'spawn', so each worker
-  unpickles its own copy (tens of MB on disk, a few hundred resident). The parent
+  unpickles its own copy of the drive graph and of the core walk and bike
+  graphs (tens of MB each on disk, a few hundred resident). The parent
   pre-builds it once so no worker downloads from Overpass or races to write the
   warm pickle, and after the first read the file is served from page cache. A
   worker caches the network process-globally and reuses it across its tasks.
@@ -427,7 +427,6 @@ class RunConfig:
     # Recommenders to run *besides* the No-RS control, which is always included.
     # A tuple, not a list, so the frozen dataclass stays hashable.
     recommenders: Tuple[RecommenderSpec, ...] = ()
-    multimodal: bool = False
     use_real_pois: bool = True
 
     def seeds(self) -> List[int]:
@@ -449,7 +448,7 @@ class RunConfig:
         key = (
             self.city, int(self.num_agents), int(self.num_days), int(self.seed),
             int(self.num_seeds), tuple(s.identity() for s in self.recommenders),
-            bool(self.multimodal), bool(self.use_real_pois),
+            bool(self.use_real_pois),
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 
@@ -745,7 +744,11 @@ def _population_rows(ds, city: str, seed: int, num_agents: int):
                 RuntimeWarning, stacklevel=2,
             )
         return None
-    rows = ds.population(city, replicate=int(seed) % n_reps, limit=num_agents)
+    # More rows than agents: carless people outside the NYC exception who
+    # cannot walk or cycle to work are left out by the Simulation, and the
+    # next rows take their places (1-2% of a metro's population).
+    rows = ds.population(city, replicate=int(seed) % n_reps,
+                         limit=num_agents + max(100, num_agents // 5))
     if rows is None:
         return None
     if len(rows) < num_agents:
@@ -800,10 +803,6 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
 
     Raises SimulationCancelled if ``cancel_event`` is set between days.
     """
-    # Mode model: paper default is car-only; the toggle re-enables multimodal.
-    # Safe to set on the module global — this is the worker's own process.
-    params.SIMPLIFICATION_TOGGLES["CAR_ONLY_MODE"] = not bool(cfg["multimodal"])
-
     poi_rows = get_datasource().poi_rows(cfg["city"]) if bool(cfg["use_real_pois"]) else None
     use_real_pois = bool(poi_rows)
     network = _worker_network(cfg["city"], use_real_pois)

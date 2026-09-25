@@ -37,6 +37,7 @@ MODE_COLOR = {
     "walk": [80, 170, 90],
     "bike": [240, 180, 40],
     "transit": [70, 130, 220],
+    "taxi": [150, 90, 200],
 }
 STATE_COLOR = {
     "home": [80, 170, 90],
@@ -125,7 +126,6 @@ def build_timelines(sim) -> Dict[int, dict]:
     purpose of the trip that brought it (home/work/leisure). ``path`` is the
     simplified route (float32 lat/lon) and ``cum`` its cumulative distances.
     """
-    net = sim.road_network
     timelines: Dict[int, dict] = {}
     for agent in sim.agents:
         trips = sorted(agent.trips, key=lambda t: t.depart_time)
@@ -137,7 +137,8 @@ def build_timelines(sim) -> Dict[int, dict]:
         for tr in trips:
             if tr.depart_time > prev_end:
                 stays.append((prev_end, tr.depart_time, prev_loc, prev_state))
-            path = _simplify_path(net.route_geometry_latlon(tr.origin, tr.destination))
+            # Drawn on the network the trip's mode used (walk/bike/drive).
+            path = _simplify_path(sim.trip_geometry(agent, tr))
             moves.append(
                 {
                     "t0": tr.depart_time,

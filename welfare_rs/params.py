@@ -25,10 +25,10 @@ _REPO_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # we can quantify its marginal contribution to the final outcomes. All toggles
 # default to ``False`` (i.e., full-rich model). Flip to ``True`` to ablate.
 #
-# * ``CAR_ONLY_MODE``: removes the mode-choice model. Every trip is assigned
-#   ``mode = "car"``. The effects of ``CarAccess`` and ``TransitAccess``
-#   persona columns are neutralised (all agents behave as car owners with no
-#   access penalty) so that mode choice can no longer influence the results.
+# ``CAR_ONLY_MODE`` used to live here. It was removed when walking and cycling
+# got their own networks (welfare_rs.active_modes): mode choice is now always
+# on. The last commit that could run the car-only model is tagged
+# ``car-only-final``.
 #
 # * ``DERIVED_DEMAND_ONLY``: removes the travel-motivation decomposition.
 #   Every agent's motivation weights are forced to
@@ -39,7 +39,6 @@ SIMPLIFICATION_TOGGLES: dict = {
     # Defaults are ON: the simplified model is the one we now run by
     # default. Flip any of these to ``False`` to restore the
     # corresponding piece of the original (richer) model for comparison.
-    "CAR_ONLY_MODE": True,
     # OFF: the MTTC motivation mixture is what makes the agents MTTC agents
     # rather than pure derived demand, and the paper's behavioural-theory claim
     # rests on it. With this on, every agent held derived=1.0 and the other
@@ -74,15 +73,23 @@ SIMPLIFIED_ETA_PARAMS: dict = {
     # Value: the paper gives no number for beta_D, and no study estimates a
     # distance elasticity of recommendation acceptance, so this is specified
     # rather than estimated — the same standing as the rest of the ICLV map.
-    # 0.30 was chosen against the measured spread of dC (Manhattan, 400 agents,
-    # 6 days, 500 offers per arm): mean dC is -0.381 under proximity-led ranking
-    # and +0.269 under footfall-led, a gap of 0.650. At 0.30 that becomes a
-    # ~20-point acceptance gap between the two designs — enough that distance
-    # matters, while staying below the trust term's +/-0.20 so it informs
-    # adoption rather than dominating it. Median offers in every arm move by
-    # under 0.05; the term bites the long right tail, where a venue is genuinely
-    # far, which is the behaviour it is meant to capture.
-    "beta_delta_cost": 0.30,
+    # It is set against a design target: the gap in mean dC between a
+    # proximity-led and a footfall-led ranker (Manhattan, 400 agents, 6 days)
+    # should become a ~0.195 gap in eta, a ~20-point acceptance difference —
+    # enough that distance matters, while staying below the trust term's
+    # +/-0.20 so it informs adoption rather than dominating it.
+    #
+    # History: 0.30 when dC was priced at 0.12 per drive km (gap 0.650); 0.22
+    # once venues were priced at expected generalised cost across walk, bike
+    # and car (gap 0.870). Current value, 2026-09-23, with the taxi mode:
+    # mean dC -0.293 proximity-led vs +1.812 footfall-led (gap 2.106, seed 42,
+    # ~265 offers per arm) and gap 1.754 at seed 43; pooled gap 1.930 ->
+    # 0.195 / 1.930 = 0.101. The gap is driven by a long right tail (p90 dC
+    # ~ +4.9): a footfall-led ranker sends carless core residents to far venues
+    # they must reach by taxi at metered fares. At this value a typical offer's
+    # extra cost moves eta only a little and the expensive tail is what bites.
+    # Reproduce with scripts/measure_delta_cost.py nyc 400 6 <seed>.
+    "beta_delta_cost": 0.10,
     # Memory term: delta_mem = memory_weight * min(memory_cap, n_accepted)
     "memory_weight": 0.015,
     "memory_cap": 5,
@@ -277,6 +284,50 @@ METRO_PARAMS: dict = {
     },
 }
 
+# ── Walk and bike networks (active_modes.py) ─────────────────────────────────
+#
+# Core-only OSM networks for the two active modes. See welfare_rs.active_modes
+# for why each setting exists; changing any of them changes the cache identity
+# and forces a fresh download.
+
+ACTIVE_NETWORK_PARAMS: dict = {
+    "modes": ("walk", "bike"),
+    # Extent beyond the (hole-filled) core polygon, so routes can use the
+    # streets just past the city line and bridges can reach the far bank.
+    "buffer_m": 1000.0,
+    # Weakly connected pieces smaller than this are dropped. They are parking
+    # aisles and isolated park paths; kept, they capture a nearby home's snap
+    # and leave it with no route anywhere. Real islands (Roosevelt Island,
+    # Treasure Island, Oakland versus San Francisco) are far larger.
+    "min_component_nodes": 50,
+    # Keep streets whose sidewalks are mapped as separate ways. OSMnx's walk
+    # filter drops them, expecting the separate sidewalk to carry the walker,
+    # but those sidewalks are often not drawn across bridges, causeways and
+    # crossings — in Miami that cut Watson Island off from the mainland on foot
+    # while bikes and cars crossed. The street centreline runs alongside its
+    # sidewalk, so keeping it restores connectivity at no distance cost.
+    "walk_keep_separate_sidewalk_streets": True,
+    # Unioned with OSMnx's walk filter: cycleways where walking is explicitly
+    # allowed. OSMnx drops every highway=cycleway, but shared-use trails are
+    # commonly tagged cycleway + foot=designated — DC alone has ~260 km of them
+    # (Mount Vernon Trail, Rock Creek), which walkers were routed around.
+    # Untagged cycleways stay excluded: only explicit permission counts, the
+    # same rule the bike network applies to footways.
+    "walk_extra_filters": (
+        '["highway"="cycleway"]["foot"~"^(yes|designated|permissive)$"]'
+        '["area"!~"yes"]["access"!~"private"]["service"!~"private"]',
+    ),
+    # Unioned with OSMnx's own bike filter: footways where cycling is
+    # explicitly allowed, which OSMnx's filter drops wholesale.
+    "bike_extra_filters": (
+        '["highway"="footway"]["bicycle"~"^(yes|designated|permissive)$"]'
+        '["area"!~"yes"]["access"!~"private"]["service"!~"private"]',
+    ),
+    # Add the reverse of one-way streets tagged oneway:bicycle=no (or the older
+    # cycleway=opposite*).
+    "bike_contraflow": True,
+}
+
 # ── Real POI dataset (filtered per metro core city) ──────────────────────────
 #
 # The raw dataset (poi_children_merged_by_wkt.csv, ~375 MB, all US) is filtered
@@ -352,6 +403,7 @@ CITY_PARAMS: dict = {
         "bike": 0.10,
         "transit": 0.08,
         "car": -0.02,
+        "taxi": -0.02,
         "ai_shuttle": 0.02,
     },
     # Un-networked access leg. Agent homes/workplaces are real Census block
@@ -363,8 +415,10 @@ CITY_PARAMS: dict = {
     # so there is no route to measure — a haversine approximation is the honest
     # ceiling on what can be known).
     #
-    # Set "access_speed_kmh" to None to charge it at the chosen mode's own
-    # speed instead of one flat local-street speed.
+    # This speed is for car (and the disabled transit stand-in). Walking and
+    # cycling snap to their own networks and always charge the gap at their own
+    # speed: a walker does not cover the last 100 m at 25 km/h. Set this to None
+    # to charge car access at the car's flat speed instead.
     "access_speed_kmh": 25.0,
     "default_context": {
         "ai_intervention": "none",
@@ -465,10 +519,18 @@ MODE_PARAMS: dict = {
         "wait_min": 0,
         "comfort": 0.2,
     },
+    # Bike-share, available anywhere in the core (no dock locations yet).
+    # Priced as an annual member rides: no unlock fee, the first 45 minutes of
+    # a classic-bike ride included, then a per-minute overage. The annual fee is
+    # sunk, so it does not enter a per-trip choice. Values are Citi Bike's
+    # (NYC) 2026 member terms — $0.27/min overage beyond 45 min — used for every
+    # metro until per-system fares are added.
     "bike": {
         "speed_kmh": 14.0,
-        "cost_per_km": 0.02,
+        "cost_per_km": 0.0,
         "fixed_cost": 0.0,
+        "included_min": 45.0,
+        "overage_per_min": 0.27,
         "emissions_g_per_km": 0.0,
         "wait_min": 0,
         "comfort": 0.4,
@@ -489,13 +551,63 @@ MODE_PARAMS: dict = {
         "wait_min": 1,
         "comfort": 0.7,
     },
+    # Taxi: a car trip for a household without a car. Drives the road network
+    # at car speed under the same congestion, and adds to it. Priced by the
+    # metro's metered fare (TAXI_FARES), not per-km operating cost, so
+    # fixed_cost and cost_per_km are unused. wait_min is the pickup wait, an
+    # assumption (a few minutes in a dense core).
+    "taxi": {
+        "speed_kmh": 30.0,
+        "cost_per_km": 0.0,
+        "fixed_cost": 0.0,
+        "emissions_g_per_km": 180.0,
+        "wait_min": 5,
+        "comfort": 0.7,
+    },
 }
+
+# Metered taxi fares per metro, from each city's regulator, kept simple: a flag
+# fall plus one per-mile rate (and, for Miami, its higher first-mile rate).
+# Left out: the short distance the flag covers, slow-traffic time charges,
+# surcharges, airport fees and tips — so taxi cost is somewhat UNDERSTATED,
+# most in slow Manhattan traffic. "default" (NYC) serves networks with no metro.
+TAXI_FARES: dict = {
+    # NYC TLC standard metered fare: $3.00 + $0.70 per 1/5 mile.
+    "nyc":     {"flag": 3.00, "per_mile": 3.50},
+    # Chicago BACP, effective 1 July 2026: $3.25 + $0.31 per 1/9 mile.
+    "chicago": {"flag": 3.25, "per_mile": 2.79},
+    # DC Department of For-Hire Vehicles: $4.00 first 1/8 mile, $2.56/mile.
+    "dc":      {"flag": 4.00, "per_mile": 2.56},
+    # SFMTA rates of fare (April 2023): $4.15 + $0.65 per 1/5 mile.
+    "sf_bay":  {"flag": 4.15, "per_mile": 3.25},
+    # King County / City of Seattle, August 2025: $2.60 + $0.30 per 1/9 mile.
+    "seattle": {"flag": 2.60, "per_mile": 2.70},
+    # Miami-Dade R-700-22: $2.95 first 1/6 mile, $0.85 per 1/6 mile to 1 mile
+    # ($5.10/mile), then $0.55 per 1/6 mile ($3.30/mile).
+    "miami":   {"flag": 2.95, "per_mile": 3.30, "first_mile_per_mile": 5.10},
+    # City of Houston ARA: $2.91 first 1/11 mile (daytime), $2.31/mile.
+    "houston": {"flag": 2.91, "per_mile": 2.31},
+    # LADOT 2023 schedule: $3.10 + $0.30 per 1/9 mile. (A licensed operator now
+    # lists $0.33 per 1/9 mile, $2.97/mile; the current official schedule could
+    # not be retrieved, so the published 2023 rate is used.)
+    "la":      {"flag": 3.10, "per_mile": 2.70},
+    "default": {"flag": 3.00, "per_mile": 3.50},
+}
+
+# Modes a Simulation leaves out unless told otherwise. Transit here is a
+# stand-in (flat speed over road distance plus a wait), not a transit network,
+# so it is not offered until one exists.
+DISABLED_MODES: tuple = ("transit",)
 
 MODE_STATUS: dict = {
     "walk": 0.2,
     "bike": 0.3,
     "transit": 0.4,
     "car": 0.9,
+    # A taxi is a car trip: same status, enjoyment, norm and weather effects as
+    # car. What differs is who may take it (carless agents), what it costs (a
+    # metered fare) and the wait for a pickup.
+    "taxi": 0.9,
 }
 
 MODE_ENJOYMENT: dict = {
@@ -503,6 +615,7 @@ MODE_ENJOYMENT: dict = {
     "bike": 0.6,
     "transit": 0.3,
     "car": 0.2,
+    "taxi": 0.2,
 }
 
 # ── Utility function weights ─────────────────────────────────────────────────
@@ -544,9 +657,9 @@ CONGESTION_PARAMS: dict = {
 # ── Weather speed factors ────────────────────────────────────────────────────
 
 WEATHER_FACTORS: dict = {
-    "rain": {"bike": 0.75, "walk": 0.75, "transit": 0.9, "car": 0.9},
-    "heat": {"bike": 0.80, "walk": 0.80, "transit": 1.0, "car": 1.0},
-    "fair": {"bike": 1.0, "walk": 1.0, "transit": 1.0, "car": 1.0},
+    "rain": {"bike": 0.75, "walk": 0.75, "transit": 0.9, "car": 0.9, "taxi": 0.9},
+    "heat": {"bike": 0.80, "walk": 0.80, "transit": 1.0, "car": 1.0, "taxi": 1.0},
+    "fair": {"bike": 1.0, "walk": 1.0, "transit": 1.0, "car": 1.0, "taxi": 1.0},
 }
 
 # ── TPB intention model ──────────────────────────────────────────────────────
@@ -579,7 +692,9 @@ PARTICIPATION_PARAMS: dict = {
     "motivation_escape_coeff": 0.2,
     "p_participate_max": 0.95,
     "min_net_utility": -0.15,
-    "expected_trip_disutility_per_km": 0.12,
+    # (expected_trip_disutility_per_km, the flat 0.12/km a venue used to be
+    # priced at, is gone: venues are priced by the mode-choice logsum — see
+    # Agent._price_round_trip.)
     "outdoor_walk_tol_discount": 0.92,
     "outdoor_walk_tol_threshold": 30,
     "activity_intrinsic_coeff": 0.35,
@@ -960,9 +1075,10 @@ PERSONA_MAPPING: dict = {
     # for every agent, so they contribute no heterogeneity and cannot be
     # mistaken for an empirical source of it.
     #
-    # Car and transit access are fixed because every trip is a car trip
-    # (CAR_ONLY_MODE, and the paper's car-only assumption). Mobility needs are
-    # fixed at "none" for the same reason. Primary leisure interest and
+    # Car access, transit access and mobility needs are fixed ONLY for agents
+    # built without an ACS/PUMS population row. A built population measures all
+    # three per agent (PUMS vehicles, tract transit share, PUMS ambulatory
+    # difficulty) and overrides these. Primary leisure interest and
     # environmental attitude are dropped outright rather than pinned: both
     # applied a utility bonus, and a constant bonus for all agents is just a
     # shift in the origin. The green weight instead keeps its random base and
@@ -1015,17 +1131,87 @@ PERSONA_MAPPING: dict = {
     },
 }
 
+# ── Decision rules ───────────────────────────────────────────────────────────
+
+DECISION_RULE_PARAMS: dict = {
+    # Which regret rule the regret paradigm uses for mode choice. BOTH are kept
+    # until the user decides (2026-09-23):
+    #   "chorus_rrm"       Chorus (2010) random regret minimisation, cited by the
+    #                      GeoRecSim paper: modes compared attribute by
+    #                      attribute, R_i = sum_j sum_m ln(1 + exp(a_jm - a_im)),
+    #                      constants added, logit over -R. Distinct from utility
+    #                      maximisation (it favours all-rounders).
+    #   "max_utility_gap"  The predecessor paper's regret (Uğurel & Yabe 2026,
+    #                      Eq. 6 / SI Eq. 4, there the recommender's filter):
+    #                      R_i = max_j U_j - U_i, lowest taken. Always picks the
+    #                      highest-utility mode, i.e. the utility rule without
+    #                      its random term.
+    # MODE_ASC was calibrated under "chorus_rrm". After switching, re-run
+    # scripts/calibrate_mode_constants.py and scripts/measure_delta_cost.py.
+    "regret_rule": "chorus_rrm",
+}
+
 # ── Mode availability constraints ────────────────────────────────────────────
 
 MODE_AVAILABILITY: dict = {
     "carshare_min_distance_km": 1.5,
-    "no_car_min_distance_km": 3.0,
+    # Taxi is how a household WITHOUT a vehicle travels by car. Every carless
+    # agent who lives in the core may take one, at the city's metered fare
+    # (TAXI_FARES). Carless agents living OUTSIDE the core may take one only in
+    # these metros, at this share of the fare: in NYC 14.7% of agents are
+    # carless and live outside Manhattan, where walking and cycling are not
+    # offered, and with no transit mode they would otherwise have no way to
+    # travel. Half the fare is the user's stand-in for the cheaper options they
+    # really use (subway, shared rides). Everywhere else a carless agent living
+    # outside the core has no mode and is left out of the population
+    # (Simulation._population_row_eligible).
+    "outer_taxi_metros": ("nyc",),
+    "outer_taxi_fare_share": 0.5,
+    # Walking and cycling are offered only to agents who LIVE in the core, and
+    # only between points on that mode's network. The distance ceilings below
+    # are physical feasibility limits (about an hour's walk, about 50 minutes'
+    # ride), not behavioural ones: how far people are willing to walk or ride
+    # comes from the time they would spend, priced by their value of time.
+    # (The walking limit used to be walk_tolerance_min / 12, i.e. 1.25 km for
+    # everyone, because walk_tolerance_min is pinned at 15 — one unsourced
+    # constant would have set the walk share.)
+    "walk_max_distance_km": 5.0,
     "bike_max_distance_km": 12,
     "bike_max_age": 75,
-    "walk_speed_for_tolerance": 12.0,  # walk_tolerance_min / this = max walk distance
     "walk_ada_max_km": 1.0,
-    "walk_min_distance_km": 0.5,
     "walk_max_age": 85,
+}
+
+# PUMS JWTRNS (means of transportation to work) -> the mode an agent's habit
+# starts from. Motorcycle is a car trip. Transit (2-6), worked from
+# home (11) and other (12) have no counterpart among the modes offered, so
+# those agents start with no habit and choose by utility until they have one.
+PUMS_JWTRNS_TO_MODE: dict = {1: "car", 7: "taxi", 8: "car", 9: "bike", 10: "walk"}
+
+# Alternative-specific constants per metro, added to a mode's travel utility
+# (car and taxi are the reference, 0). Calibrated by
+# scripts/calibrate_mode_constants.py (2026-09-23, with the taxi mode and the
+# "chorus_rrm" regret rule; 6,000 agents x replicates 0-1 per metro) so that the
+# simulated commute walk and bike shares of core-resident workers WHO HAVE A
+# CHOICE of mode match those same workers' own PUMS commute modes. Shares are
+# exact expected probabilities under each agent's decision rule. Commuters with
+# a single permitted mode are excluded (a constant cannot move them); their
+# shares are listed as "single-option". A missing metro gets no constants.
+#
+# The bike constants are large and negative everywhere: they carry what
+# deters cycling but is not in the model (safety, weather, effort, finding a
+# dock), against a bike-share ride that is otherwise free and fast. Re-run the
+# calibration after changing modes, fares, networks or the regret rule.
+MODE_ASC: dict = {
+    # n = commuters fitted; observed / fitted shares in %.
+    "miami":   {"walk": -0.545, "bike": -6.194},  # n=1,333 walk 9.90/9.99 bike 1.28/1.37; single-option car 3.7, taxi 0.4
+    "dc":      {"walk": 0.703, "bike": -3.567},   # n=2,633 walk 14.74/14.81 bike 5.09/5.12; single-option car 5.4, taxi 2.2
+    "nyc":     {"walk": 0.686, "bike": -5.127},   # n=1,704 walk 28.05/28.14 bike 5.69/5.70; single-option car 3.2, taxi 6.2
+    "sf_bay":  {"walk": 0.983, "bike": -3.325},   # n=2,494 walk 16.80/16.72 bike 4.77/4.82; single-option car 18.2, taxi 2.9
+    "seattle": {"walk": 0.879, "bike": -3.006},   # n=2,579 walk 13.26/13.23 bike 3.61/3.66; single-option car 17.0, taxi 1.2
+    "chicago": {"walk": 0.243, "bike": -5.641},   # n=2,152 walk 9.39/9.41 bike 2.04/2.13; single-option car 34.3, taxi 5.1
+    "houston": {"walk": -1.214, "bike": -6.693},  # n=1,144 walk 1.57/1.65 bike 0.35/0.33; single-option car 56.8, taxi 1.9
+    "la":      {"walk": -0.624, "bike": -5.482},  # n=1,419 walk 5.07/5.16 bike 0.92/0.93; single-option car 48.5, taxi 2.6
 }
 
 # ── Simulation defaults ──────────────────────────────────────────────────────

@@ -17,10 +17,13 @@ Design notes
 * Locations throughout the OSM-backed model are ``(lat, lon)`` tuples — the same
   shape the grid model used for ``(x, y)`` — so the rest of the ABM changes
   minimally. Snapping and routing are cached so repeated queries are cheap.
-* All modes (car, walk, bike, transit) route on this single drive network; the
-  mode differences (speed, wait, cost, comfort) live in ``params.MODE_PARAMS``
-  and are applied downstream. This is the generalisation of "walking can be the
-  same route as the car, with scaled time".
+* Car (and the disabled transit stand-in) route on the drive network. Walking
+  and cycling route on their own OSM networks — footways, paths and the correct
+  one-way rules — built for the metro core by :mod:`welfare_rs.active_modes`
+  and attached to the drive network as ``mode_networks``. The same class serves
+  both; an active network is simply built with ``timed=False`` because car
+  speeds mean nothing on a footway. Mode differences in speed, wait, cost and
+  comfort live in ``params.MODE_PARAMS`` and are applied downstream.
 """
 
 from __future__ import annotations
@@ -125,6 +128,7 @@ class RoadNetwork:
         cache_dir: Optional[str] = None,
         simplify: bool = True,
         strongly_connected: bool = True,
+        timed: bool = True,
     ):
         self.name = name
         self.network_type = network_type
@@ -148,7 +152,13 @@ class RoadNetwork:
             )
         # Per-edge speeds/travel times (car routing minimises time so freeway
         # commutes beat surface streets). Upgraded-in-place old caches persist.
-        if self._ensure_travel_times() and graph is None:
+        # An active-mode network (walk/bike) is untimed: osmnx would impute CAR
+        # speeds from highway class, which say nothing about walking or cycling
+        # and would make the router minimise the wrong quantity. Those networks
+        # route by length and apply the mode's own speed downstream.
+        if not timed:
+            self._has_edge_times = False
+        elif self._ensure_travel_times() and graph is None:
             ox.save_graphml(self.G, self._graph_path())
 
         # Node coordinate lookups + sampling pool.
@@ -253,6 +263,16 @@ class RoadNetwork:
         # off the precomputed matrix. See routing_matrix.endpoint_universe.
         self._home_block_latlon = None
 
+        # Metro key this network belongs to (set by metro.build_metro_network,
+        # never pickled into meaning: it is re-set on every load).
+        self.metro: Optional[str] = None
+        # Walk/bike networks for the metro core, keyed by mode. Attached by
+        # metro.build_metro_network after load and never pickled with the drive
+        # graph — each has its own warm pickle and routing matrices.
+        self.mode_networks: Dict[str, "RoadNetwork"] = {}
+        # Pair cache for route_km_or_none: km, or None when unreachable.
+        self._reach_cache: Dict[Tuple[int, int], Optional[float]] = {}
+
     def __getstate__(self) -> dict:
         """Exclude the lazily-rebuilt acceleration structures from pickling (so
         the disk cache stays small and isn't coupled to sklearn/scipy pickle
@@ -271,6 +291,8 @@ class RoadNetwork:
             state[k] = None
         state["_mat_rows"] = {}
         state["_pred_cache"] = {}
+        # Separate warm pickles (see active_modes); re-attached on every load.
+        state["mode_networks"] = {}
         state["_commute_total"] = 0.0
         # Per-segment prefix sums are as long as the pair table (three arrays of
         # a few million floats on a large metro), and are rebuilt lazily from the
@@ -300,6 +322,11 @@ class RoadNetwork:
             state["_mat_rows"] = {}
         if state.get("_pred_cache") is None:
             state["_pred_cache"] = {}
+        state.setdefault("metro", None)
+        if not state.get("mode_networks"):
+            state["mode_networks"] = {}
+        if state.get("_reach_cache") is None:
+            state["_reach_cache"] = {}
         self.__dict__.update(state)
 
     # ── construction ─────────────────────────────────────────────────────────
@@ -435,6 +462,37 @@ class RoadNetwork:
 
     def route_length_km_latlon(self, a: LatLon, b: LatLon) -> float:
         return self.route_length_km(self.nearest_node(*a), self.nearest_node(*b))
+
+    def route_km_or_none(self, a: LatLon, b: LatLon) -> Optional[float]:
+        """Shortest-path km between two points, or None when unreachable.
+
+        :meth:`route_length_km` substitutes the straight-line distance for an
+        unreachable pair, which is harmless on the strongly-connected drive
+        graph but wrong on a walk or bike network: those keep genuinely
+        separate components (San Francisco and Oakland, with no walkable link
+        across the Bay), and a straight-line stand-in would let an agent walk
+        across the water. Here unreachable means the mode is not available.
+        """
+        orig = self.nearest_node(*a)
+        dest = self.nearest_node(*b)
+        if orig == dest:
+            return 0.0
+        key = (orig, dest)
+        if key in self._reach_cache:
+            return self._reach_cache[key]
+        meters = self._matrix_lookup(self._mat_dist_m, orig, dest, "d")
+        if meters is None:
+            if dest not in self._route_targets:
+                self._route_targets.add(dest)
+                self._targets_version += 1
+            meters = self._single_source(orig).get(dest)
+        km = None if (meters is None or not np.isfinite(meters)) else meters / 1000.0
+        self._reach_cache[key] = km
+        return km
+
+    def snap_gap_km(self, lat: float, lon: float) -> float:
+        """Straight-line km from a point to the node it snaps to."""
+        return haversine_km((lat, lon), self.node_latlon(self.nearest_node(lat, lon)))
 
     def _ensure_csr(self) -> None:
         """Build (once) the CSR adjacencies: minimum ``length`` among parallel
@@ -814,6 +872,7 @@ class RoadNetwork:
         self._ss_time_cache.clear()
         self._car_cache.clear()
         self._geom_cache.clear()
+        self._reach_cache.clear()
         # Acceleration structures must be rebuilt against the new node set.
         self._kdtree = None
         self._kdtree_nodes = None
@@ -1198,7 +1257,8 @@ class RoadNetwork:
     def num_commute_pairs(self) -> int:
         return 0 if self._commutes is None else len(self._commutes)
 
-    def sample_commute(self, rng: random.Random, age_years=None, annual_income=None):
+    def sample_commute(self, rng: random.Random, age_years=None, annual_income=None,
+                       with_true: bool = False):
         """Draw one real commute, or None when no pairs are attached.
 
         A pair is drawn with probability ∝ its LODES job count, so the commute
@@ -1223,8 +1283,11 @@ class RoadNetwork:
         is not noise to be discarded: outside the core the graph is arterials
         only, so a suburban home can snap 1–3 km to the nearest arterial. The
         caller charges that distance as an un-networked access leg
-        (:meth:`welfare_rs.Simulation._evaluate_modes`) instead of letting the
+        (:meth:`welfare_rs.Simulation._leg_outcomes`) instead of letting the
         commute silently start from the arterial.
+
+        ``with_true`` appends the two unsnapped block points, which the walk and
+        bike networks snap on their own.
         """
         if self._commutes is None:
             return None
@@ -1245,7 +1308,8 @@ class RoadNetwork:
         w_true = (float(c.w_lat[i]), float(c.w_lon[i]))
         home = self.snap_latlon(*h_true)
         work = self.snap_latlon(*w_true)
-        return home, work, haversine_km(h_true, home), haversine_km(w_true, work)
+        drawn = (home, work, haversine_km(h_true, home), haversine_km(w_true, work))
+        return drawn + (h_true, w_true) if with_true else drawn
 
     # ── stats ────────────────────────────────────────────────────────────────
 
@@ -1274,18 +1338,21 @@ def build_road_network(
     *,
     cache_dir: Optional[str] = None,
     network_type: Optional[str] = None,
+    active: bool = True,
 ) -> RoadNetwork:
     """Build (or load from cache) a :class:`RoadNetwork` from a params preset.
 
     Shared by the frontend, the persona generator, and any script so they all
-    agree on the same area and cache. See ``params.GEO_PARAMS``.
+    agree on the same area and cache. See ``params.GEO_PARAMS``. With
+    ``active`` (the default) the walk and bike networks for the same box are
+    attached as ``mode_networks``; tooling that never simulates can skip them.
     """
     from . import params
 
     gp = params.GEO_PARAMS
     city = city or gp["default_city"]
     spec = gp["cities"][city]
-    return RoadNetwork(
+    net = RoadNetwork(
         city,
         bbox=spec.get("bbox"),
         center=spec.get("center"),
@@ -1293,3 +1360,10 @@ def build_road_network(
         network_type=network_type or gp["default_network_type"],
         cache_dir=cache_dir or gp["cache_dir"],
     )
+    # Walking and cycling get their own networks over the same box, so a demo
+    # on a preset runs the same mode choice a metro does.
+    if active and spec.get("bbox") is not None and net.network_type == "drive":
+        from .active_modes import attach_bbox_active_networks
+
+        attach_bbox_active_networks(net, spec["bbox"], cache_dir=net.cache_dir)
+    return net

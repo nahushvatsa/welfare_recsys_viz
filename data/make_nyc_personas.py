@@ -40,7 +40,7 @@ def main() -> None:
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    net = build_road_network(args.city)
+    net = build_road_network(args.city, active=False)  # placement only, never simulated
     print(f"network: {net}")
 
     with open(args.source, newline="", encoding="utf-8") as f:

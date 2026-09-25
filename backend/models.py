@@ -105,7 +105,6 @@ class RunRequest(BaseModel):
     # `recommenders` is sent.
     conditions: List[str] = Field(default_factory=list)
     treatment: Optional[str] = None
-    multimodal: bool = False
     use_real_pois: bool = True
     pup_alpha: float = Field(0.6, ge=0.0, le=1.0)
     rm_epsilon: float = Field(0.3, ge=0.0, le=1.5)
@@ -173,6 +172,5 @@ class RunRequest(BaseModel):
             seed=seed,
             num_seeds=self.num_seeds,
             recommenders=tuple(self.to_specs()),
-            multimodal=self.multimodal,
             use_real_pois=self.use_real_pois,
         )

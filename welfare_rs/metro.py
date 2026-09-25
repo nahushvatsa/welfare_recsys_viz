@@ -38,6 +38,7 @@ import networkx as nx
 import osmnx as ox
 
 from . import params, routing_matrix
+from .active_modes import attach_active_networks, ensure_active_matrices
 from .datasource import DataSource, get_datasource, select_counties
 from .geo import RoadNetwork
 from .poi_select import catalog_fingerprint, select_catalog_rows
@@ -187,8 +188,14 @@ def build_metro_network(
     cache_dir: Optional[str] = None,
     use_warm: bool = True,
     allow_degraded: bool = False,
+    active: bool = True,
 ) -> RoadNetwork:
     """Build (or load from cache) the two-layer network for a metro key.
+
+    With ``active`` (the default) the metro's walk and bike networks are
+    attached as ``net.mode_networks``, built on first use exactly as the drive
+    graph is. Pass ``active=False`` only when a caller needs the drive graph
+    alone (tooling that never simulates).
 
     The datasource decides which counties are in (90% inbound-worker rule)
     and provides their weights; geometry comes from Nominatim + Overpass on
@@ -232,6 +239,9 @@ def build_metro_network(
             _attach_commutes(net, metro, datasource, list(net.county_meta or {}))
             routing_matrix.attach(net, metro, cache_dir,
                                   getattr(net, "poi_fingerprint", ""))
+            net.metro = metro
+            if active:
+                attach_active_networks(net, metro, cache_dir=cache_dir)
             return net
         # Pre-v2 pickle: no POIs baked in, so its node ids cannot index the
         # matrices. Fall through and rebuild from the cached GraphML.
@@ -312,6 +322,9 @@ def build_metro_network(
     with open(warm, "wb") as f:
         pickle.dump(net, f, protocol=_PICKLE_PROTOCOL)
     routing_matrix.attach(net, metro, cache_dir, poi_fingerprint)
+    net.metro = metro
+    if active:
+        attach_active_networks(net, metro, cache_dir=cache_dir)
     return net
 
 
@@ -368,10 +381,12 @@ def ensure_routing_matrices(
         meta = routing_matrix.read_meta(cache_dir, metro) or {}
         log(f"  {metro}: routing matrices already current "
             f"({meta.get('universe', 0):,} endpoint nodes)")
-        return net
-    routing_matrix.build(net, metro, cache_dir=cache_dir,
-                         poi_fingerprint=poi_fp, workers=workers, log=log)
-    routing_matrix.attach(net, metro, cache_dir, poi_fp)
+    else:
+        routing_matrix.build(net, metro, cache_dir=cache_dir,
+                             poi_fingerprint=poi_fp, workers=workers, log=log)
+        routing_matrix.attach(net, metro, cache_dir, poi_fp)
+    ensure_active_matrices(net, metro, cache_dir=cache_dir, workers=workers,
+                           rebuild=rebuild, log=log)
     return net
 
 

@@ -218,8 +218,11 @@ class Agent:
             rng.uniform(*ad["satisficing_base_range"]) + income / ad["satisficing_income_divisor"]
         )
 
-        # Habit: default commute mode (updated after trips).
-        self.habit_mode = "car" if car_ownership else "transit"
+        # Habit: the mode a habit-paradigm agent repeats (updated after every
+        # trip). An agent built from a population row starts from its own PUMS
+        # commute mode instead (Simulation._build_agent_from_persona). None
+        # means no habit yet, so the agent chooses by utility.
+        self.habit_mode = "car" if car_ownership else None
 
         self.home = home
         self.work = work
@@ -229,6 +232,22 @@ class Agent:
         # begin with, which is the case for every fallback sampler.
         self.home_access_km = 0.0
         self.work_access_km = 0.0
+        # The real (census block) points behind home and work, before snapping
+        # to the drive graph. Walking and cycling snap THESE to their own
+        # networks; re-snapping the drive-snapped node would compound two snap
+        # errors. Equal to home/work when no finer point is known.
+        self.home_true = home
+        self.work_true = work
+        # Walking and cycling are offered only to agents who live in the core
+        # (Simulation sets this from the core polygon).
+        self.lives_in_core = True
+        # Snap gap of home/work on each active network, keyed (mode, anchor);
+        # filled lazily by the Simulation.
+        self.active_access_km = {}
+        # True once the agent has driven away from home in its own car and not
+        # yet driven back: the car is with the agent, so car is the only mode
+        # until it is home again. Reset every morning (the day ends at home).
+        self.car_out = False
         self.schedule = []
         self.current_activity_index = 0
         self.activity_end_time = 0
@@ -558,11 +577,22 @@ class Agent:
         return adjustment
 
     def _price_round_trip(self, env, origin, destination, subtype):
-        """Expected disutility of going to ``destination`` and home again.
+        """Expected disutility of going to ``destination`` and home again, or
+        None when the agent has no way to make one of the two legs.
 
-        Distance only, on the network — the ex-ante view. The realised trip is
-        charged in time under congestion downstream, which is what lets an
-        agent's expectation fall short of the outcome.
+        Each leg is priced at the generalised cost this agent can expect on it
+        — time x value of time + money, the paper's C — with each mode's cost
+        weighted by the probability that the agent takes that mode under its
+        own decision rule. So a venue costs what getting there will actually
+        cost THIS agent: a 600 m walk is cheap for a carless core resident, and
+        a suburban driver pays the drive. (Not the whole travel utility, whose
+        mode constants have no meaningful level, and not the logsum: see
+        Simulation.planned_round_trip_disutility.)
+
+        Still the ex-ante view: priced at free-flow road speed, whereas the
+        realised trip is charged under the congestion it meets, which is what
+        lets an agent's expectation fall short of the outcome. The agent's
+        psychological trip-burden multiplier scales the cost, as it always has.
 
         One method rather than two call sites because the acceptance decision
         differences this against the agent's own pick, and the paper requires
@@ -571,13 +601,11 @@ class Agent:
         values travel the same way whether planning or responding."
         """
         pp = params.PARTICIPATION_PARAMS
-        d_out = env.distance_km(origin, destination)
-        d_back = env.distance_km(destination, self.home)
-        disutility = pp["expected_trip_disutility_per_km"] * (d_out + d_back)
-        disutility *= self._trip_disutility_multiplier()
+        weight = self._trip_disutility_multiplier()
         if subtype in {"park", "workout_or_run"} and self.walk_tolerance_min >= pp["outdoor_walk_tol_threshold"]:
-            disutility *= pp["outdoor_walk_tol_discount"]
-        return disutility
+            weight *= pp["outdoor_walk_tol_discount"]
+        return env.planned_round_trip_disutility(
+            self, origin, destination, subtype, gen_cost_weight=weight)
 
     def _trip_disutility_multiplier(self):
         """Scale expected travel burden from psychological and survey factors."""
@@ -792,6 +820,8 @@ class Agent:
 
         schedule = []
         schedule.append(Activity("home", "", "organic", False, "", 0, work_start, self.home, is_mandatory=True))
+        # The day starts at home, and so does the car.
+        self.car_out = False
         self.last_eta = 0.0
         self.had_leisure_opportunity = False
         self.rs_abstained = False
@@ -837,8 +867,12 @@ class Agent:
             leisure_duration = rng.randint(*seg_cfg["duration_minmax"])
             leisure_start = after_work_start + leisure_delay
             # Organic leisure destination: a real POI of this subtype, chosen by
-            # proximity (falls back to a random node if the catalog has none).
-            desired_location, desired_place_id = env.sample_poi(subtype, origin_after_work, rng)
+            # proximity (falls back to a random node if the catalog has none),
+            # among the places this agent could physically get to.
+            desired_location, desired_place_id = env.sample_poi(
+                subtype, origin_after_work, rng, max_km=env.reach_limit_km(self))
+            if desired_location is None:
+                continue
 
             open_start, open_end = self._authority_window(env, subtype)
             if leisure_start < open_start:
@@ -849,6 +883,9 @@ class Agent:
             expected_trip_disutility = self._price_round_trip(
                 env, origin_after_work, desired_location, subtype
             )
+            if expected_trip_disutility is None:
+                # No mode this agent may use reaches the place and back.
+                continue
 
             activity_utility = seg_cfg["activity_utility"]
             activity_utility += pp["activity_intrinsic_coeff"] * self.motivation_weights["intrinsic"]
@@ -950,14 +987,18 @@ class Agent:
             chosen_location = chosen["desired_location"]
             chosen_place_id = chosen["desired_place_id"]
             source = "organic"
+            # An offer this agent cannot reach by any mode it may use (a carless
+            # agent recommended somewhere beyond cycling range) is declined
+            # outright: eta stays 0 and no acceptance draw is made.
+            offered_cost = None
             if best_rec is not None:
+                offered_cost = self._price_round_trip(
+                    env, origin_after_work, best_rec.place.location, subtype)
+            if offered_cost is not None:
                 # Eq. 2's dC_it. The agent's own pick was already priced when
                 # the evening's options were ranked, so only the offered venue
                 # needs routing here.
-                delta_cost = (
-                    self._price_round_trip(env, origin_after_work, best_rec.place.location, subtype)
-                    - chosen["trip_disutility"]
-                )
+                delta_cost = offered_cost - chosen["trip_disutility"]
                 eta = self._estimate_eta(best_rec.score, delta_cost=delta_cost)
                 accepted = rng.random() < eta
                 if accepted:

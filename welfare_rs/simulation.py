@@ -5,11 +5,14 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import itertools
 import math
 import random
 import warnings
 from collections import Counter
 from pathlib import Path
+
+from typing import NamedTuple
 
 from . import params, tastes
 from . import agent as agent_module
@@ -25,6 +28,20 @@ from .recommender_systems import (
     SingleRecommenderOrchestrator,
     build_recommender_stack,
 )
+
+
+class _Stop(NamedTuple):
+    """The activity a planned leg ends at — the fields mode utility reads."""
+
+    type: str
+    subtype: str
+    is_mandatory: bool
+    place_id: str = ""
+
+
+# Car owners take the car with them (chain-bound); everyone else's "car" is a
+# ride that does not have to come home.
+_CHAIN_BOUND_CAR = ("own car", "carshare")
 
 
 class SimulationCancelled(Exception):
@@ -121,12 +138,41 @@ class Simulation:
         )
 
         # Mode parameters — read from params at init time. ``disabled_modes``
-        # lets a caller drop modes entirely (e.g., the frontend removes transit).
+        # drops modes entirely; by default that is the transit stand-in, which
+        # is a flat speed over road distance rather than a transit network and
+        # is not offered until one exists.
         self.modes = {k: dict(v) for k, v in params.MODE_PARAMS.items()}
-        for _m in (disabled_modes or ()):
+        for _m in (params.DISABLED_MODES if disabled_modes is None else disabled_modes):
             self.modes.pop(_m, None)
         self.mode_status = dict(params.MODE_STATUS)
         self.mode_enjoyment = dict(params.MODE_ENJOYMENT)
+
+        # Walking and cycling run on their own core networks, attached to the
+        # drive graph by metro.build_metro_network. A mode without its network
+        # is not offered at all — pricing it on the drive graph would route
+        # pedestrians along one-way arterials and never through a park.
+        self.metro = getattr(road_network, "metro", None)
+        attached = getattr(road_network, "mode_networks", None) or {}
+        self.active_networks = {m: attached[m] for m in params.ACTIVE_NETWORK_PARAMS["modes"]
+                                if m in self.modes and m in attached}
+        missing = [m for m in params.ACTIVE_NETWORK_PARAMS["modes"]
+                   if m in self.modes and m not in attached]
+        for m in missing:
+            self.modes.pop(m)
+        if missing:
+            warnings.warn(
+                f"{road_network.name}: no {'/'.join(missing)} network attached, so "
+                f"{' and '.join(missing)} {'is' if len(missing) == 1 else 'are'} not "
+                "offered in this run. Build them with scripts/warm_metros.py.",
+                RuntimeWarning, stacklevel=2,
+            )
+        self._mode_asc = dict(params.MODE_ASC.get(self.metro, {}))
+        # Legs for which no permitted mode existed at departure. The population
+        # filter and the planner are built so this stays zero; it is counted,
+        # not silently absorbed, so a run can prove it.
+        self.infeasible_legs = 0
+        self.dropped_population_rows = 0
+        self.dropped_outside_graph = 0
 
         # Place catalog and agents must exist before some recommender factories
         # can finish wiring treatment-specific stacks (for example Oracle).
@@ -156,6 +202,15 @@ class Simulation:
             _catset = set(_cats)
             self._pois_by_subtype[_subtype] = [p for p in self.place_catalog if p.category in _catset]
 
+        # Read by mode utility, which the planner now calls (the logsum), so it
+        # has to exist before agents plan day 0.
+        self.last_road_volume = 0
+        self.last_transit_volume = 0
+        self.last_mode_counts = Counter()
+        # Peer mode status an agent expects when planning: yesterday's mix, or
+        # neutral on the first day.
+        self._planning_peer_status = 0.5
+
         _num_agents = num_agents if num_agents is not None else sd["num_agents"]
         self.agents = []
         personas = self._load_personas() if self.use_persona_agents else []
@@ -179,6 +234,35 @@ class Simulation:
                     f"population holds {len(self.population_rows):,} agents but the "
                     f"run asks for {_num_agents:,}. Build more with "
                     "db/build_population.py --agents.")
+            # Two kinds of row are left out, in row order, and the next rows
+            # take their places:
+            # * homes in a county the graph does not cover. The drive graph and
+            #   its commute pairs are restricted to the counties holding 95% of
+            #   the metro's commuters (the rest is "real LODES data with
+            #   unusable geometry"), but the population build drew homes from
+            #   every county, so these agents snapped to the graph's edge and
+            #   were charged a 7-18 km (up to 68 km) straight-line access leg.
+            # * people with no permitted way to reach their workplace.
+            # Every condition of a study applies the same rules to the same
+            # rows, so the paired No-RS comparison still pairs identical agents.
+            graph_counties = self._graph_counties()
+            eligible = []
+            for row in self.population_rows:
+                if len(eligible) == _num_agents:
+                    break
+                if graph_counties is not None and str(row["home_geoid"])[:5] not in graph_counties:
+                    self.dropped_outside_graph += 1
+                    self.dropped_population_rows += 1
+                elif self._population_row_eligible(row):
+                    eligible.append(row)
+                else:
+                    self.dropped_population_rows += 1
+            if len(eligible) < _num_agents:
+                raise ValueError(
+                    f"only {len(eligible):,} of {len(self.population_rows):,} population "
+                    f"rows live on the graph and can travel under the mode rules, but "
+                    f"the run asks for {_num_agents:,}. Pass more rows.")
+            self.population_rows = eligible
         # The given personas are used as-is for the first len(personas) agents.
         # Beyond that, whole profiles are resampled with replacement (see
         # _resample_persona) so the population can exceed the provided set
@@ -228,6 +312,13 @@ class Simulation:
             + [a.home for a in self.agents]
             + [a.work for a in self.agents]
         )
+        core_agents = [a for a in self.agents if a.lives_in_core]
+        for _net in self.active_networks.values():
+            _net.register_route_targets(
+                [p.location for p in self.place_catalog]
+                + [a.home_true for a in core_agents]
+                + [a.work_true for a in core_agents]
+            )
 
         self.recommender_stack = self._resolve_recommender_stack(
             recommender_override=recommender_override,
@@ -236,9 +327,6 @@ class Simulation:
         self._plan_agents_for_day(day_index=0)
 
         self.stats = None
-        self.last_road_volume = 0
-        self.last_transit_volume = 0
-        self.last_mode_counts = Counter()
 
     # ── Environment interface (shared with Agent.plan_day) ───────────────────
 
@@ -271,7 +359,7 @@ class Simulation:
             return float(params.TASTE_PARAMS["match_bonus"])
         return 0.0
 
-    def sample_poi(self, subtype, origin, rng):
+    def sample_poi(self, subtype, origin, rng, max_km=None):
         """Sample an organic destination POI for a leisure subtype.
 
         Among the catalog POIs of the chosen subtype, a place is drawn with
@@ -281,13 +369,23 @@ class Simulation:
         proximity heuristic; realized travel cost is still measured on the
         network downstream.
 
+        ``max_km`` restricts the draw to places within that straight-line
+        distance of ``origin`` — the agent's physical reach when it has no car
+        (see :meth:`reach_limit_km`). A carless agent picks among the places it
+        could get to, not among all of them.
+
         Returns ``(location, place_id)``; falls back to a random intersection
-        (with ``place_id=""``) when the catalog has no POI for the subtype.
+        (with ``place_id=""``) when the catalog has no POI for the subtype, and
+        returns ``(None, "")`` when none of them is within ``max_km``.
         """
         places = self._pois_by_subtype.get(subtype) or []
         if not places:
             # Fallback destinations stay in the principal city on metro networks.
             return self.road_network.sample_core_latlon(self._loc_rng), ""
+        if max_km is not None:
+            places = [p for p in places if haversine_km(origin, p.location) <= max_km]
+            if not places:
+                return None, ""
         if len(places) == 1:
             return places[0].location, places[0].place_id
         scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
@@ -332,7 +430,9 @@ class Simulation:
         return self.road_network.snap_latlon(lat, lon)
 
     def _sample_home_work(self, persona=None, age_years=None, annual_income=None):
-        """Return ``(home, work)`` for one agent.
+        """Return ``(home, work, home_access_km, work_access_km, home_true,
+        work_true)`` for one agent — the ``_true`` points being the unsnapped
+        locations (equal to the snapped ones when the sampler draws nodes).
 
         Preference order:
 
@@ -350,7 +450,8 @@ class Simulation:
            workplace inside the core.
         """
         net = self.road_network
-        drawn = (net.sample_commute(self._loc_rng, age_years=age_years, annual_income=annual_income)
+        drawn = (net.sample_commute(self._loc_rng, age_years=age_years,
+                                    annual_income=annual_income, with_true=True)
                  if net.has_commutes else None)
         if drawn is not None:
             return drawn
@@ -369,7 +470,8 @@ class Simulation:
                 home = net.sample_node_latlon(self._loc_rng)
         # Fallback samplers return graph nodes directly, so there is no snap
         # gap to charge.
-        return home, net.sample_core_latlon(self._loc_rng), 0.0, 0.0
+        work = net.sample_core_latlon(self._loc_rng)
+        return home, work, 0.0, 0.0, home, work
 
     def _home_work_from_population(self, row):
         """Snap one population row's block coordinates onto the road graph.
@@ -378,7 +480,7 @@ class Simulation:
         what it does with the snap gap. The stored coordinates are census block
         internal points; outside the core the graph carries arterials only, so
         a suburban home can snap 1-3 km. That distance is returned as an
-        un-networked access leg and charged by ``_evaluate_modes`` instead of
+        un-networked access leg and charged by ``_leg_outcomes`` instead of
         letting the trip silently start from the arterial.
 
         A non-worker has no workplace, and its day is home-anchored
@@ -394,10 +496,10 @@ class Simulation:
         h_acc = haversine_km(home_true, home)
 
         if row.get("work_lat") is None or row.get("work_lon") is None:
-            return home, home, h_acc, 0.0
+            return home, home, h_acc, 0.0, home_true, home_true
         work_true = (float(row["work_lat"]), float(row["work_lon"]))
         work = net.snap_latlon(*work_true)
-        return home, work, h_acc, haversine_km(work_true, work)
+        return home, work, h_acc, haversine_km(work_true, work), home_true, work_true
 
     @staticmethod
     def _warn_if_synthetic(personas):
@@ -607,12 +709,20 @@ class Simulation:
             car_ownership = self.rng.random() < ad["car_ownership_prob_low_income"]
         else:
             car_ownership = self.rng.random() < ad["car_ownership_prob_high_income"]
-        home, work, h_acc, w_acc = self._sample_home_work(age_years=age, annual_income=income)
+        home, work, h_acc, w_acc, h_true, w_true = self._sample_home_work(
+            age_years=age, annual_income=income)
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed, eta_shift=self.eta_shift)
         agent.home_access_km, agent.work_access_km = h_acc, w_acc
+        self._set_true_anchors(agent, h_true, w_true)
         agent.car_access_type = "own car" if car_ownership else "no car"
         agent.car_access_penalty = 0.0 if car_ownership else ad["no_car_access_penalty"]
         return agent
+
+    def _set_true_anchors(self, agent, home_true, work_true):
+        """Record the unsnapped home/work points and core residency."""
+        agent.home_true = home_true
+        agent.work_true = work_true
+        agent.lives_in_core = self.road_network.in_core(*home_true)
 
     def _build_agent_from_population(self, i, row):
         """Build agent ``i`` from one pre-built population row.
@@ -664,9 +774,9 @@ class Simulation:
         transit_access_level = None
 
         if population is not None:
-            # Three of the nine attributes the survey could not ground are now
-            # measured. They stay inert while CAR_ONLY_MODE is on — every agent
-            # is forced to a car below — and become live the moment it comes off.
+            # Three of the nine attributes the survey could not ground are
+            # measured per agent: household vehicles (PUMS VEH), ambulatory
+            # difficulty and the home tract's transit share.
             vehicles = population.get("vehicles")
             if vehicles is not None:
                 car_access = "own car" if vehicles > 0 else "none"
@@ -689,15 +799,11 @@ class Simulation:
         budget = str(persona.get("Budget", "medium")).strip()
         top_rated = str(persona.get("TopRated", "no")).strip().lower() == "yes"
 
-        # TOGGLE: when CAR_ONLY_MODE is on we neutralise CarAccess /
-        # TransitAccess persona columns. Every agent is treated as a car
-        # owner with no access penalty, which prevents these persona
-        # columns from leaking into the results.
-        if params.SIMPLIFICATION_TOGGLES.get("CAR_ONLY_MODE", False):
-            car_access = "own car"
-            car_ownership = True
-            car_access_penalty = 0.0
-        elif car_access == "own car":
+        # car_access_penalty applies only to the "car" mode, which only car
+        # owners (and carshare members) have. A carless agent travels by car
+        # as a taxi instead, which pays a metered fare rather than a penalty
+        # (Simulation._taxi_leg), so its penalty never fires.
+        if car_access == "own car":
             car_ownership = True
             car_access_penalty = 0.0
         elif car_access == "carshare":
@@ -714,10 +820,10 @@ class Simulation:
         # which someone without a job does not have.
         if population is not None:
             is_employed = bool(population["employed"])
-            home, work, h_acc, w_acc = self._home_work_from_population(population)
+            home, work, h_acc, w_acc, h_true, w_true = self._home_work_from_population(population)
         else:
             is_employed = self._persona_is_employed(persona)
-            home, work, h_acc, w_acc = self._sample_home_work(
+            home, work, h_acc, w_acc, h_true, w_true = self._sample_home_work(
                 persona,
                 age_years=age,
                 annual_income=income if is_employed else None,
@@ -726,6 +832,14 @@ class Simulation:
         agent = Agent(i, income, age, car_ownership, home, work, seed=self.seed,
                       eta_shift=self.eta_shift, is_employed=is_employed)
         agent.home_access_km, agent.work_access_km = h_acc, w_acc
+        self._set_true_anchors(agent, h_true, w_true)
+        if population is not None:
+            # Habit starts from how this person really commutes (PUMS JWTRNS).
+            # Modes with no counterpart here (transit, worked from home) leave
+            # no habit, so the agent chooses by utility until it has one.
+            commute_mode = population.get("commute_mode")
+            agent.habit_mode = (params.PUMS_JWTRNS_TO_MODE.get(int(commute_mode))
+                                if commute_mode is not None else None)
 
         agent.persona_id = str(persona.get("PersonaID", f"P{i:04d}"))
         agent.car_access_type = car_access
@@ -771,6 +885,7 @@ class Simulation:
                 "hh_income": population.get("hh_income"),
                 "hh_size": population.get("hh_size"),
                 "vehicles": population.get("vehicles"),
+                "commute_mode": population.get("commute_mode"),
                 "survey_match_keys": population.get("match_keys"),
                 "survey_match_level": population.get("match_level"),
             })
@@ -931,6 +1046,11 @@ class Simulation:
         self.road_network.add_pois_as_nodes(
             [(place_id, lat, lon) for (place_id, _n, _c, lat, lon) in selected]
         )
+        # The same venues on the walk and bike networks (baked in, so a no-op,
+        # on a warmed metro).
+        for _net in self.active_networks.values():
+            _net.add_pois_as_nodes(
+                [(place_id, lat, lon) for (place_id, _n, _c, lat, lon) in selected])
 
         # Taste tags come from the business names, so they are assigned over the
         # whole selection at once: the imputation for unlabelled venues draws
@@ -1081,34 +1201,198 @@ class Simulation:
                 on_day_complete(day, self)
         return outputs
 
-    def _mode_available(self, mode, agent, distance_km):
+    # ── Who may use which mode ───────────────────────────────────────────────
+    #
+    # Car:   only for car owners. The car starts the day at home and goes
+    #        wherever the owner drives it; once driven away it is the only mode
+    #        until it is back home ("the car can only be used where the car is").
+    # Taxi:  only for agents WITHOUT a car: everyone carless in the core, at the
+    #        metro's metered fare; carless agents outside the core only in
+    #        MODE_AVAILABILITY.outer_taxi_metros, at a share of the fare. Never
+    #        tied to the agent, so it needs no return.
+    # Walk/  only for agents who live in the core, only between points their
+    # bike:  mode's network connects, within the physical limits below. Bike is
+    #        bike-share, so it is never tied to the agent and needs no return.
+
+    @staticmethod
+    def _owns_car(agent):
+        return agent.car_access_type in _CHAIN_BOUND_CAR
+
+    def _taxi_fare_share(self, agent):
+        """Share of the metered fare this agent pays for a taxi, or None when
+        no taxi is offered to it (it owns a car, or lives outside the core
+        outside ``outer_taxi_metros``)."""
+        if "taxi" not in self.modes or self._owns_car(agent):
+            return None
+        if agent.lives_in_core:
+            return 1.0
         ma = params.MODE_AVAILABILITY
-        # TOGGLE: CAR_ONLY_MODE — only car is ever available.
-        if params.SIMPLIFICATION_TOGGLES.get("CAR_ONLY_MODE", False):
-            return mode == "car"
-        if mode == "car":
-            if agent.car_access_type == "own car":
-                return True
-            if agent.car_access_type == "carshare":
-                return distance_km >= ma["carshare_min_distance_km"]
-            return distance_km >= ma["no_car_min_distance_km"]
-        if mode == "bike":
-            # No ownership gate: bike-share (e.g., Citi Bike) makes cycling
-            # available to any able rider within range. ACS has no bike-
-            # ownership variable, so we don't model one.
-            if agent.characteristics["age"] > ma["bike_max_age"]:
-                return False
-            if agent.mobility_needs == "ADA/wheelchair":
-                return False
-            return distance_km <= ma["bike_max_distance_km"]
+        if self.metro in ma["outer_taxi_metros"]:
+            return float(ma["outer_taxi_fare_share"])
+        return None
+
+    def _taxi_fare(self, km, share):
+        """Metered fare in dollars for ``km`` of travel (TAXI_FARES), times the
+        share of the fare the rider pays."""
+        tariff = params.TAXI_FARES.get(self.metro) or params.TAXI_FARES["default"]
+        miles = km / 1.609344
+        fare = tariff["flag"] + tariff["per_mile"] * miles
+        first = tariff.get("first_mile_per_mile")
+        if first is not None:
+            fare += (first - tariff["per_mile"]) * min(miles, 1.0)
+        return share * fare
+
+    @staticmethod
+    def _active_permitted(mode, age, ada, km):
+        """Physical feasibility of walking or cycling ``km`` (network + access)."""
+        ma = params.MODE_AVAILABILITY
         if mode == "walk":
-            if agent.characteristics["age"] > ma["walk_max_age"]:
+            if age > ma["walk_max_age"]:
                 return False
-            walk_limit = max(ma["walk_min_distance_km"], agent.walk_tolerance_min / ma["walk_speed_for_tolerance"])
-            if agent.mobility_needs == "ADA/wheelchair":
-                walk_limit = min(walk_limit, ma["walk_ada_max_km"])
-            return distance_km <= walk_limit
+            return km <= (ma["walk_ada_max_km"] if ada else ma["walk_max_distance_km"])
+        if mode == "bike":
+            if age > ma["bike_max_age"] or ada:
+                return False
+            return km <= ma["bike_max_distance_km"]
+        return False
+
+    @staticmethod
+    def _true_point(agent, location):
+        """The unsnapped point behind a location: block points for home and
+        work, the dataset coordinate (already the location) for a POI."""
+        if location == agent.home:
+            return agent.home_true
+        if location == agent.work:
+            return agent.work_true
+        return location
+
+    @staticmethod
+    def _drive_access_km(agent, location):
+        """Drive-graph snap gap at a location. Resolved by LOCATION, not by
+        activity type: a remote-work day's "work" activity sits at home."""
+        if location == agent.home:
+            return agent.home_access_km
+        if location == agent.work:
+            return agent.work_access_km
+        return 0.0
+
+    def _active_access_km(self, agent, mode, location):
+        """Snap gap on ``mode``'s network at a home or work location. POIs are
+        inserted into every network as mid-block nodes and carry none, the same
+        convention the drive graph uses."""
+        if location == agent.home:
+            key, point = "home", agent.home_true
+        elif location == agent.work:
+            key, point = "work", agent.work_true
+        else:
+            return 0.0
+        gap = agent.active_access_km.get((mode, key))
+        if gap is None:
+            gap = self.active_networks[mode].snap_gap_km(*point)
+            agent.active_access_km[(mode, key)] = gap
+        return gap
+
+    def _active_leg(self, agent, mode, origin, destination):
+        """``{distance_km, access_km}`` for walking or cycling a leg, or None
+        when the mode is not offered for it."""
+        net = self.active_networks.get(mode)
+        if net is None or not agent.lives_in_core:
+            return None
+        km = net.route_km_or_none(self._true_point(agent, origin),
+                                  self._true_point(agent, destination))
+        if km is None:
+            return None
+        access = (self._active_access_km(agent, mode, origin)
+                  + self._active_access_km(agent, mode, destination))
+        if not self._active_permitted(mode, agent.characteristics["age"],
+                                      agent.mobility_needs == "ADA/wheelchair", km + access):
+            return None
+        return {"distance_km": km, "access_km": access, "car_route": None}
+
+    def _car_leg(self, agent, origin, destination, drive_km, *, planning):
+        """The car option for a leg, or None when the agent cannot drive it."""
+        ma = params.MODE_AVAILABILITY
+        if not self._owns_car(agent):
+            return None
+        if not planning and not agent.car_out and origin != agent.home:
+            return None  # the car is parked at home
+        if (agent.car_access_type == "carshare"
+                and drive_km < ma["carshare_min_distance_km"]):
+            return None
+        return {
+            "distance_km": drive_km,
+            "access_km": self._drive_access_km(agent, origin) + self._drive_access_km(agent, destination),
+            "car_route": self.road_network.route_car_latlon(origin, destination),
+        }
+
+    def _taxi_leg(self, agent, origin, destination, drive_km):
+        """The taxi option for a leg, or None when no taxi is offered.
+
+        Same route as a car (the taxi comes to the door, so the drive-graph
+        access gap is driven too); priced by :meth:`_taxi_fare`. No minimum
+        distance: the fare and the pickup wait are what make a short taxi ride
+        unattractive.
+        """
+        share = self._taxi_fare_share(agent)
+        if share is None:
+            return None
+        return {
+            "distance_km": drive_km,
+            "access_km": self._drive_access_km(agent, origin) + self._drive_access_km(agent, destination),
+            "car_route": self.road_network.route_car_latlon(origin, destination),
+            "fare_share": share,
+        }
+
+    def _leg_options(self, agent, origin, destination, *, planning=False):
+        """Every mode the agent may use for this leg -> its route inputs."""
+        legs = {}
+        for mode in self.active_networks:
+            leg = self._active_leg(agent, mode, origin, destination)
+            if leg is not None:
+                legs[mode] = leg
+        drive_km = None
+        if self.modes.keys() & {"car", "taxi", "transit"}:
+            drive_km = self.distance_km(origin, destination)
+        if "car" in self.modes:
+            leg = self._car_leg(agent, origin, destination, drive_km, planning=planning)
+            if leg is not None:
+                legs["car"] = leg
+        if "taxi" in self.modes:
+            leg = self._taxi_leg(agent, origin, destination, drive_km)
+            if leg is not None:
+                legs["taxi"] = leg
+        if "transit" in self.modes:
+            # The disabled-by-default stand-in: flat speed over road distance.
+            legs["transit"] = {
+                "distance_km": drive_km,
+                "access_km": self._drive_access_km(agent, origin) + self._drive_access_km(agent, destination),
+                "car_route": None,
+            }
+        if not planning and agent.car_out:
+            # The car is here and has to go home with the agent.
+            legs = {"car": legs["car"]} if "car" in legs else {}
+        return legs
+
+    def _tour_feasible_without_car(self, agent):
+        """Whether an owner leaving home now could finish the tour without the
+        car: every remaining leg until home needs a walk or bike option.
+
+        Leaving the car at home is only a choice if the rest of the day can be
+        done without it — nobody walks to work to find they must drive to the
+        restaurant from there. The tour is known in full at this point: the day
+        plan fixed the leisure venue this morning.
+        """
+        sched = agent.schedule
+        for j in range(agent.current_activity_index + 1, len(sched) - 1):
+            a, b = sched[j].location, sched[j + 1].location
+            if a != b and not any(self._active_leg(agent, m, a, b) is not None
+                                  for m in self.active_networks):
+                return False
+            if b == agent.home:
+                break
         return True
+
+    # ── Costs ────────────────────────────────────────────────────────────────
 
     def _road_congestion_factor(self, volume):
         cp = params.CONGESTION_PARAMS
@@ -1127,45 +1411,68 @@ class Simulation:
     def _policy_cost_adjustment(self, mode, distance_km):
         policy = self.context["ai_intervention"]
         cp = params.CONGESTION_PARAMS
-        if policy == "congestion_pricing" and mode == "car":
+        if policy == "congestion_pricing" and mode in ("car", "taxi"):
             return cp["congestion_pricing_base"] + cp["congestion_pricing_per_km"] * distance_km
         return 0.0
 
-    def _base_mode_utility(self, agent, mode, distance_km, road_factor, transit_factor,
-                           car_route=None, access_km=0.0):
+    def _base_mode_utility(self, agent, mode, leg, road_factor, transit_factor):
+        """Time, money, emissions and base utility of one mode over one leg.
+
+        ``leg`` is from :meth:`_leg_options`: the mode's own network distance,
+        its un-networked access distance, and (car) the fastest-path route.
+        Returns ``(parts, travel_time, monetary_cost, emissions, gen_cost,
+        travelled_km)``, where ``parts`` holds the utility contributions of time,
+        money, comfort and emissions separately (see :meth:`_mode_outcome`).
+        """
         uw = params.UTILITY_WEIGHTS
         spec = self.modes[mode]
-        if mode == "car" and car_route is not None:
+        weather = max(1e-3, self._weather_speed_factor(mode))
+        distance_km = leg["distance_km"]
+        car_route = leg.get("car_route")
+        on_road = mode in ("car", "taxi")
+        if on_road and car_route is not None:
             # Network fastest-path (free-flow) time — freeway km are faster
             # than surface km, which matters for metro commutes. Weather slows
             # it the same way it scaled the flat speed; congestion multiplies
             # as before. Costs/emissions accrue over the driven path's km.
             base_min, car_km = car_route
-            in_vehicle = (base_min / max(1e-3, self._weather_speed_factor(mode))) * road_factor
+            in_vehicle = (base_min / weather) * road_factor
             distance_km = car_km
         else:
-            speed = spec["speed_kmh"] * self._weather_speed_factor(mode)
-            in_vehicle = (distance_km / max(1e-3, speed)) * 60
-            if mode == "car":
+            # Walk and bike: shortest path on their own network at the mode's
+            # speed. (Car only lands here on a graph without edge times.)
+            in_vehicle = (distance_km / (spec["speed_kmh"] * weather)) * 60
+            if on_road:
                 in_vehicle *= road_factor
         if mode == "transit":
             in_vehicle *= transit_factor
 
         # Access leg: the un-networked hop between the real block point and the
         # graph node it snapped to. It is off-graph by construction, so it is
-        # charged straight-line at local-street speed (or the mode's own speed
-        # when access_speed_kmh is None) and its km accrue cost and emissions
-        # like any other. No congestion factor — local streets, not arterials.
+        # charged straight-line and its km accrue cost and emissions like any
+        # other. A walker or cyclist covers it at their own speed; car at local-
+        # street speed (CITY_PARAMS.access_speed_kmh). No congestion factor.
+        access_km = leg["access_km"]
         if access_km > 0.0:
-            access_speed = params.CITY_PARAMS.get("access_speed_kmh") or spec["speed_kmh"]
-            access_speed *= max(1e-3, self._weather_speed_factor(mode))
-            in_vehicle += (access_km / max(1e-3, access_speed)) * 60
+            if mode in self.active_networks:
+                access_speed = spec["speed_kmh"]
+            else:
+                access_speed = params.CITY_PARAMS.get("access_speed_kmh") or spec["speed_kmh"]
+            in_vehicle += (access_km / (access_speed * weather)) * 60
             distance_km += access_km
 
         wait = spec["wait_min"]
         travel_time = in_vehicle + wait
 
-        monetary_cost = spec["fixed_cost"] + spec["cost_per_km"] * distance_km
+        if mode == "taxi":
+            # The meter runs over the whole driven distance, access included.
+            monetary_cost = self._taxi_fare(distance_km, leg.get("fare_share", 1.0))
+        else:
+            monetary_cost = spec["fixed_cost"] + spec["cost_per_km"] * distance_km
+        # Time-based fares (bike-share): minutes beyond the included ride time.
+        overage = spec.get("overage_per_min", 0.0)
+        if overage:
+            monetary_cost += overage * max(0.0, in_vehicle - spec.get("included_min", 0.0))
         monetary_cost += self._policy_cost_adjustment(mode, distance_km)
 
         gen_cost = (travel_time / 60) * agent.vot * agent.preferences["time"]
@@ -1177,50 +1484,76 @@ class Simulation:
         if self.context["social_norms"] == "green":
             green_weight *= uw["green_norm_boost"]
 
-        utility = -gen_cost / uw["gen_cost_denominator"] + comfort * agent.preferences["comfort"]
-        utility -= green_weight * (emissions / uw["emissions_divisor"])
-        return utility, travel_time, monetary_cost, emissions, gen_cost
+        denom = uw["gen_cost_denominator"]
+        parts = {
+            "time": -(travel_time / 60) * agent.vot * agent.preferences["time"] / denom,
+            "money": -monetary_cost * agent.preferences["cost"] / denom,
+            "comfort": comfort * agent.preferences["comfort"],
+            "emissions": -green_weight * (emissions / uw["emissions_divisor"]),
+        }
+        return parts, travel_time, monetary_cost, emissions, gen_cost, distance_km
 
     def _leisure_mode_adjustment(self, mode, next_activity):
         if next_activity.type != "leisure" or not next_activity.subtype:
             return 0.0
-        return params.LEISURE_MODE_TASTE_SHIFTS.get(next_activity.subtype, {}).get(mode, 0.0)
+        # A taxi is a car trip: it takes car's leisure-type taste shift.
+        key = "car" if mode == "taxi" else mode
+        return params.LEISURE_MODE_TASTE_SHIFTS.get(next_activity.subtype, {}).get(key, 0.0)
 
-    def _mode_outcome(self, agent, mode, distance_km, road_factor, transit_factor, peer_status,
-                      next_activity, car_route=None, access_km=0.0):
-        """Utility/cost outcome for a single mode (shared by evaluation + fallback)."""
+    def _mode_outcome(self, agent, mode, leg, road_factor, transit_factor, peer_status,
+                      next_activity, with_activity=True):
+        """Utility/cost outcome for a single mode over one leg.
+
+        Travel utility is kept in two groups, because the regret rule treats
+        them differently (Chorus 2010):
+
+        * ``attributes`` — properties of the mode on this trip: time, money,
+          comfort, emissions, the time-based MTTC terms (derived-demand penalty,
+          enjoyment of travel), escape and status. Regret agents compare these
+          mode against mode.
+        * ``constants`` — the agent's standing leaning towards a mode: the
+          calibrated constant, community norm, survey-measured mode attitude,
+          leisure-type taste shift and the no-car penalty. They are added as
+          they are, as alternative-specific constants are in random regret
+          models.
+
+        Travel utility is the sum of both, for every decision rule.
+        """
         uw = params.UTILITY_WEIGHTS
-        utility, travel_time, monetary_cost, emissions, gen_cost = self._base_mode_utility(
-            agent, mode, distance_km, road_factor, transit_factor, car_route=car_route,
-            access_km=access_km,
+        attrs, travel_time, monetary_cost, emissions, gen_cost, travelled_km = self._base_mode_utility(
+            agent, mode, leg, road_factor, transit_factor,
         )
 
+        attrs["derived"] = 0.0
         if next_activity.is_mandatory:
             derived = agent.motivation_weights["derived"]
-            utility -= uw["derived_penalty_coeff"] * derived * (travel_time / uw["derived_time_divisor"])
+            attrs["derived"] = -uw["derived_penalty_coeff"] * derived * (travel_time / uw["derived_time_divisor"])
 
         intrinsic = agent.motivation_weights["intrinsic"]
-        utility += intrinsic * self.mode_enjoyment[mode] * (travel_time / uw["intrinsic_time_divisor"])
+        attrs["enjoyment"] = intrinsic * self.mode_enjoyment[mode] * (travel_time / uw["intrinsic_time_divisor"])
 
         escape = agent.motivation_weights["escape"]
+        attrs["escape"] = 0.0
+        constants = {"leisure_shift": 0.0}
         if next_activity.type == "leisure":
-            utility += escape * min(uw["escape_cap"], distance_km / uw["escape_distance_scale_km"])
-            utility += self._leisure_mode_adjustment(mode, next_activity)
+            # Distance of the route itself (the mode's own network), not the
+            # access hop — the same quantity as before modes had networks.
+            attrs["escape"] = escape * min(uw["escape_cap"], leg["distance_km"] / uw["escape_distance_scale_km"])
+            constants["leisure_shift"] = self._leisure_mode_adjustment(mode, next_activity)
 
         positionality = agent.motivation_weights["positionality"]
         status_delta = self.mode_status[mode] - peer_status
-        utility += positionality * agent.attitudes["status_seeking"] * status_delta
+        attrs["status"] = positionality * agent.attitudes["status_seeking"] * status_delta
 
-        practice_bias = self.community_mode_bias(mode)
-        utility += practice_bias * agent.attitudes["practice_conformity"]
-        utility += agent.mode_preference_bias.get(mode, 0.0)
+        constants["community"] = self.community_mode_bias(mode) * agent.attitudes["practice_conformity"]
+        # The survey-measured attitude towards car applies to taxi as well.
+        constants["attitude"] = agent.mode_preference_bias.get("car" if mode == "taxi" else mode, 0.0)
+        constants["asc"] = self._mode_asc.get(mode, 0.0)
+        constants["no_car"] = -agent.car_access_penalty if mode == "car" else 0.0
 
-        if mode == "car":
-            utility -= agent.car_access_penalty
-
-        travel_utility = utility
+        travel_utility = sum(attrs.values()) + sum(constants.values())
         activity_utility = 0.0
-        if next_activity.type == "leisure" and next_activity.subtype:
+        if with_activity and next_activity.type == "leisure" and next_activity.subtype:
             seg_cfg = params.LEISURE_SEGMENTS.get(next_activity.subtype, {})
             activity_utility += seg_cfg.get("activity_utility", 0.0)
             activity_utility += uw["activity_intrinsic_coeff"] * agent.motivation_weights["intrinsic"]
@@ -1240,48 +1573,224 @@ class Simulation:
             "cost": monetary_cost,
             "emissions": emissions,
             "gen_cost": gen_cost,
-            "distance_km": access_km + (car_route[1] if (mode == "car" and car_route is not None)
-                                        else distance_km),
+            # Full cost: the whole travel utility in dollars (utility x
+            # -gen_cost_denominator). What the satisficing rule measures
+            # against its aspiration level, so that it weighs everything the
+            # other rules weigh rather than money and time alone.
+            "full_cost": -travel_utility * uw["gen_cost_denominator"],
+            "attributes": attrs,
+            "constants": constants,
+            "distance_km": travelled_km,
         }
 
-    def _evaluate_modes(self, agent, origin, destination, current_activity, next_activity):
-        distance_km = self.distance_km(origin, destination)
-        # Un-networked access at BOTH ends: leaving the real home/work point to
-        # reach the graph, and again on arrival. Leisure destinations are POIs
-        # inserted into the graph as mid-block nodes, so they contribute 0.
-        access_km = (agent.access_km(current_activity.type)
-                     + agent.access_km(next_activity.type))
-        # Car rides the fastest network path: (free-flow minutes, km) along it,
-        # or None on graphs without edge travel times (flat-speed fallback).
-        car_route = None
-        if "car" in self.modes:
-            car_route = self.road_network.route_car_latlon(origin, destination)
-        road_factor = self._road_congestion_factor(self.last_road_volume)
-        transit_factor = self._transit_crowding_factor(self.last_transit_volume)
-        peer_status = self._peer_status_average()
+    def _leg_outcomes(self, agent, origin, destination, next_activity, *, planning=False):
+        """Outcome of every mode the agent may use for one leg.
 
-        outcomes = {}
-        for mode in self.modes:
-            if not self._mode_available(mode, agent, distance_km):
-                continue
-            outcomes[mode] = self._mode_outcome(
-                agent, mode, distance_km, road_factor, transit_factor, peer_status,
-                next_activity, car_route=car_route, access_km=access_km
-            )
+        ``planning`` is the ex-ante view used to price venues: free-flow roads,
+        no crowding, yesterday's peer mode mix, and the car assumed available
+        to its owner (the morning's mode is not chosen yet).
+        """
+        legs = self._leg_options(agent, origin, destination, planning=planning)
+        if planning:
+            road_factor = transit_factor = 1.0
+            peer_status = self._planning_peer_status
+        else:
+            road_factor = self._road_congestion_factor(self.last_road_volume)
+            transit_factor = self._transit_crowding_factor(self.last_transit_volume)
+            peer_status = self._peer_status_average()
+        return {
+            mode: self._mode_outcome(agent, mode, leg, road_factor, transit_factor, peer_status,
+                                     next_activity, with_activity=not planning)
+            for mode, leg in legs.items()
+        }
 
+    def _departure_outcomes(self, agent, current_activity, next_activity):
+        """Mode outcomes for a departure now, with the car rule applied."""
+        origin, destination = current_activity.location, next_activity.location
+        outcomes = self._leg_outcomes(agent, origin, destination, next_activity)
+        if (self._owns_car(agent) and not agent.car_out and origin == agent.home
+                and "car" in outcomes and len(outcomes) > 1
+                and not self._tour_feasible_without_car(agent)):
+            outcomes = {"car": outcomes["car"]}
         if not outcomes:
-            # No mode passed availability (e.g., a carless agent on a mid-range
-            # trip once transit is disabled). Walking is always physically
-            # possible, so use it as the universal fallback.
-            fallback = "walk" if "walk" in self.modes else next(iter(self.modes))
-            outcomes[fallback] = self._mode_outcome(
-                agent, fallback, distance_km, road_factor, transit_factor, peer_status,
-                next_activity, car_route=car_route, access_km=access_km
-            )
-
+            # Unreachable by construction (the population filter and the
+            # planner both exclude it); counted so a run can prove it never
+            # happens, and priced as a car trip with the agent's no-car
+            # penalty so the day can still complete.
+            self.infeasible_legs += 1
+            legs = {"car": {
+                "distance_km": self.distance_km(origin, destination),
+                "access_km": self._drive_access_km(agent, origin) + self._drive_access_km(agent, destination),
+                "car_route": self.road_network.route_car_latlon(origin, destination),
+            }}
+            outcomes = {"car": self._mode_outcome(
+                agent, "car", legs["car"], self._road_congestion_factor(self.last_road_volume),
+                self._transit_crowding_factor(self.last_transit_volume),
+                self._peer_status_average(), next_activity)}
         return outcomes
 
+    # ── Planning (the ex-ante price of a venue) ──────────────────────────────
+
+    def _leg_expected_cost(self, agent, origin, destination, stop, gen_cost_weight):
+        """Generalised cost the agent can expect on one leg, in utility units,
+        or None when no permitted mode makes the leg.
+
+        ``sum_m P_m * C_m / gen_cost_denominator``: each mode's generalised cost
+        (time x value of time + money, the paper's C) weighted by the
+        probability that THIS agent picks that mode under its own decision
+        rule (:meth:`mode_choice_probabilities`, computed from the same full
+        utilities the departure will use). ``gen_cost_weight`` is the agent's
+        trip-burden multiplier: how heavily it perceives the cost, not which
+        mode it expects to take.
+        """
+        outcomes = self._leg_outcomes(agent, origin, destination, stop, planning=True)
+        if not outcomes:
+            return None
+        denom = params.UTILITY_WEIGHTS["gen_cost_denominator"]
+        probs = self.mode_choice_probabilities(agent, outcomes)
+        return gen_cost_weight * sum(p * outcomes[m]["gen_cost"] for m, p in probs.items()) / denom
+
+    def planned_round_trip_disutility(self, agent, origin, destination, subtype,
+                                      gen_cost_weight=1.0):
+        """Expected travel cost of going to ``destination`` and back home, in
+        utility units. None when a leg has no permitted mode.
+
+        This is the paper's C in U = V - C: the generalised cost (time x value
+        of time + money) of reaching and returning from the activity, which is
+        also exactly what the welfare metric charges a realised trip
+        (``activity_utility - gen_cost / gen_cost_denominator``). It is made
+        mode-aware by weighting each mode's cost by the probability this agent
+        takes it: a carless core resident pays the walk, a suburban driver the
+        drive.
+
+        Why cost and not the whole travel utility: the travel utility also
+        carries the mode constants, which a choice model identifies only
+        RELATIVE to car (car = 0). Their level is arbitrary, and priced as a
+        level they made every non-car option look absolutely worse: NYC leisure
+        participation fell from 0.276 to 0.060. They still decide WHICH mode the
+        agent expects to take, through the probabilities. And why not the
+        logsum: at this model's utility scale its choice-value term (up to ln 3
+        ~ 1.1 per leg) is as large as the travel cost itself, and no realised
+        trip is ever credited with it. See Agent._price_round_trip.
+        """
+        out = self._leg_expected_cost(agent, origin, destination,
+                                      _Stop("leisure", subtype, False), gen_cost_weight)
+        if out is None:
+            return None
+        back = self._leg_expected_cost(agent, destination, agent.home,
+                                       _Stop("home", "", True), gen_cost_weight)
+        if back is None:
+            return None
+        return out + back
+
+    def reach_limit_km(self, agent):
+        """Straight-line bound on how far the agent can travel at all, or None
+        when a car or taxi is available (no bound). Network distance is never
+        shorter than straight-line, so filtering by this loses no reachable
+        venue."""
+        if self._owns_car(agent) or self._taxi_fare_share(agent) is not None:
+            return None
+        if not agent.lives_in_core:
+            return 0.0
+        ma = params.MODE_AVAILABILITY
+        age = agent.characteristics["age"]
+        ada = agent.mobility_needs == "ADA/wheelchair"
+        limits = [ma["walk_ada_max_km"] if ada else ma["walk_max_distance_km"]] \
+            if age <= ma["walk_max_age"] else []
+        if age <= ma["bike_max_age"] and not ada:
+            limits.append(ma["bike_max_distance_km"])
+        return max(limits) if limits else 0.0
+
+    def _graph_counties(self):
+        """County FIPS the drive graph serves, or None when it is unlayered.
+
+        The graph's county list minus the metro's excluded counties — the same
+        set its commute pairs are restricted to (metro._attach_commutes). The
+        exclusions are applied here too because older warm graphs recorded the
+        county list before those exclusions existed.
+        """
+        meta = getattr(self.road_network, "county_meta", None)
+        if not meta:
+            return None
+        excluded = set(params.METRO_PARAMS["metros"].get(self.metro, {}).get("exclude_counties", ()))
+        return set(meta) - excluded
+
+    def _population_row_eligible(self, row):
+        """Whether a population row's person has a permitted way to work.
+
+        Only carless people can fail. With the taxi, everyone carless in the
+        core can always travel, and so can carless people outside the core in
+        ``outer_taxi_metros``; carless people outside the core anywhere else
+        have no mode at all. The walk/bike check below only matters when the
+        taxi mode is disabled. A carless core resident with no job is kept even
+        if they can reach nowhere — they have no mandatory trip.
+        """
+        vehicles = row.get("vehicles")
+        if vehicles is None or vehicles > 0:
+            return True
+        home = (float(row["home_lat"]), float(row["home_lon"]))
+        in_core = self.road_network.in_core(*home)
+        if "taxi" in self.modes and (
+                in_core or self.metro in params.MODE_AVAILABILITY["outer_taxi_metros"]):
+            return True
+        if not self.active_networks or not in_core:
+            return False
+        if not row.get("employed") or row.get("work_lat") is None:
+            return True
+        work = (float(row["work_lat"]), float(row["work_lon"]))
+        age = int(row["age"])
+        ada = bool(row.get("ambulatory"))
+        for mode, net in self.active_networks.items():
+            gaps = net.snap_gap_km(*home) + net.snap_gap_km(*work)
+            there = net.route_km_or_none(home, work)
+            back = net.route_km_or_none(work, home)
+            if (there is not None and back is not None
+                    and self._active_permitted(mode, age, ada, there + gaps)
+                    and self._active_permitted(mode, age, ada, back + gaps)):
+                return True
+        return False
+
     # ── Decision paradigms ───────────────────────────────────────────────────
+
+    def mode_choice_probabilities(self, agent, outcomes):
+        """Probability of each mode under the agent's own decision rule.
+
+        Mirrors :meth:`choose_mode` exactly, without drawing: the logit for the
+        utility paradigm (and as every rule's fallback), random-regret
+        probabilities for regret, the habitual mode when available, the
+        deterministic prospect pick, and for satisficing the habitual mode first
+        and every order of the rest equally likely. Used to price venues ahead of time and by the mode-constant
+        calibration.
+        """
+        if len(outcomes) == 1:
+            return {next(iter(outcomes)): 1.0}
+        paradigm = agent.decision_paradigms.get("mode_choice", "utility")
+        if paradigm == "regret":
+            return self._regret_probabilities(outcomes)
+        if paradigm == "prospect":
+            return {self._choose_mode_prospect(outcomes, agent): 1.0}
+        if paradigm == "habit" and agent.habit_mode in outcomes:
+            return {agent.habit_mode: 1.0}
+        if paradigm == "satisficing":
+            head = [agent.habit_mode] if agent.habit_mode in outcomes else []
+            rest = [m for m in outcomes if m not in head]
+            orders = [head + list(p) for p in itertools.permutations(rest)]
+            probs = {m: 0.0 for m in outcomes}
+            for order in orders:
+                pick = next((m for m in order
+                             if outcomes[m]["full_cost"] <= agent.satisficing_threshold), None)
+                if pick is None:
+                    for m, p in self._logit_probabilities(outcomes).items():
+                        probs[m] += p / len(orders)
+                else:
+                    probs[pick] += 1.0 / len(orders)
+            return probs
+        return self._logit_probabilities(outcomes)
+
+    @staticmethod
+    def _logit_probabilities(outcomes):
+        modes = list(outcomes)
+        return dict(zip(modes, softmax([outcomes[m]["utility"] for m in modes])))
 
     def _choose_mode_utility(self, outcomes):
         modes = list(outcomes.keys())
@@ -1289,16 +1798,74 @@ class Simulation:
         probs = softmax(utilities)
         return self.rng.choices(modes, weights=probs, k=1)[0]
 
-    def _choose_mode_regret(self, outcomes):
-        regrets = {}
-        for m_i, d_i in outcomes.items():
+    @staticmethod
+    def _rrm_probabilities(outcomes):
+        """Random regret minimisation (Chorus 2010, *EJTIR* 10(2)).
+
+        Each mode is compared with every other mode attribute by attribute;
+        regret builds up whenever another mode is better on an attribute:
+
+            R_i = sum_{j != i} sum_m ln(1 + exp(a_jm - a_im))
+
+        where ``a_im`` is attribute m's contribution to mode i's travel utility
+        (see :meth:`_mode_outcome`), so the taste weights are the same ones every
+        other rule uses. Alternative-specific constants are not compared; they
+        enter additively, as in RRM applications. Choice is a logit over
+        negative regret plus constants, the random-regret counterpart of the
+        utility agents' logit.
+
+        Regret on TOTAL utility (max_j U_j - U_i) would choose exactly what a
+        utility maximiser chooses; comparing attributes one by one is what makes
+        regret a distinct rule (it rewards modes that are never far behind on
+        anything, the "compromise effect").
+        """
+        modes = list(outcomes)
+
+        def softplus(x):
+            return x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+
+        scores = []
+        for i in modes:
+            ai = outcomes[i]["attributes"]
             regret = 0.0
-            for m_j, d_j in outcomes.items():
-                if m_i == m_j:
+            for j in modes:
+                if j == i:
                     continue
-                regret += max(0.0, d_j["gen_cost"] - d_i["gen_cost"])
-            regrets[m_i] = regret
-        return min(regrets, key=regrets.get)
+                aj = outcomes[j]["attributes"]
+                regret += sum(softplus(aj[m] - ai[m]) for m in ai)
+            scores.append(-regret + sum(outcomes[i]["constants"].values()))
+        return dict(zip(modes, softmax(scores)))
+
+    @staticmethod
+    def _utility_gap_regret_pick(outcomes):
+        """The predecessor paper's regret (Uğurel & Yabe 2026, Eq. 6 / SI Eq. 4):
+        ``R_i = max_j U_j - U_i``, and the option with the lowest regret is
+        taken, deterministically. U is the full travel utility.
+
+        Note what this implies: the lowest ``max - U_i`` is always the highest
+        ``U_i``, so a regret agent under this rule picks the best mode every
+        time — the utility rule without its random term.
+        """
+        top = max(o["travel_utility"] for o in outcomes.values())
+        regret = {m: top - o["travel_utility"] for m, o in outcomes.items()}
+        return min(regret, key=regret.get)
+
+    def _regret_probabilities(self, outcomes):
+        """Choice probabilities of the regret paradigm under the rule chosen in
+        ``params.DECISION_RULE_PARAMS['regret_rule']``."""
+        rule = params.DECISION_RULE_PARAMS["regret_rule"]
+        if rule == "chorus_rrm":
+            return self._rrm_probabilities(outcomes)
+        if rule == "max_utility_gap":
+            return {self._utility_gap_regret_pick(outcomes): 1.0}
+        raise ValueError(f"unknown regret_rule {rule!r}")
+
+    def _choose_mode_regret(self, outcomes):
+        probs = self._regret_probabilities(outcomes)
+        modes = list(probs)
+        if len(modes) == 1:
+            return modes[0]
+        return self.rng.choices(modes, weights=[probs[m] for m in modes], k=1)[0]
 
     def _choose_mode_prospect(self, outcomes, agent):
         ref_time = agent.reference_points["time_min"]
@@ -1324,29 +1891,55 @@ class Simulation:
         return best_mode
 
     def _choose_mode_satisficing(self, outcomes, agent):
-        for mode, data in outcomes.items():
-            if data["gen_cost"] <= agent.satisficing_threshold:
+        """First acceptable mode in the agent's search order: sequential search
+        that stops at the first option clearing a reservation level (Simon 1955;
+        Caplin, Dean & Martin 2011, *AER* 101(7)).
+
+        "Acceptable" is judged on FULL cost — the mode's whole travel utility in
+        dollars — against the agent's aspiration threshold, so a satisficer
+        weighs the same things every other rule weighs. (Judging on money and
+        time alone made a $0 bike-share ride acceptable whatever else it cost.)
+        The search order is the habitual mode first, then the rest at random:
+        a fixed order would decide the outcome, and MODE_PARAMS lists walk first.
+        """
+        order = list(outcomes)
+        self.rng.shuffle(order)
+        if agent.habit_mode in outcomes:
+            order.remove(agent.habit_mode)
+            order.insert(0, agent.habit_mode)
+        for mode in order:
+            if outcomes[mode]["full_cost"] <= agent.satisficing_threshold:
                 return mode
         return self._choose_mode_utility(outcomes)
 
     def choose_mode(self, agent, current_activity, next_activity):
-        # TOGGLE: CAR_ONLY_MODE disables the mode-choice model entirely.
-        # Every trip is assigned to the car without any evaluation of
-        # alternative modes, and without any dependence on the agent's
-        # decision paradigm.
-        if params.SIMPLIFICATION_TOGGLES.get("CAR_ONLY_MODE", False):
-            return "car"
-        outcomes = self._evaluate_modes(agent, current_activity.location, next_activity.location, current_activity, next_activity)
+        """Choose the mode for a departure now. Returns ``(mode, outcome)``."""
+        outcomes = self._departure_outcomes(agent, current_activity, next_activity)
+        if len(outcomes) == 1:
+            mode = next(iter(outcomes))
+            return mode, outcomes[mode]
         paradigm = agent.decision_paradigms.get("mode_choice", "utility")
         if paradigm == "regret":
-            return self._choose_mode_regret(outcomes)
-        if paradigm == "prospect":
-            return self._choose_mode_prospect(outcomes, agent)
-        if paradigm == "satisficing":
-            return self._choose_mode_satisficing(outcomes, agent)
-        if paradigm == "habit" and agent.habit_mode in outcomes:
-            return agent.habit_mode
-        return self._choose_mode_utility(outcomes)
+            mode = self._choose_mode_regret(outcomes)
+        elif paradigm == "prospect":
+            mode = self._choose_mode_prospect(outcomes, agent)
+        elif paradigm == "satisficing":
+            mode = self._choose_mode_satisficing(outcomes, agent)
+        elif paradigm == "habit" and agent.habit_mode in outcomes:
+            mode = agent.habit_mode
+        else:
+            mode = self._choose_mode_utility(outcomes)
+        return mode, outcomes[mode]
+
+    # ── Visualisation ────────────────────────────────────────────────────────
+
+    def trip_geometry(self, agent, trip):
+        """Route polyline of a realised trip, on the network its mode used."""
+        net = self.active_networks.get(trip.mode)
+        if net is None:
+            return self.road_network.route_geometry_latlon(trip.origin, trip.destination)
+        return net.route_geometry_latlon(self._true_point(agent, trip.origin),
+                                         self._true_point(agent, trip.destination))
 
     def _record_recommendation_feedback(self, agent, feedback_trip, feedback_params):
         liked, p_like = agent.evaluate_recommendation_feedback(feedback_trip, self, self.rng)
@@ -1397,6 +1990,7 @@ class Simulation:
             "total_delay": 0.0,
             "late_arrivals": 0,
         }
+        infeasible_before = self.infeasible_legs
         history = [] if record_history else None
 
         time_bins = range(0, 1440, self.time_step)
@@ -1466,16 +2060,18 @@ class Simulation:
 
             if departures:
                 for agent, current_activity, next_activity in departures:
-                    mode = self.choose_mode(agent, current_activity, next_activity)
-                    chosen.append((agent, current_activity, next_activity, mode))
+                    mode, data = self.choose_mode(agent, current_activity, next_activity)
+                    chosen.append((agent, current_activity, next_activity, mode, data))
 
-                road_volume = sum(1 for *_agent, _cur, _nxt, mode in chosen if mode == "car")
-                transit_volume = sum(1 for *_agent, _cur, _nxt, mode in chosen if mode == "transit")
+                road_volume = sum(1 for c in chosen if c[3] in ("car", "taxi"))
+                transit_volume = sum(1 for c in chosen if c[3] == "transit")
 
                 alpha = sd["reference_point_smoothing"]
-                for agent, current_activity, next_activity, mode in chosen:
-                    outcomes = self._evaluate_modes(agent, current_activity.location, next_activity.location, current_activity, next_activity)
-                    data = outcomes[mode]
+                for agent, current_activity, next_activity, mode, data in chosen:
+                    # The car goes where its owner drives it, and comes home
+                    # with them.
+                    if self._owns_car(agent):
+                        agent.car_out = (mode == "car") and (next_activity.location != agent.home)
                     travel_time_min = max(1, int(math.ceil(data["travel_time"])))
                     arrival_time = t + travel_time_min
                     agent.in_transit = True
@@ -1530,7 +2126,7 @@ class Simulation:
 
                 self.last_road_volume = road_volume
                 self.last_transit_volume = transit_volume
-                self.last_mode_counts = Counter(mode for *_rest, mode in chosen)
+                self.last_mode_counts = Counter(c[3] for c in chosen)
 
             if record_history:
                 step = {
@@ -1550,6 +2146,12 @@ class Simulation:
                 history.append(step)
 
         stats["total_delay"] = sum(a.total_delay for a in self.agents)
+        stats["infeasible_legs"] = self.infeasible_legs - infeasible_before
+        # Tomorrow's plans expect today's mix of modes among one's peers.
+        day_trips = sum(stats["mode_counts"].values())
+        if day_trips:
+            self._planning_peer_status = sum(
+                self.mode_status[m] * c for m, c in stats["mode_counts"].items()) / day_trips
         self.stats = stats
         if record_history:
             return stats, history
@@ -1596,6 +2198,7 @@ class Simulation:
             "avg_delay_min": stats["total_delay"] / max(1, len(self.agents)),
             "late_arrivals": stats["late_arrivals"],
             "mode_share": {k: v / trips for k, v in stats["mode_counts"].items()},
+            "infeasible_legs": stats.get("infeasible_legs", 0),
             "purpose_share": {k: v / trips for k, v in purpose_counts.items()},
             "leisure_subtype_counts": dict(leisure_subtype_counts),
             "recommendation_source_counts": dict(rec_source_counts),

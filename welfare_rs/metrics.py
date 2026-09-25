@@ -85,11 +85,9 @@ def _trust_groups(agents) -> Dict[int, str]:
 def agent_segments(sim) -> Dict[int, Dict[str, str]]:
     """``agent_id -> {segmentation: group}`` for every agent.
 
-    ``paradigm`` is included but is **inert under the default car-only mode**:
-    ``Simulation.choose_mode`` returns "car" before it ever reads the agent's
-    decision paradigm, so under ``CAR_ONLY_MODE`` the paradigm cannot influence
-    any outcome and a by-paradigm chart would be plotting noise. The frontend
-    only surfaces it for multimodal studies.
+    ``paradigm`` is the agent's mode-choice decision rule. It acts only when
+    the agent has more than one mode to choose between, so for agents who live
+    outside the core (car only) it never fires.
     """
     trust = _trust_groups(sim.agents)
     return {
