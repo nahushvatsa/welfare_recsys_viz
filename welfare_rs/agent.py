@@ -813,7 +813,15 @@ class Agent:
 
         base_remote = ad["remote_base"] + (ad["remote_no_car_boost"] if self.characteristics["car_ownership"] is False else 0.0)
         base_remote += ad["remote_age_55_boost"] if self.characteristics["age"] > 55 else 0.0
-        remote_today = self.is_employed and rng.random() < min(ad["remote_cap"], base_remote)
+        remote_draw = self.is_employed and rng.random() < min(ad["remote_cap"], base_remote)
+        # Only core residents work from home. A remote day sends the leisure
+        # trip out from home, and a LODES home can sit 30-60 km out, across a
+        # shell that carries arterials only; those trips would dominate every
+        # distance-normalised metric. So every home->venue trip starts in the
+        # core, as it already does for non-workers (db/build_population.py).
+        # The draw is still taken for everyone so the RNG stream, and with it
+        # the rest of the day, does not shift for agents outside the core.
+        remote_today = remote_draw and self.lives_in_core
 
         work_start = rng.randint(*ad["work_start_range"])
         work_duration = rng.randint(*ad["work_duration_range"])

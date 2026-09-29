@@ -161,10 +161,15 @@ non-working adults, both measured.
 population — they come home to the core in the evening — but LODES pairs were
 filtered to work-block-in-core and no longer carry them.
 
-**Related, and pre-existing:** `agent.py` also sends **remote workers** out from
-home, and their homes are metro-wide LODES homes. The long home→venue trips
-that motivated the core-only rule therefore already occur at the remote-work
-rate (12–35% of employed agents on a given day), independently of non-workers.
+**Remote workers follow the same rule (2026-09-28).** `agent.py` sends a
+remote worker's leisure trip out from home, and worker homes are metro-wide
+LODES homes, so the long home→venue trips the core-only rule exists to prevent
+used to occur at the remote-work rate (12–35% of employed agents on a given
+day). Now only core residents work remotely (`Agent.plan_day`); a worker living
+outside the core commutes every day, and its leisure trip departs from its
+core workplace. Every home→venue trip therefore starts in the core. The cost is
+a lower remote-work share overall: remote days now apply only to the core
+residents among workers.
 
 ## 5a. Car commutes are capped at what people actually drive
 
